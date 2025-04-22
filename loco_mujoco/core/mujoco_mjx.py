@@ -73,7 +73,7 @@ class Mjx(Mujoco):
         data = mjx.put_data(self._model, self._data)
         self._first_data = mjx.forward(self.sys, data)
 
-    def mjx_reset(self, key: jax.random.PRNGKey) -> MjxState:
+    def mjx_reset(self, key: jax.random.PRNGKey, env_id: int = None) -> MjxState:
         """
         Resets the environment.
 
@@ -90,7 +90,7 @@ class Mjx(Mujoco):
         # reset data
         data = self._first_data
 
-        carry = self._init_additional_carry(key, self._model, data, jnp)
+        carry = self._init_additional_carry(key, self._model, data, jnp, env_id)
 
         data, carry = self._mjx_reset_carry(self.sys, data, carry)
 
@@ -556,7 +556,8 @@ class Mjx(Mujoco):
     def _init_additional_carry(self, key,
                                model: Model,
                                data: Data,
-                               backend: ModuleType) -> MjxAdditionalCarry:
+                               backend: ModuleType,
+                               env_id: int = None) -> MjxAdditionalCarry:
         """
         Initializes additional carry parameters.
 
@@ -569,7 +570,7 @@ class Mjx(Mujoco):
         Returns:
             MjxAdditionalCarry: Initialized carry object.
         """
-        carry = super()._init_additional_carry(key, model, data, backend)
+        carry = super()._init_additional_carry(key, model, data, backend, env_id)
         return MjxAdditionalCarry(final_observation=backend.zeros(self.info.observation_space.shape),
                                   final_info={},
                                   **vars(carry))
