@@ -40,6 +40,7 @@ class AdditionalCarry:
     control_func_state: struct.PyTreeNode
     user_scene: MjvScene
     env_id: Union[int, None]
+    env_offset: Union[np.ndarray, jax.Array, None]
 
 
 class Mujoco:
@@ -829,6 +830,7 @@ class Mujoco:
         carry = AdditionalCarry(
             key=key,
             env_id=env_id,
+            env_offset=backend.zeros(3),
             cur_step_in_episode=1,
             last_action=backend.zeros(self.info.action_space.shape),
             observation_states=self.obs_container.init_state(self, _k1, model, data, backend),
