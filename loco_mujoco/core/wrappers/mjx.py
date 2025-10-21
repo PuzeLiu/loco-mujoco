@@ -22,8 +22,8 @@ class LocoMjxWrapper:
         """
         return getattr(self.env, name)
 
-    def reset(self, rng_key):
-        state = self.env.mjx_reset(rng_key)
+    def reset(self, rng_key, env_id=None):
+        state = self.env.mjx_reset(rng_key, env_id=env_id)
         return state.observation, state
 
     def step(self, state, action):
@@ -123,8 +123,8 @@ class LogWrapper(BaseWrapper):
     """Log the episode returns and lengths."""
 
     @partial(jax.jit, static_argnums=(0,))
-    def reset(self, rng_key):
-        obs, env_state = self.env.reset(rng_key)
+    def reset(self, rng_key, env_id=None):
+        obs, env_state = self.env.reset(rng_key, env_id=env_id)
         state = LogEnvState(env_state, metrics=Metrics(0, 0, 0, 0, 0, False))
         return obs, state
 
@@ -172,8 +172,8 @@ class NStepWrapper(BaseWrapper):
         new_info.observation_space = observation_space
         return new_info
 
-    def reset(self, rng_key):
-        obs, env_state = self.env.reset(rng_key)
+    def reset(self, rng_key, env_id=None):
+        obs, env_state = self.env.reset(rng_key, env_id=env_id)
         observation_buffer = jnp.tile(jnp.zeros_like(obs), (self.n_steps, 1))
         observation_buffer = observation_buffer.at[-1].set(obs)
         state = NStepWrapperState(env_state, observation_buffer)
@@ -199,7 +199,7 @@ class VecEnv(BaseWrapper):
 
     def __init__(self, env):
         super().__init__(env)
-        self.reset = jax.vmap(self.env.reset, in_axes=(0,))
+        self.reset = jax.vmap(self.env.reset, in_axes=(0, 0))
         self.step = jax.vmap(self.env.step, in_axes=(0, 0))
 
 
@@ -218,8 +218,8 @@ class NormalizeVecReward(BaseWrapper):
         super().__init__(env)
         self.gamma = gamma
 
-    def reset(self, key):
-        obs, state = self.env.reset(key)
+    def reset(self, key, env_id=None):
+        obs, state = self.env.reset(key, env_id)
         batch_count = obs.shape[0]
         state = NormalizeVecRewEnvState(
             mean=0.0,

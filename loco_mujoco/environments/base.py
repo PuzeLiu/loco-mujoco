@@ -637,7 +637,7 @@ class LocoEnv(Mjx):
             self.th.to_numpy()
         return super().reset(key)
 
-    def mjx_reset(self, key: jax.random.PRNGKey) -> MjxState:
+    def mjx_reset(self, key: jax.random.PRNGKey, env_id: int = None) -> MjxState:
         """
         Resets the environment.
 
@@ -651,7 +651,7 @@ class LocoEnv(Mjx):
         if self.th is not None and self.th.is_numpy:
             raise ValueError("Trajectory is in numpy format, but your attempting to run the MJX backend. "
                              "Please call the <your_env_name>.th.to_jax() function on your environment first.")
-        return super().mjx_reset(key)
+        return super().mjx_reset(key, env_id)
 
     def _reset_carry(self, model: MjModel,
                      data: MjData,

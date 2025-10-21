@@ -151,6 +151,9 @@ class Mjx(Mujoco):
             MjxState: The next state of the environment.
 
         """
+        proccessed_action = jnp.zeros(self.info.action_space.shape[0])
+        proccessed_action = proccessed_action.at[self.unfixed_joints_qpos_adr].set(action)
+        action = proccessed_action
 
         data = state.data
         cur_info = state.info

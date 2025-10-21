@@ -95,7 +95,7 @@ class PPOJax(JaxRLAlgorithmBase):
             critic_obs_ind = jnp.concatenate([critic_obs_ind + i*obs_len
                                               for i in range(config.experiment.len_obs_history)])
         network = ActorCritic(
-            env.info.action_space.shape[0],
+            config.experiment.action_dim,
             activation=config.experiment.activation,
             init_std=config.experiment.init_std,
             learnable_std=config.experiment.learnable_std,
@@ -167,7 +167,7 @@ class PPOJax(JaxRLAlgorithmBase):
         # INIT ENV
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config.num_envs)
-        obsv, env_state = env.reset(reset_rng)
+        obsv, env_state = env.reset(reset_rng, env_id=jnp.arange(config.num_envs))
 
         train_state_buffer = TrainStateBuffer.create(train_state, config.validation.num)
 
@@ -364,7 +364,7 @@ class PPOJax(JaxRLAlgorithmBase):
 
                 rng = runner_state[-1]
                 reset_rng = jax.random.split(rng, config.validation.num_envs)
-                obsv, env_state = env.reset(reset_rng)
+                obsv, env_state = env.reset(reset_rng, env_id=jnp.arange(config.num_envs))
                 runner_state_eval = (train_state, env_state, obsv, train_state_buffer, rng)
 
                 # do evaluation runs
@@ -471,7 +471,7 @@ class PPOJax(JaxRLAlgorithmBase):
             obs = env.reset()
             env_state = None
         else:
-            obs, env_state = env.reset(env_keys)
+            obs, env_state = env.reset(env_keys, env_id=jnp.arange(n_envs))
 
         if n_steps is None:
             n_steps = np.iinfo(np.int32).max
