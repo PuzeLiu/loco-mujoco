@@ -65,7 +65,7 @@ class LocoEnv(Mjx):
         """
 
         if "geom_group_visualization_on_startup" not in core_params.keys():
-            core_params["geom_group_visualization_on_startup"] = [0, 2]   # enable robot geom [0] and floor visual [2]
+            core_params["geom_group_visualization_on_startup"] = [0, 1, 2]   # enable robot geom [0] and floor visual [2]
 
         # take over default values
         core_params["n_substeps"] = n_substeps
