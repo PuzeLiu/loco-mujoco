@@ -476,7 +476,7 @@ class PPOJax(JaxRLAlgorithmBase):
                     for key in mean_ep_return_components.keys():
                         group = "Live Return Components"
                         wandb_log_dict[group + '/' + key] = mean_ep_return_components[key]
-                        wandb_run.log(wandb_log_dict, step=timestep)                
+                    wandb_run.log(wandb_log_dict, step=timestep)                
 
             jax.debug.callback(callback, metric, live_info={
                 "Learning Rate": train_state.adaptive_lr_state.learning_rate if config.get("adaptive_lr", False) else config.lr,

@@ -180,8 +180,8 @@ class RichLogWrapper(BaseWrapper):
     """Log the episode returns and lengths."""
 
     @partial(jax.jit, static_argnums=(0,))
-    def reset(self, rng_key):
-        obs, env_state = self.env.reset(rng_key)
+    def reset(self, rng_key, env_id=None):
+        obs, env_state = self.env.reset(rng_key, env_id=env_id)
         initial_reward_components = env_state.additional_carry.reward_state.reward_components
         zero_components = {key: 0.0 for key in initial_reward_components.keys()}
 
