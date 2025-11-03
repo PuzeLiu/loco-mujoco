@@ -435,7 +435,7 @@ class PPOJax(JaxRLAlgorithmBase):
 
                 rng = runner_state[-1]
                 reset_rng = jax.random.split(rng, config.validation.num_envs)
-                obsv, env_state = env.reset(reset_rng, env_id=jnp.arange(config.num_envs))
+                obsv, env_state = env.reset(reset_rng, env_id=jnp.arange(config.validation.num_envs))
                 runner_state_eval = (train_state, env_state, obsv, train_state_buffer, rng)
 
                 # do evaluation runs
@@ -455,7 +455,7 @@ class PPOJax(JaxRLAlgorithmBase):
                 validation_metrics = jax.lax.cond(counter % config.validation_interval == 0, _evaluation_step,
                                                    mh.get_zero_container)
 
-            def callback(metric, live_info):
+            def callback(metric, live_info, validation_info):
                 mean_ep_return = metric.mean_episode_return
                 mean_ep_length = metric.mean_episode_length
                 timestep = metric.max_timestep
@@ -473,14 +473,37 @@ class PPOJax(JaxRLAlgorithmBase):
                     for key, value in live_info.items():
                         wandb_log_dict["Live Info/" + key] = value
 
+                    for key, value in validation_info.items():
+                        wandb_log_dict["Validation Info/" + key] = value
+
                     for key in mean_ep_return_components.keys():
                         group = "Live Return Components"
                         wandb_log_dict[group + '/' + key] = mean_ep_return_components[key]
                     wandb_run.log(wandb_log_dict, step=timestep)                
 
-            jax.debug.callback(callback, metric, live_info={
+            # --- add validation metrics when applicable ---
+            def make_validation_info(_):
+                return {
+                    "Mean Return": validation_metrics.mean_episode_return,
+                    "Mean Length": validation_metrics.mean_episode_length,
+                }
+
+            def empty_validation_info(_):
+                return {
+                    "Mean Return": jnp.nan,
+                    "Mean Length": jnp.nan,
+                }
+
+            validation_info = jax.lax.cond(
+                (counter % config.validation_interval) == 0,
+                make_validation_info,
+                empty_validation_info,
+                operand=None
+            )
+            live_info = {
                 "Learning Rate": train_state.adaptive_lr_state.learning_rate if config.get("adaptive_lr", False) else config.lr,
-            })
+            }
+            jax.debug.callback(callback, metric, live_info=live_info, validation_info=validation_info)
 
             # add train state to buffer if needed
             train_state_buffer = jax.lax.cond(counter % config.validation_interval == 0,

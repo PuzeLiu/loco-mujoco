@@ -119,6 +119,8 @@ class MetricsHandler:
                     assert self.rel_site_ids is not None, ("Relative site quantities requires relative site ids with "
                                                            "the first site being the site used to calculate the "
                                                            "relative quantities.")
+        else:
+            self.quantaties = []
 
         self._vec_calc_site_velocities = jax.vmap(jax.vmap(calc_site_velocities, in_axes=(None, 0, None, None, None, None)), in_axes=(None, 0, None, None, None, None))
         self._vec_calc_rel_site_quantities = jax.vmap(jax.vmap(calculate_relative_site_quatities, in_axes=(0, None, None, None, None)), in_axes=(0, None, None, None, None))
