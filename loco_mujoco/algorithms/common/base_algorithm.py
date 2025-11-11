@@ -62,7 +62,7 @@ class JaxRLAlgorithmBase:
     @classmethod
     def build_train_fn(cls, env, agent_conf: AgentConfBase, mh: MetricsHandler = None, wandb_run=None):
         """ Returns the main train function of an RL algorithm used to train an agent from scratch. """
-        return lambda rng_key: cls._train_fn(rng_key, env, agent_conf, mh=mh, wandb_run=wandb_run)
+        return lambda rng_key, agent_state=None: cls._train_fn(rng_key, env, agent_conf, agent_state, mh=mh, wandb_run=wandb_run)
 
     @classmethod
     def build_resume_train_fn(cls, env, agent_conf: AgentConfBase, mh: MetricsHandler = None):

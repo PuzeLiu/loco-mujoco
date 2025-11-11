@@ -177,7 +177,7 @@ class PPOJax(JaxRLAlgorithmBase):
             network_params = network.init(_rng1, init_x)
 
         else:
-            raise NotImplementedError("Loading of train state not implemented yet.")
+            network_params = train_state.params
         
         if config.get("adaptive_lr", False):
             adaptive_lr_state = AdaptiveLRState(learning_rate=jnp.array(config.lr))
