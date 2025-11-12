@@ -206,8 +206,11 @@ class Mjx(Mujoco):
         done = jnp.logical_or(done, jnp.any(jnp.isnan(cur_obs)))
         cur_obs = jnp.nan_to_num(cur_obs, nan=0.0)
 
+        # update history
+        history = jnp.roll(carry.history, shift=-1, axis=0)
+        history = history.at[-1].set(cur_obs)
+        carry = carry.replace(cur_step_in_episode=carry.cur_step_in_episode + 1, history=history)
         # create state
-        carry = carry.replace(cur_step_in_episode=carry.cur_step_in_episode + 1)
         state = state.replace(data=data, observation=cur_obs, reward=reward,
                               absorbing=absorbing, done=done, info=cur_info, additional_carry=carry)
 
