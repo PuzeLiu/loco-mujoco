@@ -43,6 +43,8 @@ class AdditionalCarry:
     env_offset: Union[np.ndarray, jax.Array, None]
     delta_action: Union[np.ndarray, jax.Array, None]
     history: Union[np.ndarray, jax.Array]
+    cur_pattern: int
+    reward_pattern: int
 
 
 class Mujoco:
@@ -829,6 +831,12 @@ class Mujoco:
         """
         key, _k1, _k2, _k3, _k4, _k5, _k6, _k7 = jax.random.split(key, 8)
 
+        # Ensure pattern_type is a JAX array (e.g., [1,2,3])
+        cur_pattern = jnp.asarray(self.pattern_type, dtype=jnp.int32)[0]
+
+        # (Optional) Debug prints are fine inside JIT
+        jax.debug.print("🎲 Initialized pattern: {}", cur_pattern)
+
         carry = AdditionalCarry(
             key=key,
             env_id=env_id,
@@ -844,7 +852,9 @@ class Mujoco:
             control_func_state=self._control_func.init_state(self, _k6, model, data, backend),
             terminal_state_handler_state=self._terminal_state_handler.init_state(self, _k7, model, data, backend),
             user_scene=MjvScene.init_for_all_stateful_objects(backend),
-            history=backend.zeros((self.history_length, self.info.observation_space.shape[0])))
+            history=backend.zeros((self.history_length, self.info.observation_space.shape[0])),
+            cur_pattern=cur_pattern,
+            reward_pattern=cur_pattern)
 
         return carry
 
