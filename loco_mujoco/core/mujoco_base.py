@@ -27,6 +27,25 @@ from loco_mujoco.core.utils.mujoco import mj_jntid2qposid, mj_jntid2qvelid
 
 
 @struct.dataclass
+class PatternState:
+    cur_pattern: int
+    reward_pattern: int
+    frequency: float
+    dwell_ratio: float
+    throw_positions: np.ndarray | jax.Array
+    hand_cycle_time: float
+    ball_cycle_time: float
+    pattern_cycle_time: float
+    dwell_time: float
+    vacant_time: float
+    flight_time: float
+    phase_offsets: np.ndarray | jax.Array
+    t_offsets: float
+    takeoff_velocity_1: np.ndarray | jax.Array
+    takeoff_velocity_2: np.ndarray | jax.Array
+
+
+@struct.dataclass
 class AdditionalCarry:
     key: jax.Array
     cur_step_in_episode: int
@@ -43,8 +62,7 @@ class AdditionalCarry:
     env_offset: Union[np.ndarray, jax.Array, None]
     delta_action: Union[np.ndarray, jax.Array, None]
     history: Union[np.ndarray, jax.Array]
-    cur_pattern: int
-    reward_pattern: int
+    pattern_state: PatternState
 
 
 class Mujoco:
@@ -831,12 +849,6 @@ class Mujoco:
         """
         key, _k1, _k2, _k3, _k4, _k5, _k6, _k7 = jax.random.split(key, 8)
 
-        # Ensure pattern_type is a JAX array (e.g., [1,2,3])
-        cur_pattern = jnp.asarray(self.pattern_type, dtype=jnp.int32)[0]
-
-        # (Optional) Debug prints are fine inside JIT
-        jax.debug.print("🎲 Initialized pattern: {}", cur_pattern)
-
         carry = AdditionalCarry(
             key=key,
             env_id=env_id,
@@ -853,8 +865,23 @@ class Mujoco:
             terminal_state_handler_state=self._terminal_state_handler.init_state(self, _k7, model, data, backend),
             user_scene=MjvScene.init_for_all_stateful_objects(backend),
             history=backend.zeros((self.history_length, self.info.observation_space.shape[0])),
-            cur_pattern=cur_pattern,
-            reward_pattern=cur_pattern)
+            pattern_state=PatternState(
+                cur_pattern=0,
+                reward_pattern=0,
+                frequency=0.0,
+                dwell_ratio=0.0,
+                throw_positions=backend.zeros((2, 3)),
+                hand_cycle_time=0.0,
+                ball_cycle_time=0.0,
+                pattern_cycle_time=0.0,
+                dwell_time=0.0,
+                vacant_time=0.0,
+                flight_time=0.0,
+                phase_offsets=backend.zeros(2),
+                t_offsets=0.0,
+                takeoff_velocity_1=backend.zeros(3),
+                takeoff_velocity_2=backend.zeros(3),
+            ))
 
         return carry
 
