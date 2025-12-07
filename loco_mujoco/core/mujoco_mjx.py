@@ -206,6 +206,10 @@ class Mjx(Mujoco):
         done = jnp.logical_or(done, jnp.any(jnp.isnan(cur_obs)))
         cur_obs = jnp.nan_to_num(cur_obs, nan=0.0)
 
+        total_timestep = carry.total_timestep
+        total_timestep = total_timestep + 1
+        carry = carry.replace(total_timestep=total_timestep)
+
         # update history
         if self.history_length > 0:
             history = jnp.roll(carry.history, shift=-1, axis=0)
@@ -411,7 +415,10 @@ class Mjx(Mujoco):
         Returns:
             Tuple[jnp.ndarray, MjxAdditionalCarry]: Computed action and updated carry.
         """
-        action, carry = self._control_func.generate_action(self, action, model, data, carry, inner_loop_idx, jnp)
+        try:
+            action, carry = self._control_func.generate_action(self, action, model, data, carry, inner_loop_idx, jnp)
+        except:
+            action, carry = self._control_func.generate_action(self, action, model, data, carry, jnp)
         return action, carry
 
     def _mjx_reset_carry(self, model: Model,
