@@ -96,7 +96,7 @@ class PPOJax(JaxRLAlgorithmBase):
             critic_obs_ind = jnp.concatenate([critic_obs_ind + i*obs_len
                                               for i in range(config.experiment.len_obs_history)])
         network = ActorCritic(
-            config.experiment.action_dim,
+            config.experiment.action_dim if hasattr(config.experiment, "action_dim") else env.info.action_space.shape[0],
             activation=config.experiment.activation,
             init_std=config.experiment.init_std,
             learnable_std=config.experiment.learnable_std,
