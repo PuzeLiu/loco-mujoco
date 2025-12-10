@@ -25,83 +25,83 @@ class UnitreeH1(BaseRobotHumanoid):
     ============ ================== ================ ==================================== ============================== ===
     0 - 4        q_root             FreeJointPosNoXY [-inf, -inf, -inf, -inf, -inf]       [inf, inf, inf, inf, inf]      5
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    5            q_back_bkz         JointPos         [-2.35]                              [2.35]                         1
+    5            q_torso         JointPos         [-2.35]                              [2.35]                         1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    6            q_l_arm_shy        JointPos         [-2.87]                              [2.87]                         1
+    6            q_left_shoulder_pitch        JointPos         [-2.87]                              [2.87]                         1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    7            q_l_arm_shx        JointPos         [-0.34]                              [3.11]                         1
+    7            q_left_shoulder_roll        JointPos         [-0.34]                              [3.11]                         1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    8            q_l_arm_shz        JointPos         [-1.3]                               [4.45]                         1
+    8            q_left_shoulder_yaw        JointPos         [-1.3]                               [4.45]                         1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
     9            q_left_elbow       JointPos         [-1.25]                              [2.61]                         1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    10           q_r_arm_shy        JointPos         [-2.87]                              [2.87]                         1
+    10           q_right_shoulder_pitch        JointPos         [-2.87]                              [2.87]                         1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    11           q_r_arm_shx        JointPos         [-3.11]                              [0.34]                         1
+    11           q_right_shoulder_roll        JointPos         [-3.11]                              [0.34]                         1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    12           q_r_arm_shz        JointPos         [-4.45]                              [1.3]                          1
+    12           q_right_shoulder_yaw        JointPos         [-4.45]                              [1.3]                          1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
     13           q_right_elbow      JointPos         [-1.25]                              [2.61]                         1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    14           q_hip_flexion_r    JointPos         [-1.57]                              [1.57]                         1
+    14           q_right_hip_pitch    JointPos         [-1.57]                              [1.57]                         1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    15           q_hip_adduction_r  JointPos         [-0.43]                              [0.43]                         1
+    15           q_right_hip_roll  JointPos         [-0.43]                              [0.43]                         1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    16           q_hip_rotation_r   JointPos         [-0.43]                              [0.43]                         1
+    16           q_right_hip_yaw   JointPos         [-0.43]                              [0.43]                         1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    17           q_knee_angle_r     JointPos         [-0.26]                              [2.05]                         1
+    17           q_right_knee     JointPos         [-0.26]                              [2.05]                         1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    18           q_ankle_angle_r    JointPos         [-0.87]                              [0.52]                         1
+    18           q_right_ankle    JointPos         [-0.87]                              [0.52]                         1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    19           q_hip_flexion_l    JointPos         [-1.57]                              [1.57]                         1
+    19           q_left_hip_pitch    JointPos         [-1.57]                              [1.57]                         1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    20           q_hip_adduction_l  JointPos         [-0.43]                              [0.43]                         1
+    20           q_left_hip_roll  JointPos         [-0.43]                              [0.43]                         1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    21           q_hip_rotation_l   JointPos         [-0.43]                              [0.43]                         1
+    21           q_left_hip_yaw   JointPos         [-0.43]                              [0.43]                         1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    22           q_knee_angle_l     JointPos         [-0.26]                              [2.05]                         1
+    22           q_left_knee     JointPos         [-0.26]                              [2.05]                         1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    23           q_ankle_angle_l    JointPos         [-0.87]                              [0.52]                         1
+    23           q_left_ankle    JointPos         [-0.87]                              [0.52]                         1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
     24 - 29      dq_root            FreeJointVel     [-inf, -inf, -inf, -inf, -inf, -inf] [inf, inf, inf, inf, inf, inf] 6
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    30           dq_back_bkz        JointVel         [-inf]                               [inf]                          1
+    30           dq_torso        JointVel         [-inf]                               [inf]                          1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    31           dq_l_arm_shy       JointVel         [-inf]                               [inf]                          1
+    31           dq_left_shoulder_pitch       JointVel         [-inf]                               [inf]                          1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    32           dq_l_arm_shx       JointVel         [-inf]                               [inf]                          1
+    32           dq_left_shoulder_roll       JointVel         [-inf]                               [inf]                          1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    33           dq_l_arm_shz       JointVel         [-inf]                               [inf]                          1
+    33           dq_left_shoulder_yaw       JointVel         [-inf]                               [inf]                          1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
     34           dq_left_elbow      JointVel         [-inf]                               [inf]                          1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    35           dq_r_arm_shy       JointVel         [-inf]                               [inf]                          1
+    35           dq_right_shoulder_pitch       JointVel         [-inf]                               [inf]                          1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    36           dq_r_arm_shx       JointVel         [-inf]                               [inf]                          1
+    36           dq_right_shoulder_roll       JointVel         [-inf]                               [inf]                          1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    37           dq_r_arm_shz       JointVel         [-inf]                               [inf]                          1
+    37           dq_right_shoulder_yaw       JointVel         [-inf]                               [inf]                          1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
     38           dq_right_elbow     JointVel         [-inf]                               [inf]                          1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    39           dq_hip_flexion_r   JointVel         [-inf]                               [inf]                          1
+    39           dq_right_hip_pitch   JointVel         [-inf]                               [inf]                          1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    40           dq_hip_adduction_r JointVel         [-inf]                               [inf]                          1
+    40           dq_right_hip_roll JointVel         [-inf]                               [inf]                          1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    41           dq_hip_rotation_r  JointVel         [-inf]                               [inf]                          1
+    41           dq_right_hip_yaw  JointVel         [-inf]                               [inf]                          1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    42           dq_knee_angle_r    JointVel         [-inf]                               [inf]                          1
+    42           dq_right_knee    JointVel         [-inf]                               [inf]                          1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    43           dq_ankle_angle_r   JointVel         [-inf]                               [inf]                          1
+    43           dq_right_ankle   JointVel         [-inf]                               [inf]                          1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    44           dq_hip_flexion_l   JointVel         [-inf]                               [inf]                          1
+    44           dq_left_hip_pitch   JointVel         [-inf]                               [inf]                          1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    45           dq_hip_adduction_l JointVel         [-inf]                               [inf]                          1
+    45           dq_left_hip_roll JointVel         [-inf]                               [inf]                          1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    46           dq_hip_rotation_l  JointVel         [-inf]                               [inf]                          1
+    46           dq_left_hip_yaw  JointVel         [-inf]                               [inf]                          1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    47           dq_knee_angle_l    JointVel         [-inf]                               [inf]                          1
+    47           dq_left_knee    JointVel         [-inf]                               [inf]                          1
     ------------ ------------------ ---------------- ------------------------------------ ------------------------------ ---
-    48           dq_ankle_angle_l   JointVel         [-inf]                               [inf]                          1
+    48           dq_left_ankle   JointVel         [-inf]                               [inf]                          1
     ============ ================== ================ ==================================== ============================== ===
 
     Default Action Space
@@ -227,15 +227,15 @@ class UnitreeH1(BaseRobotHumanoid):
         equ_constr_to_remove = []
 
         if self._disable_arms:
-            joints_to_remove += ["l_arm_shy", "l_arm_shx", "l_arm_shz", "left_elbow", "r_arm_shy",
-                                 "r_arm_shx", "r_arm_shz", "right_elbow"]
-            actuators_to_remove += ["l_arm_shy_actuator", "l_arm_shx_actuator", "l_arm_shz_actuator",
-                                    "left_elbow_actuator", "r_arm_shy_actuator", "r_arm_shx_actuator",
-                                    "r_arm_shz_actuator", "right_elbow_actuator"]
+            joints_to_remove += ["left_shoulder_pitch", "left_shoulder_roll", "left_shoulder_yaw", "left_elbow", "right_shoulder_pitch",
+                                 "right_shoulder_roll", "right_shoulder_yaw", "right_elbow"]
+            actuators_to_remove += ["left_shoulder_pitch_actuator", "left_shoulder_roll_actuator", "left_shoulder_yaw_actuator",
+                                    "left_elbow", "right_shoulder_pitch_actuator", "right_shoulder_roll_actuator",
+                                    "right_shoulder_yaw_actuator", "right_elbow"]
 
         if self._disable_back_joint:
-            joints_to_remove += ["back_bkz"]
-            actuators_to_remove += ["back_bkz_actuator"]
+            joints_to_remove += ["torso"]
+            actuators_to_remove += ["torso_actuator"]
 
         return joints_to_remove, actuators_to_remove, equ_constr_to_remove
 
@@ -276,47 +276,47 @@ class UnitreeH1(BaseRobotHumanoid):
         """
         observation_spec = [# ------------- JOINT POS -------------
                             ObservationType.FreeJointPosNoXY("q_root", xml_name="root"),
-                            ObservationType.JointPos("q_back_bkz", xml_name="back_bkz"),
-                            ObservationType.JointPos("q_l_arm_shy", xml_name="l_arm_shy"),
-                            ObservationType.JointPos("q_l_arm_shx", xml_name="l_arm_shx"),
-                            ObservationType.JointPos("q_l_arm_shz", xml_name="l_arm_shz"),
+                            ObservationType.JointPos("q_torso", xml_name="torso"),
+                            ObservationType.JointPos("q_left_shoulder_pitch", xml_name="left_shoulder_pitch"),
+                            ObservationType.JointPos("q_left_shoulder_roll", xml_name="left_shoulder_roll"),
+                            ObservationType.JointPos("q_left_shoulder_yaw", xml_name="left_shoulder_yaw"),
                             ObservationType.JointPos("q_left_elbow", xml_name="left_elbow"),
-                            ObservationType.JointPos("q_r_arm_shy", xml_name="r_arm_shy"),
-                            ObservationType.JointPos("q_r_arm_shx", xml_name="r_arm_shx"),
-                            ObservationType.JointPos("q_r_arm_shz", xml_name="r_arm_shz"),
+                            ObservationType.JointPos("q_right_shoulder_pitch", xml_name="right_shoulder_pitch"),
+                            ObservationType.JointPos("q_right_shoulder_roll", xml_name="right_shoulder_roll"),
+                            ObservationType.JointPos("q_right_shoulder_yaw", xml_name="right_shoulder_yaw"),
                             ObservationType.JointPos("q_right_elbow", xml_name="right_elbow"),
-                            ObservationType.JointPos("q_hip_flexion_r", xml_name="hip_flexion_r"),
-                            ObservationType.JointPos("q_hip_adduction_r", xml_name="hip_adduction_r"),
-                            ObservationType.JointPos("q_hip_rotation_r", xml_name="hip_rotation_r"),
-                            ObservationType.JointPos("q_knee_angle_r", xml_name="knee_angle_r"),
-                            ObservationType.JointPos("q_ankle_angle_r", xml_name="ankle_angle_r"),
-                            ObservationType.JointPos("q_hip_flexion_l", xml_name="hip_flexion_l"),
-                            ObservationType.JointPos("q_hip_adduction_l", xml_name="hip_adduction_l"),
-                            ObservationType.JointPos("q_hip_rotation_l", xml_name="hip_rotation_l"),
-                            ObservationType.JointPos("q_knee_angle_l", xml_name="knee_angle_l"),
-                            ObservationType.JointPos("q_ankle_angle_l", xml_name="ankle_angle_l"),
+                            ObservationType.JointPos("q_right_hip_pitch", xml_name="right_hip_pitch"),
+                            ObservationType.JointPos("q_right_hip_roll", xml_name="right_hip_roll"),
+                            ObservationType.JointPos("q_right_hip_yaw", xml_name="right_hip_yaw"),
+                            ObservationType.JointPos("q_right_knee", xml_name="right_knee"),
+                            ObservationType.JointPos("q_right_ankle", xml_name="right_ankle"),
+                            ObservationType.JointPos("q_left_hip_pitch", xml_name="left_hip_pitch"),
+                            ObservationType.JointPos("q_left_hip_roll", xml_name="left_hip_roll"),
+                            ObservationType.JointPos("q_left_hip_yaw", xml_name="left_hip_yaw"),
+                            ObservationType.JointPos("q_left_knee", xml_name="left_knee"),
+                            ObservationType.JointPos("q_left_ankle", xml_name="left_ankle"),
 
                             # ------------- JOINT VEL -------------
                             ObservationType.FreeJointVel("dq_root", xml_name="root"),
-                            ObservationType.JointVel("dq_back_bkz", xml_name="back_bkz"),
-                            ObservationType.JointVel("dq_l_arm_shy", xml_name="l_arm_shy"),
-                            ObservationType.JointVel("dq_l_arm_shx", xml_name="l_arm_shx"),
-                            ObservationType.JointVel("dq_l_arm_shz", xml_name="l_arm_shz"),
+                            ObservationType.JointVel("dq_torso", xml_name="torso"),
+                            ObservationType.JointVel("dq_left_shoulder_pitch", xml_name="left_shoulder_pitch"),
+                            ObservationType.JointVel("dq_left_shoulder_roll", xml_name="left_shoulder_roll"),
+                            ObservationType.JointVel("dq_left_shoulder_yaw", xml_name="left_shoulder_yaw"),
                             ObservationType.JointVel("dq_left_elbow", xml_name="left_elbow"),
-                            ObservationType.JointVel("dq_r_arm_shy", xml_name="r_arm_shy"),
-                            ObservationType.JointVel("dq_r_arm_shx", xml_name="r_arm_shx"),
-                            ObservationType.JointVel("dq_r_arm_shz", xml_name="r_arm_shz"),
+                            ObservationType.JointVel("dq_right_shoulder_pitch", xml_name="right_shoulder_pitch"),
+                            ObservationType.JointVel("dq_right_shoulder_roll", xml_name="right_shoulder_roll"),
+                            ObservationType.JointVel("dq_right_shoulder_yaw", xml_name="right_shoulder_yaw"),
                             ObservationType.JointVel("dq_right_elbow", xml_name="right_elbow"),
-                            ObservationType.JointVel("dq_hip_flexion_r", xml_name="hip_flexion_r"),
-                            ObservationType.JointVel("dq_hip_adduction_r", xml_name="hip_adduction_r"),
-                            ObservationType.JointVel("dq_hip_rotation_r", xml_name="hip_rotation_r"),
-                            ObservationType.JointVel("dq_knee_angle_r", xml_name="knee_angle_r"),
-                            ObservationType.JointVel("dq_ankle_angle_r", xml_name="ankle_angle_r"),
-                            ObservationType.JointVel("dq_hip_flexion_l", xml_name="hip_flexion_l"),
-                            ObservationType.JointVel("dq_hip_adduction_l", xml_name="hip_adduction_l"),
-                            ObservationType.JointVel("dq_hip_rotation_l", xml_name="hip_rotation_l"),
-                            ObservationType.JointVel("dq_knee_angle_l", xml_name="knee_angle_l"),
-                            ObservationType.JointVel("dq_ankle_angle_l", xml_name="ankle_angle_l")]
+                            ObservationType.JointVel("dq_right_hip_pitch", xml_name="right_hip_pitch"),
+                            ObservationType.JointVel("dq_right_hip_roll", xml_name="right_hip_roll"),
+                            ObservationType.JointVel("dq_right_hip_yaw", xml_name="right_hip_yaw"),
+                            ObservationType.JointVel("dq_right_knee", xml_name="right_knee"),
+                            ObservationType.JointVel("dq_right_ankle", xml_name="right_ankle"),
+                            ObservationType.JointVel("dq_left_hip_pitch", xml_name="left_hip_pitch"),
+                            ObservationType.JointVel("dq_left_hip_roll", xml_name="left_hip_roll"),
+                            ObservationType.JointVel("dq_left_hip_yaw", xml_name="left_hip_yaw"),
+                            ObservationType.JointVel("dq_left_knee", xml_name="left_knee"),
+                            ObservationType.JointVel("dq_left_ankle", xml_name="left_ankle")]
 
         return observation_spec
 
@@ -331,12 +331,12 @@ class UnitreeH1(BaseRobotHumanoid):
         Returns:
             List[str]: List of action names.
         """
-        action_spec = ["back_bkz_actuator", "l_arm_shy_actuator", "l_arm_shx_actuator",
-                       "l_arm_shz_actuator", "left_elbow_actuator", "r_arm_shy_actuator", "r_arm_shx_actuator",
-                       "r_arm_shz_actuator", "right_elbow_actuator", "hip_flexion_r_actuator",
-                       "hip_adduction_r_actuator", "hip_rotation_r_actuator", "knee_angle_r_actuator",
-                       "ankle_angle_r_actuator", "hip_flexion_l_actuator", "hip_adduction_l_actuator",
-                       "hip_rotation_l_actuator", "knee_angle_l_actuator", "ankle_angle_l_actuator"]
+        action_spec = ["torso", "left_shoulder_pitch", "left_shoulder_roll",
+                       "left_shoulder_yaw", "left_elbow", "right_shoulder_pitch", "right_shoulder_roll",
+                       "right_shoulder_yaw", "right_elbow", "right_hip_pitch",
+                       "right_hip_roll", "right_hip_yaw", "right_knee",
+                       "right_ankle", "left_hip_pitch", "left_hip_roll",
+                       "left_hip_yaw", "left_knee", "left_ankle"]
 
         return action_spec
 
@@ -345,7 +345,8 @@ class UnitreeH1(BaseRobotHumanoid):
         """
         Returns the default XML file path for the Unitree H1 environment.
         """
-        return (loco_mujoco.PATH_TO_MODELS / "unitree_h1" / "h1.xml").as_posix()
+        # return (loco_mujoco.PATH_TO_MODELS / "unitree_h1" / "h1.xml").as_posix()
+        return "/home/steven/code/juggling/humanoid_juggling/humanoid_juggling/envs/assets/mjcf/juggling_scene.xml"
 
     @info_property
     def upper_body_xml_name(self) -> str:

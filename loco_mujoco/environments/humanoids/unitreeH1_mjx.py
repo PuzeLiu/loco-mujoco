@@ -9,6 +9,10 @@ class MjxUnitreeH1(UnitreeH1):
     mjx_enabled = True
     
     def __init__(self, timestep=0.002, n_substeps=5, **kwargs):
+        self.env_cfg = kwargs.get("env_cfg", None)
+        # remove env_cfg from kwargs
+        if "env_cfg" in kwargs.keys():
+            del kwargs["env_cfg"]
         if "model_option_conf" not in kwargs.keys():
             model_option_conf = dict(iterations=2, ls_iterations=4, disableflags=mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
         else:
