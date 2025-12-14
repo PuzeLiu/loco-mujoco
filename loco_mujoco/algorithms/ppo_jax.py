@@ -218,7 +218,29 @@ class PPOJax(JaxRLAlgorithmBase):
 
                 # STEP ENV
                 obsv, reward, absorbing, done, info, env_state = env.step(env_state, action)
-
+                def parse_multi_rew_jax(rew_dict: dict, rew_list: list):
+                    """
+                    Parse detailed reward components into grouped rewards.
+                    Args: rew_dict: dict[str, jnp.ndarray], rew_list: list[list[str]]
+                    Returns: list[jnp.ndarray]: grouped rewards, each shape (N,)
+                    """
+                    assert rew_list is not None, "rew_list must be provided"
+                    multi_rew = []
+                    for rew_terms in rew_list:
+                        tot_rew = None
+                        for rew_name, rew_val in rew_dict.items():
+                            if rew_name in rew_terms:
+                                if tot_rew is None:
+                                    tot_rew = rew_val
+                                else:
+                                    tot_rew = tot_rew + rew_val
+                        # If no reward matched → return zeros (important for JIT safety)
+                        if tot_rew is None:
+                            example = next(iter(rew_dict.values()))
+                            tot_rew = jnp.zeros_like(example)
+                        multi_rew.append(tot_rew)
+                    return multi_rew
+                reward_parsed = parse_multi_rew_jax(env_state.additional_carry.reward_state.reward_components, [["ball_pos_reward"], ["hand_under_ball_reward", "control_cost"]])
                 # GET METRICS
                 log_env_state = env_state.find(RichLogEnvState)
                 logged_metrics = log_env_state.metrics

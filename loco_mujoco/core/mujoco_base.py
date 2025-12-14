@@ -43,6 +43,8 @@ class PatternState:
     t_offsets: float
     takeoff_velocity_1: np.ndarray | jax.Array
     takeoff_velocity_2: np.ndarray | jax.Array
+    base_site_pos: np.ndarray | jax.Array
+    base_site_rot: np.ndarray | jax.Array
 
 
 @struct.dataclass
@@ -886,6 +888,8 @@ class Mujoco:
                 t_offsets=0.0,
                 takeoff_velocity_1=backend.zeros(3),
                 takeoff_velocity_2=backend.zeros(3),
+                base_site_pos=backend.zeros(3),
+                base_site_rot=backend.eye(3),
             ))
 
         return carry
