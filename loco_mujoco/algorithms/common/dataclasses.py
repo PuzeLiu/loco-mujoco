@@ -1,5 +1,5 @@
 from typing import NamedTuple
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 
 import jax
 import jax.numpy as jnp
@@ -21,6 +21,21 @@ class Transition(NamedTuple):
     info: jnp.ndarray
     traj_state: TrajState
     metrics: Metrics
+
+
+@struct.dataclass
+class IPPOTransition:
+    done: jnp.ndarray
+    absorbing: jnp.ndarray
+    action: jnp.ndarray
+    action_dict: Dict[str, jnp.ndarray]   # === CHANGE: store per-agent action ===
+    value: Dict[str, jnp.ndarray]
+    reward: Dict[str, jnp.ndarray]
+    log_prob: Dict[str, jnp.ndarray]
+    obs: jnp.ndarray
+    info: Any
+    traj_state: Any
+    metrics: Any
 
 
 class MetricHandlerTransition(NamedTuple):
