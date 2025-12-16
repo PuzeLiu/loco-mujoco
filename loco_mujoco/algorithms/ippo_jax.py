@@ -77,7 +77,7 @@ class IPPOAgentConf(AgentConfBase):
         """
         conf_dict = OmegaConf.to_container(self.config, resolve=True, throw_on_missing=True)
         serialized_networks = {k: flax.serialization.to_state_dict(v) for k, v in self.networks.items()}
-        return {"config": conf_dict, "network": serialized_networks}
+        return {"config": conf_dict, "networks": serialized_networks}
 
     @classmethod
     def from_dict(cls, d):
@@ -597,7 +597,10 @@ class IPPOJax(JaxRLAlgorithmBase):
 
                     for key in mean_ep_return_components.keys():
                         group = "Live Return Components"
-                        wandb_log_dict[group + '/' + key] = mean_ep_return_components[key]
+                        if mean_ep_return_components[key] != 0.0:
+                            wandb_log_dict[group + '/' + key] = mean_ep_return_components[key]
+                        else:
+                            continue
                     wandb_run.log(wandb_log_dict, step=timestep)                
 
             # --- add validation metrics when applicable ---
