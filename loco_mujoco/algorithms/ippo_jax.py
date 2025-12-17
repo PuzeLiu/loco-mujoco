@@ -304,7 +304,7 @@ class IPPOJax(JaxRLAlgorithmBase):
 
                 transition = IPPOTransition(
                     done=done,
-                    absorbing=absorbing,
+                    absorbing=env_state.additional_carry.terminal_state_handler_state.is_absorbing_dict,
                     action=action,
                     action_dict=agent_actions,
                     value=agent_values,
@@ -337,7 +337,6 @@ class IPPOJax(JaxRLAlgorithmBase):
                 def _get_advantages(gae_and_next_value, transition):
                     gae, next_value = gae_and_next_value
                     done = transition.done
-                    absorbing = transition.absorbing
 
                     new_gae = {}
                     adv_out = {}
@@ -347,6 +346,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                         reward = transition.reward[name]
                         nv = next_value[name]
                         g = gae[name]
+                        absorbing_key = agent_conf.config.env.agent[name].absorbing_key
+                        absorbing = transition.absorbing[absorbing_key]
 
                         delta = reward + config.gamma * nv * (1.0 - absorbing) - value
                         g = delta + config.gamma * config.gae_lambda * (1.0 - done) * g

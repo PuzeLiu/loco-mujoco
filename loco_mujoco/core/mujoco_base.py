@@ -66,6 +66,7 @@ class AdditionalCarry:
     delta_action: Union[np.ndarray, jax.Array, None]
     history: Union[np.ndarray, jax.Array]
     pattern_state: PatternState
+    reach_goal_state: bool
 
 
 class Mujoco:
@@ -890,7 +891,9 @@ class Mujoco:
                 takeoff_velocity_2=backend.zeros(3),
                 base_site_pos=backend.zeros(3),
                 base_site_rot=backend.eye(3),
-            ))
+            ),
+            reach_goal_state=False,
+        )
 
         return carry
 

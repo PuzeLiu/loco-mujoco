@@ -26,7 +26,7 @@ class Transition(NamedTuple):
 @struct.dataclass
 class IPPOTransition:
     done: jnp.ndarray
-    absorbing: jnp.ndarray
+    absorbing: Dict[str, jnp.ndarray]
     action: jnp.ndarray
     action_dict: Dict[str, jnp.ndarray]   # === CHANGE: store per-agent action ===
     value: Dict[str, jnp.ndarray]
