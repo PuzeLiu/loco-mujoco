@@ -196,6 +196,7 @@ class Mjx(Mujoco):
 
         # check if the next obs is an absorbing state
         absorbing, carry = self._mjx_is_absorbing(cur_obs, cur_info, data, carry)
+        absorbing_dict = carry.terminal_state_handler_state.is_absorbing_dict
 
         # calculate the reward
         reward, carry = self._mjx_reward(state.observation, action, cur_obs, absorbing, cur_info, self._model, data, carry)
@@ -222,7 +223,8 @@ class Mjx(Mujoco):
 
         # reset state if done
         state = jax.lax.cond(state.done, self._mjx_reset_in_step, lambda x: x, state)
-
+        # restore absorbing dict
+        state = state.replace(additional_carry=state.additional_carry.replace(terminal_state_handler_state=state.additional_carry.terminal_state_handler_state.replace(is_absorbing_dict=absorbing_dict)))
         return state
 
     def _mjx_create_observation(self, model: Model,

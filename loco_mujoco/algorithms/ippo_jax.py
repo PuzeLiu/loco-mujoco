@@ -15,31 +15,9 @@ import optax
 from loco_mujoco.algorithms import (JaxRLAlgorithmBase, AgentConfBase, AgentStateBase, ActorCritic,
                                     Transition, IPPOTransition, TrainState, TrainStateBuffer, MetricHandlerTransition, AdaptiveLRState)
 # from loco_mujoco.core.wrappers import LogWrapper, NStepWrapper, LogEnvState, VecEnv, NormalizeVecReward, SummaryMetrics
-from loco_mujoco.core.wrappers import RichLogWrapper, NStepWrapper, RichLogEnvState, VecEnv, NormalizeVecReward, SummaryRichMetrics
+from loco_mujoco.core.wrappers import RichLogWrapper, NStepWrapper, RichLogEnvState, VecEnv, NormalizeVecRewardDict, SummaryRichMetrics
 from loco_mujoco.utils import MetricsHandler, ValidationSummary
 
-
-def _parse_agent_reward_by_terms(rew_dict: Dict[str, jnp.ndarray],
-                                 reward_terms: list) -> jnp.ndarray:
-    """
-    Sum reward components whose key contains any of the terms in reward_terms.
-    Example:
-      term "ball_pos" matches key "ball_pos_reward".
-
-    Returns:
-      (num_envs,) reward.
-    """
-    tot = None
-    for k, v in rew_dict.items():
-        # substring match to be robust to suffixes like "_reward" / "_cost"
-        if any(term in k for term in reward_terms):
-            tot = v if tot is None else (tot + v)
-
-    if tot is None:
-        # JIT-safe fallback
-        example = next(iter(rew_dict.values()))
-        tot = jnp.zeros_like(example)
-    return tot
 
 def _scatter_actions(num_envs: int,
                      full_action_dim: int,
@@ -293,18 +271,15 @@ class IPPOJax(JaxRLAlgorithmBase):
 
                 # STEP ENV
                 obsv, reward, absorbing, done, info, env_state = env.step(env_state, action)
-                reward_components = env_state.additional_carry.reward_state.reward_components
-                agent_rewards = {}
-                for name in agent_names:
-                    terms = list(agent_conf.config.env.agent[name].reward_terms)
-                    agent_rewards[name] = _parse_agent_reward_by_terms(reward_components, terms)
+                agent_rewards = info['agent_rewards']
                 # GET METRICS
                 log_env_state = env_state.find(RichLogEnvState)
                 logged_metrics = log_env_state.metrics
 
                 transition = IPPOTransition(
                     done=done,
-                    absorbing=env_state.additional_carry.terminal_state_handler_state.is_absorbing_dict,
+                    absorbing=absorbing,
+                    absorbing_dict=env_state.additional_carry.terminal_state_handler_state.is_absorbing_dict,
                     action=action,
                     action_dict=agent_actions,
                     value=agent_values,
@@ -347,7 +322,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                         nv = next_value[name]
                         g = gae[name]
                         absorbing_key = agent_conf.config.env.agent[name].absorbing_key
-                        absorbing = transition.absorbing[absorbing_key]
+                        absorbing = transition.absorbing_dict[absorbing_key]
 
                         delta = reward + config.gamma * nv * (1.0 - absorbing) - value
                         g = delta + config.gamma * config.gae_lambda * (1.0 - done) * g
@@ -804,5 +779,5 @@ class IPPOJax(JaxRLAlgorithmBase):
         env = RichLogWrapper(env)
         env = VecEnv(env)
         if config.normalize_env:
-            env = NormalizeVecReward(env, config.gamma)
+            env = NormalizeVecRewardDict(env, config.gamma)
         return env

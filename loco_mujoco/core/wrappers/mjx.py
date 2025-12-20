@@ -1,7 +1,7 @@
 from copy import deepcopy
 from functools import partial
 import dataclasses
-from typing import Optional, Tuple, Union, Any
+from typing import Optional, Tuple, Union, Any, Dict
 
 import numpy as np
 import jax
@@ -351,4 +351,105 @@ class NormalizeVecReward(BaseWrapper):
         )
 
         return next_observation, reward / jnp.sqrt(state.var + 1e-8), absorbing, done, info, state
+
+
+def _parse_agent_reward_by_terms(rew_dict: Dict[str, jnp.ndarray],
+                                 reward_terms: list) -> jnp.ndarray:
+    """
+    Sum reward components whose key contains any of the terms in reward_terms.
+    Example:
+      term "ball_pos" matches key "ball_pos_reward".
+
+    Returns:
+      (num_envs,) reward.
+    """
+    tot = None
+    for k, v in rew_dict.items():
+        # substring match to be robust to suffixes like "_reward" / "_cost"
+        if any(term in k for term in reward_terms):
+            tot = v if tot is None else (tot + v)
+
+    if tot is None:
+        # JIT-safe fallback
+        example = next(iter(rew_dict.values()))
+        tot = jnp.zeros_like(example)
+    return tot
+
+
+@struct.dataclass
+class NormalizeVecRewEnvDictState(BaseWrapperState):
+    env_state: MjxState
+    mean: dict[str, jnp.ndarray]
+    var: dict[str, jnp.ndarray]
+    count: dict[str, float]
+    return_val: dict[str, float]
+
+
+class NormalizeVecRewardDict(BaseWrapper):
+
+    def __init__(self, env, gamma):
+        super().__init__(env)
+        self.gamma = gamma
+        self.env_cfg = env.env_cfg
+        self.agent_names = self.env_cfg.agent.keys()
+
+    def reset(self, key, env_id=None):
+        obs, state = self.env.reset(key, env_id)
+        batch_count = obs.shape[0]
+        state = NormalizeVecRewEnvDictState(
+            mean={name: 0.0 for name in self.agent_names},
+            var={name: 1.0 for name in self.agent_names},
+            count={name: 1e-4 for name in self.agent_names},
+            return_val={name: jnp.zeros((batch_count,)) for name in self.agent_names},
+            env_state=state,
+        )
+        return obs, state
+
+    def step(self, state, action):
+        next_observation, reward, absorbing, done, info, env_state = self.env.step(state.env_state, action)
+        reward_components = env_state.additional_carry.reward_state.reward_components
+        absorbing_dict = env_state.additional_carry.terminal_state_handler_state.is_absorbing_dict
+        agent_rewards = {}
+        new_mean_dict = {}
+        new_var_dict = {}
+        new_count_dict = {}
+        new_return_val_dict = {}
+        for name in self.agent_names:
+            absorb = absorbing_dict[self.env_cfg.agent[name].absorbing_key]
+            terms = list(self.env_cfg.agent[name].reward_terms)
+            cur_reward = _parse_agent_reward_by_terms(reward_components, terms)
+            # use logical or to combine done and absorbing
+            # done_or_absorb = jnp.logical_or(done, absorb)
+            return_val = (state.return_val[name] * self.gamma * (1 - done) + cur_reward)
+            batch_mean = jnp.mean(return_val, axis=0)
+            batch_var = jnp.var(return_val, axis=0)
+            # only count non-absorbing steps
+            batch_count = jnp.sum(~absorb)
+
+            delta = batch_mean - state.mean[name]
+            tot_count = state.count[name] + batch_count
+
+            new_mean = state.mean[name] + delta * batch_count / tot_count
+            m_a = state.var[name] * state.count[name]
+            m_b = batch_var * batch_count
+            M2 = m_a + m_b + jnp.square(delta) * state.count[name] * batch_count / tot_count
+            new_var = M2 / tot_count
+            new_count = tot_count
+            agent_rewards[name] = cur_reward / jnp.sqrt(new_var + 1e-8)
+            new_mean_dict[name] = new_mean
+            new_var_dict[name] = new_var
+            new_count_dict[name] = new_count
+            new_return_val_dict[name] = return_val
+
+        state = NormalizeVecRewEnvDictState(
+            mean=new_mean_dict,
+            var=new_var_dict,
+            count=new_count_dict,
+            return_val=new_return_val_dict,
+            env_state=env_state,
+        )
+
+        info['agent_rewards'] = agent_rewards
+
+        return next_observation, reward, absorbing, done, info, state
 
