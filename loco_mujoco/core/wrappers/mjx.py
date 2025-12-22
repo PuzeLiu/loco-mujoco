@@ -435,7 +435,10 @@ class NormalizeVecRewardDict(BaseWrapper):
             M2 = m_a + m_b + jnp.square(delta) * state.count[name] * batch_count / tot_count
             new_var = M2 / tot_count
             new_count = tot_count
-            agent_rewards[name] = cur_reward / jnp.sqrt(new_var + 1e-8)
+            if self.env_cfg.agent[name].normalize_reward:
+                agent_rewards[name] = cur_reward / jnp.sqrt(new_var + 1e-8)
+            else:
+                agent_rewards[name] = cur_reward
             new_mean_dict[name] = new_mean
             new_var_dict[name] = new_var
             new_count_dict[name] = new_count
