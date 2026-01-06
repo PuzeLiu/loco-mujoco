@@ -7,6 +7,56 @@ from typing import Sequence
 import distrax
 
 
+class RandomActionDistribution:
+    """Wrapper distribution that samples random actions from uniform [-1, 1] instead of the policy."""
+    
+    def __init__(self, base_distribution, action_dim):
+        self.base_distribution = base_distribution
+        self.action_dim = action_dim
+        # Store batch shape from base distribution
+        self._batch_shape = base_distribution.batch_shape
+    
+    def sample(self, seed, sample_shape=()):
+        """Sample from uniform distribution [-1, 1] instead of the policy."""
+        # Infer shape from base distribution's batch shape
+        if len(sample_shape) == 0:
+            if len(self._batch_shape) > 0:
+                shape = self._batch_shape + (self.action_dim,)
+            else:
+                shape = (self.action_dim,)
+        else:
+            shape = sample_shape + (self.action_dim,)
+        
+        return jax.random.uniform(seed, minval=-0.25, maxval=0.25, shape=shape)
+    
+    def log_prob(self, value):
+        """Return zero log prob for random actions."""
+        # Return zeros with the same shape as value's batch dimensions
+        if value.ndim > 1:
+            # Batched case: return zeros for each sample in the batch
+            return jnp.zeros(value.shape[:-1])
+        else:
+            # Single sample case
+            return jnp.array(0.0)
+    
+    def entropy(self):
+        """Return entropy of uniform distribution."""
+        # Entropy of uniform [-1, 1] is log(2) = log(high - low)
+        if len(self._batch_shape) > 0:
+            return jnp.full(self._batch_shape, jnp.log(2.0))
+        else:
+            return jnp.array(jnp.log(2.0))
+    
+    @property
+    def batch_shape(self):
+        """Return batch shape from base distribution."""
+        return self._batch_shape
+    
+    def __getattr__(self, name):
+        """Delegate other attributes to base distribution."""
+        return getattr(self.base_distribution, name)
+
+
 def get_activation_fn(name: str):
     """ Get activation function by name from the flax.linen module."""
     try:
@@ -56,6 +106,7 @@ class ActorCritic(nn.Module):
     hidden_layer_dims: Sequence[int] = (1024, 512)
     actor_obs_ind: jnp.ndarray = None
     critic_obs_ind: jnp.ndarray = None
+    random: bool = False
 
     def setup(self):
         self.activation_fn = get_activation_fn(self.activation)
@@ -75,6 +126,10 @@ class ActorCritic(nn.Module):
             actor_logtstd = jax.lax.stop_gradient(actor_logtstd)
 
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
+        
+        # Wrap policy with random action distribution if random is True
+        if self.random:
+            pi = RandomActionDistribution(pi, self.action_dim)
 
         # build critic
         critic_x = x if self.critic_obs_ind is None else x[..., self.critic_obs_ind]
