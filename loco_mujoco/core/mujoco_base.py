@@ -45,6 +45,11 @@ class PatternState:
     takeoff_velocity_2: np.ndarray | jax.Array
     base_site_pos: np.ndarray | jax.Array
     base_site_rot: np.ndarray | jax.Array
+    # for multi hand
+    catch_positions: np.ndarray | jax.Array
+    hand_phase_offsets: np.ndarray | jax.Array
+    ball_start_hand: np.ndarray | jax.Array
+    takeoff_velocity_multi: np.ndarray | jax.Array
 
 
 @struct.dataclass
@@ -885,12 +890,17 @@ class Mujoco:
                 dwell_time=0.0,
                 vacant_time=0.0,
                 flight_time=0.0,
-                phase_offsets=backend.zeros(2),
+                phase_offsets=backend.zeros(self.n_balls),
                 t_offsets=0.0,
                 takeoff_velocity_1=backend.zeros(3),
                 takeoff_velocity_2=backend.zeros(3),
                 base_site_pos=backend.zeros(3),
                 base_site_rot=backend.eye(3),
+                # for multi hand
+                catch_positions=backend.zeros((2, 3)),
+                hand_phase_offsets=backend.zeros(2),
+                ball_start_hand=backend.zeros(3, dtype=jnp.int32),
+                takeoff_velocity_multi=backend.zeros((2, 3)),
             ),
             reach_goal_state=False,
         )
