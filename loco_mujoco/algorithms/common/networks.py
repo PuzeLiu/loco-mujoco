@@ -106,7 +106,7 @@ class ActorCritic(nn.Module):
     hidden_layer_dims: Sequence[int] = (1024, 512)
     actor_obs_ind: jnp.ndarray = None
     critic_obs_ind: jnp.ndarray = None
-    random: bool = False
+    # random: bool = False
 
     def setup(self):
         self.activation_fn = get_activation_fn(self.activation)
@@ -127,9 +127,9 @@ class ActorCritic(nn.Module):
 
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
         
-        # Wrap policy with random action distribution if random is True
-        if self.random:
-            pi = RandomActionDistribution(pi, self.action_dim)
+        # # Wrap policy with random action distribution if random is True
+        # if self.random:
+        #     pi = RandomActionDistribution(pi, self.action_dim)
 
         # build critic
         critic_x = x if self.critic_obs_ind is None else x[..., self.critic_obs_ind]

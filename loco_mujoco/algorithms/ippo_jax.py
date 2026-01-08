@@ -146,11 +146,10 @@ class IPPOJax(JaxRLAlgorithmBase):
                 hidden_layer_dims=hidden_layers,
                 actor_obs_ind=actor_obs_ind,
                 critic_obs_ind=critic_obs_ind,
-                random=agent_cfg.random_action
+                # random=agent_cfg.get("random_action", False)
             )
 
             txs[agent_name] = cls._get_optimizer(config)
-
         return cls._agent_conf(config=config, networks=networks, txs=txs)
     
     @classmethod
