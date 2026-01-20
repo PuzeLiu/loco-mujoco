@@ -275,6 +275,18 @@ class IPPOJax(JaxRLAlgorithmBase):
                 # GET METRICS
                 log_env_state = env_state.find(RichLogEnvState)
                 logged_metrics = log_env_state.metrics
+                # update absorb ratio
+                absorb_ratio = jnp.sum(jnp.where(logged_metrics.done, logged_metrics.absorbed, 0.0)) / (jnp.sum(logged_metrics.done) + 1e-6)
+                absorb_ratio = absorb_ratio * jnp.ones_like(env_state.additional_carry.curriculum.absorb_ratio)
+                curriculum = env_state.additional_carry.curriculum
+                curriculum = curriculum.replace(absorb_ratio=absorb_ratio)
+                env_state = env_state.replace(
+                    env_state=env_state.env_state.replace(
+                        env_state=env_state.env_state.env_state.replace(
+                            additional_carry=env_state.env_state.env_state.additional_carry.replace(curriculum=curriculum)
+                        )
+                    )
+                )
 
                 transition = IPPOTransition(
                     done=done,
@@ -476,7 +488,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                 mean_episode_length=jnp.sum(jnp.where(logged_metrics.done, logged_metrics.returned_episode_lengths, 0.0)) / jnp.sum(logged_metrics.done),
                 max_timestep=jnp.max(logged_metrics.timestep * config.num_envs),
                 frac_absorbed=jnp.sum(jnp.where(logged_metrics.done, logged_metrics.absorbed, 0.0)) / (jnp.sum(logged_metrics.done) + 1e-6),
-                mean_episode_return_components=mean_episode_return_components
+                mean_episode_return_components=mean_episode_return_components,
+                curriculum_step=jnp.mean(logged_metrics.curriculum_step),
             )
 
             def _evaluation_step():
@@ -556,6 +569,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                 timestep = metric.max_timestep
                 frac_absorbed = metric.frac_absorbed
                 mean_ep_return_components = metric.mean_episode_return_components                
+                curriculum_step = metric.curriculum_step
 
                 if config.debug:
                     print(f"timestep={timestep}, episodic return={mean_ep_return}, episodic length={mean_ep_length}, absorbed={frac_absorbed}")
@@ -564,6 +578,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                     wandb_log_dict["Live Info/Mean Episode Return"] = mean_ep_return
                     wandb_log_dict["Live Info/Mean Episode Length"] = mean_ep_length
                     wandb_log_dict["Live Info/Absorbed Envs"] = frac_absorbed
+                    wandb_log_dict["Live Info/Curriculum Step"] = curriculum_step
                     # also log other live info
                     for key, value in live_info.items():
                         wandb_log_dict["Live Info/" + key] = value

@@ -51,6 +51,10 @@ class PatternState:
     ball_start_hand: np.ndarray | jax.Array
     takeoff_velocity_multi: np.ndarray | jax.Array
 
+@struct.dataclass
+class CurriculumState:
+    absorb_ratio: float
+    step: int
 
 @struct.dataclass
 class AdditionalCarry:
@@ -72,6 +76,7 @@ class AdditionalCarry:
     history: Union[np.ndarray, jax.Array]
     pattern_state: PatternState
     reach_goal_state: bool
+    curriculum: CurriculumState
 
 
 class Mujoco:
@@ -903,6 +908,7 @@ class Mujoco:
                 takeoff_velocity_multi=backend.zeros((2, 3)),
             ),
             reach_goal_state=False,
+            curriculum=CurriculumState(absorb_ratio=1.0, step=0),
         )
 
         return carry
