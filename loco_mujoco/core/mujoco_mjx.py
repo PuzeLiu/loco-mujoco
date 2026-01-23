@@ -138,6 +138,9 @@ class Mjx(Mujoco):
         # create new observation
         obs, carry = self._mjx_create_observation(self._model, data, carry)
 
+        # update obs to last obs if last obs is not 0.0
+        obs = jax.lax.cond(jnp.any(carry.last_obs != 0.0), lambda x: carry.last_obs, lambda x: x, obs)
+        
         return state.replace(data=data, observation=obs, additional_carry=carry)
 
     def mjx_step(self, state: MjxState, action: jax.Array) -> MjxState:
@@ -217,6 +220,7 @@ class Mjx(Mujoco):
             history = history.at[-1].set(cur_obs)
             carry = carry.replace(history=history)
         carry = carry.replace(cur_step_in_episode=carry.cur_step_in_episode + 1)
+        carry = carry.replace(time_step_in_episode=carry.time_step_in_episode + 1)
         # create state
         state = state.replace(data=data, observation=cur_obs, reward=reward,
                               absorbing=absorbing, done=done, info=cur_info, additional_carry=carry)
@@ -225,6 +229,8 @@ class Mjx(Mujoco):
         state = jax.lax.cond(state.done, self._mjx_reset_in_step, lambda x: x, state)
         # restore absorbing dict
         state = state.replace(additional_carry=state.additional_carry.replace(terminal_state_handler_state=state.additional_carry.terminal_state_handler_state.replace(is_absorbing_dict=absorbing_dict)))
+        # update last qpos and qvel
+        state = state.replace(additional_carry=state.additional_carry.replace(init_state_buffer=state.additional_carry.init_state_buffer.replace(last_qpos=data.qpos, last_qvel=data.qvel)))
         return state
 
     def _mjx_create_observation(self, model: Model,

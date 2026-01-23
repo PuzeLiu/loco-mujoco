@@ -38,6 +38,90 @@ def _scatter_actions(num_envs: int,
         full = full.at[:, idx].set(a)
     return full
 
+def step_to_bin(step, B, max_episode_len):
+    step = jnp.clip(step.astype(jnp.int32), 0, max_episode_len - 1)
+    return (step * B) // max_episode_len  # [N] -> bins in [0,B-1]
+
+def buffer_update(buf, value, obs, carry):
+    """
+    buf.qpos:  [B, nq]
+    buf.qvel:  [B, nv]
+    buf.value: [B]
+    value: [N]
+    step: [N]
+    last_qpos: [N, nq]
+    last_qvel: [N, nv]
+    """
+    B = buf.value.shape[1]
+    N = value.shape[0]
+    step = carry.time_step_in_episode
+    env_id = carry.env_id
+    dt = 0.02
+    max_pattern_len = jnp.round(carry.pattern_state.pattern_cycle_time / dt).astype(jnp.int32)
+    step_pattern_len = carry.time_step_in_episode % max_pattern_len
+    bins = step_to_bin(step_pattern_len, B, max_pattern_len)               # [N]
+    qpos = buf.last_qpos
+    qvel = buf.last_qvel
+    delta_action = carry.delta_action
+    # 1) best candidate value per bin from the batch
+    neg_inf = jnp.array(-jnp.inf, dtype=value.dtype)
+    best_val_per_bin = jnp.full((B,), neg_inf, dtype=value.dtype)
+    best_val_per_bin = best_val_per_bin.at[bins].max(value)   # scatter max
+
+    # 2) pick one candidate index per bin achieving best_val_per_bin
+    # mask candidates that are NOT best in their bin
+    is_best = value == best_val_per_bin[bins]                 # [N] bool
+
+    # tie-break: choose smallest index among best candidates in each bin
+    idx = jnp.arange(N, dtype=jnp.int32)
+    big = jnp.iinfo(jnp.int32).max
+    idx_masked = jnp.where(is_best, idx, big)                 # [N]
+    best_idx_per_bin = jnp.full((B,), big, dtype=jnp.int32)
+    best_idx_per_bin = best_idx_per_bin.at[bins].min(idx_masked)  # scatter min
+
+    # bins that received no candidate in this batch
+    has_candidate = best_idx_per_bin != big                   # [B] bool
+
+    # gather the chosen candidates (use safe index 0 where empty)
+    safe_idx = jnp.where(has_candidate, best_idx_per_bin, 0)  # [B]
+    qpos_new = qpos[safe_idx]                                 # [B, nq]
+    qvel_new = qvel[safe_idx]                                 # [B, nv]
+    val_new  = value[safe_idx]                                # [B]
+    step_new = step[safe_idx].astype(jnp.int32)               # [B]
+    jax.debug.print("step_new: {}", step_new)
+    env_id_new = env_id[safe_idx].astype(jnp.int32)           # [B]
+    obs_new = obs[safe_idx]                                   # [B, obs_dim]
+    delta_action_new = delta_action[safe_idx]                 # [B, action_dim]
+    # Replace rule vs existing buffer:
+    # - if slot empty -> fill if has_candidate
+    # - else replace only if val_new > buf.value
+    buf_value = buf.value[0]
+    buf_step = buf.step[0]
+    buf_qpos = buf.qpos[0]
+    buf_qvel = buf.qvel[0]
+    buf_env_id = buf.env_id[0]
+    buf_obs = buf.obs[0]
+    buf_delta_action = buf.delta_action[0]
+    do_update = has_candidate & (val_new > buf_value)
+
+    qpos_out = jnp.where(do_update[:, None], qpos_new, buf_qpos)[None, :, :]
+    qvel_out = jnp.where(do_update[:, None], qvel_new, buf_qvel)[None, :, :]
+    val_out  = jnp.where(do_update, val_new, buf_value)[None, :]
+    step_out = jnp.where(do_update, step_new, buf_step)[None, :]
+    jax.debug.print("do_update: {}", do_update)
+    jax.debug.print("step_out: {}", step_out)
+    env_id_out = jnp.where(do_update, env_id_new, buf_env_id)[None, :]
+    obs_out = jnp.where(do_update[:, None], obs_new, buf_obs)[None, :, :]
+    delta_action_out = jnp.where(do_update[:, None], delta_action_new, buf_delta_action)[None, :, :]
+    # repeat buf.value with val_out
+    buf_qpos_out = jnp.repeat(qpos_out, N, axis=0)
+    buf_qvel_out = jnp.repeat(qvel_out, N, axis=0)
+    buf_value_out = jnp.repeat(val_out, N, axis=0)
+    buf_step_out = jnp.repeat(step_out, N, axis=0)
+    buf_env_id_out = jnp.repeat(env_id_out, N, axis=0)
+    buf_obs_out = jnp.repeat(obs_out, N, axis=0)
+    buf_delta_action_out = jnp.repeat(delta_action_out, N, axis=0)
+    return buf.replace(qpos=buf_qpos_out, qvel=buf_qvel_out, value=buf_value_out, step=buf_step_out, env_id=buf_env_id_out, obs=buf_obs_out, delta_action=buf_delta_action_out)
 
 @dataclass(frozen=True)
 class IPPOAgentConf(AgentConfBase):
@@ -730,6 +814,7 @@ class IPPOJax(JaxRLAlgorithmBase):
 
             keys = jax.random.split(step_rng, len(agent_names) + 1)
             agent_keys = keys[1:]
+            total_values = jnp.zeros(n_envs)
 
             for name, k in zip(agent_names, agent_keys):
                 ts = new_train_states[name]
@@ -740,7 +825,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                     obs,
                     mutable=["run_stats"]
                 )
-                pi, _ = y
+                pi, value = y
+                total_values = total_values + value
 
                 ts = ts.replace(run_stats=updates["run_stats"])
                 a = pi.sample(seed=k)
@@ -749,6 +835,14 @@ class IPPOJax(JaxRLAlgorithmBase):
                 new_train_states[name] = ts
 
             train_states = new_train_states
+            # init_state_buffer = jax.lax.cond(i < 50, lambda x: buffer_update(x, total_values, obs, env_state.additional_carry), lambda x: x, env_state.additional_carry.init_state_buffer)
+            # env_state = env_state.replace(
+            #         env_state=env_state.env_state.replace(
+            #             env_state=env_state.env_state.env_state.replace(
+            #                 additional_carry=env_state.env_state.env_state.additional_carry.replace(init_state_buffer=init_state_buffer)
+            #             )
+            #         )
+            #     )
 
             # === scatter into full env action ===
             action = jnp.zeros((n_envs, full_action_dim), dtype=jnp.float32)
