@@ -16,6 +16,7 @@ from loco_mujoco.algorithms import (JaxRLAlgorithmBase, AgentConfBase, AgentStat
                                     Transition, IPPOTransition, TrainState, TrainStateBuffer, MetricHandlerTransition, AdaptiveLRState)
 # from loco_mujoco.core.wrappers import LogWrapper, NStepWrapper, LogEnvState, VecEnv, NormalizeVecReward, SummaryMetrics
 from loco_mujoco.core.wrappers import RichLogWrapper, NStepWrapper, RichLogEnvState, VecEnv, NormalizeVecRewardDict, SummaryRichMetrics
+from loco_mujoco.core.wrappers.mjx import BaseWrapper
 from loco_mujoco.utils import MetricsHandler, ValidationSummary
 
 
@@ -172,17 +173,37 @@ class IPPOJax(JaxRLAlgorithmBase):
         return tx
 
     @classmethod
+    def build_train_fn(cls, env, agent_conf: IPPOAgentConf, mh: MetricsHandler = None, wandb_run=None):
+        """Returns the main train function of IPPO with optional timestep offset."""
+        config = agent_conf.config.experiment
+        wrapped_env = env if isinstance(env, BaseWrapper) else cls._wrap_env(env, config)
+        return (
+            lambda rng_key, agent_state=None, env_state=None, timesteps=0: cls._train_fn(
+                rng_key,
+                wrapped_env,
+                agent_conf,
+                agent_state,
+                mh=mh,
+                wandb_run=wandb_run,
+                env_state=env_state,
+                timesteps=timesteps,
+            )
+        )
+    
+    @classmethod
     def _train_fn(cls, rng, env,
                   agent_conf: IPPOAgentConf,
                   agent_state: IPPOAgentState = None,
                   mh: MetricsHandler = None,
                   wandb_run=None,
+                  env_state=None,
+                  timesteps: int = 0,
                   ):
-
         # extract static agent info
         config = agent_conf.config.experiment
 
-        env = cls._wrap_env(env, config)
+        if not isinstance(env, BaseWrapper):
+            env = cls._wrap_env(env, config)
 
         agent_names = tuple(agent_conf.networks.keys())
 
@@ -194,6 +215,8 @@ class IPPOJax(JaxRLAlgorithmBase):
 
         full_action_dim = env.info.action_space.shape[0]
         num_envs = config.num_envs
+
+        global_timesteps = timesteps if env_state is None else jnp.zeros_like(timesteps)
 
         # extract current agent state
         if agent_state is not None:
@@ -220,10 +243,13 @@ class IPPOJax(JaxRLAlgorithmBase):
                     tx=agent_conf.txs[name],
                 )
 
-        # INIT ENV
-        rng, _rng = jax.random.split(rng)
-        reset_rng = jax.random.split(_rng, config.num_envs)
-        obsv, env_state = env.reset(reset_rng, env_id=jnp.arange(config.num_envs))
+        # INIT ENV (only if no previous env_state is provided)
+        if env_state is None:
+            rng, _rng = jax.random.split(rng)
+            reset_rng = jax.random.split(_rng, config.num_envs)
+            obsv, env_state = env.reset(reset_rng, env_id=jnp.arange(config.num_envs))
+        else:
+            obsv = env_state.observation
 
         train_state_buffer = TrainStateBuffer.create(next(iter(train_states.values())), config.validation.num)
 
@@ -471,11 +497,6 @@ class IPPOJax(JaxRLAlgorithmBase):
             rng = update_state[-1]
 
             ref_agent = agent_names[0]
-            ref_train_state = train_states[ref_agent]
-
-            counter = ((ref_train_state.step + 1)
-                    // config.num_minibatches
-                    // config.update_epochs)
 
             logged_metrics = traj_batch.metrics
 
@@ -486,84 +507,13 @@ class IPPOJax(JaxRLAlgorithmBase):
             metric = SummaryRichMetrics(
                 mean_episode_return=jnp.sum(jnp.where(logged_metrics.done, logged_metrics.returned_episode_returns, 0.0)) / jnp.sum(logged_metrics.done),
                 mean_episode_length=jnp.sum(jnp.where(logged_metrics.done, logged_metrics.returned_episode_lengths, 0.0)) / jnp.sum(logged_metrics.done),
-                max_timestep=jnp.max(logged_metrics.timestep * config.num_envs),
+                max_timestep=global_timesteps + jnp.max(logged_metrics.timestep * config.num_envs),
                 frac_absorbed=jnp.sum(jnp.where(logged_metrics.done, logged_metrics.absorbed, 0.0)) / (jnp.sum(logged_metrics.done) + 1e-6),
                 mean_episode_return_components=mean_episode_return_components,
                 curriculum_step=jnp.mean(logged_metrics.curriculum_step),
             )
 
-            def _evaluation_step():
-
-                def _eval_env(runner_state, unused):
-                    train_states, env_state, last_obs, train_state_buffer, rng = runner_state
-
-                    # SELECT ACTION
-                    rng, _rng = jax.random.split(rng)
-                    agent_actions = {}
-                    new_train_states = dict(train_states)
-
-                    keys = jax.random.split(_rng, len(agent_names) + 1)
-                    rng_next = keys[0]
-                    agent_keys = keys[1:]
-
-                    for name, k in zip(agent_names, agent_keys):
-                        ts = new_train_states[name]
-                        net = agent_conf.networks[name]
-
-                        y, updates = net.apply(
-                            {"params": ts.params, "run_stats": ts.run_stats},
-                            last_obs,
-                            mutable=["run_stats"],
-                        )
-                        pi, _ = y
-                        ts = ts.replace(run_stats=updates["run_stats"])
-                        a = pi.sample(seed=k)
-
-                        agent_actions[name] = a
-                        new_train_states[name] = ts
-
-                    action = _scatter_actions(
-                        config.validation.num_envs,
-                        env.info.action_space.shape[0],
-                        agent_actions,
-                        agent_action_idx
-                    )
-                    # STEP ENV
-                    obsv, reward, absorbing, done, info, env_state = env.step(env_state, action)
-
-                    # GET METRICS
-                    log_env_state = env_state.find(RichLogEnvState)
-                    logged_metrics = log_env_state.metrics
-
-                    transition = MetricHandlerTransition(env_state, logged_metrics)
-
-                    runner_state = (new_train_states, env_state, obsv, train_state_buffer, rng_next)
-                    return runner_state, transition
-                
-
-                rng = runner_state[-1]
-                reset_rng = jax.random.split(rng, config.validation.num_envs)
-                obsv, env_state = env.reset(reset_rng, env_id=jnp.arange(config.validation.num_envs))
-                runner_state_eval = (train_states, env_state, obsv, train_state_buffer, rng)
-
-                # do evaluation runs
-                _, traj_batch_eval = jax.lax.scan(
-                    _eval_env, runner_state_eval, None, config.validation.num_steps
-                )
-
-                env_states = traj_batch_eval.env_state
-
-                validation_metrics = mh(env_states)
-
-                return validation_metrics
-
-            if mh is None:
-                validation_metrics = ValidationSummary()
-            else:
-                validation_metrics = jax.lax.cond(counter % config.validation_interval == 0, _evaluation_step,
-                                                   mh.get_zero_container)
-
-            def callback(metric, live_info, validation_info):
+            def callback(metric, live_info):
                 mean_ep_return = metric.mean_episode_return
                 mean_ep_length = metric.mean_episode_length
                 timestep = metric.max_timestep
@@ -583,9 +533,6 @@ class IPPOJax(JaxRLAlgorithmBase):
                     for key, value in live_info.items():
                         wandb_log_dict["Live Info/" + key] = value
 
-                    for key, value in validation_info.items():
-                        wandb_log_dict["Validation Info/" + key] = value
-
                     for key in mean_ep_return_components.keys():
                         group = "Live Return Components"
                         if mean_ep_return_components[key] != 0.0:
@@ -594,55 +541,99 @@ class IPPOJax(JaxRLAlgorithmBase):
                             continue
                     wandb_run.log(wandb_log_dict, step=timestep)                
 
-            # --- add validation metrics when applicable ---
-            def make_validation_info(_):
-                return {
-                    "Mean Return": validation_metrics.mean_episode_return,
-                    "Mean Length": validation_metrics.mean_episode_length,
-                }
-
-            def empty_validation_info(_):
-                return {
-                    "Mean Return": jnp.nan,
-                    "Mean Length": jnp.nan,
-                }
-
-            validation_info = jax.lax.cond(
-                (counter % config.validation_interval) == 0,
-                make_validation_info,
-                empty_validation_info,
-                operand=None
-            )
             ts = train_states[ref_agent]
             live_info = {
                 "Learning Rate": ts.adaptive_lr_state.learning_rate
                 if config.get("adaptive_lr", False) else config.lr,
             }
-            jax.debug.callback(callback, metric, live_info=live_info, validation_info=validation_info)
+            jax.debug.callback(callback, metric, live_info=live_info)
 
-            # add train state to buffer if needed
-            train_state_buffer = jax.lax.cond(
-                counter % config.validation_interval == 0,
-                lambda x, y: TrainStateBuffer.add(x, y),
-                lambda x, y: x,
-                train_state_buffer,
-                ref_train_state
-            )
+            # no train state buffering during training (validation only at end)
 
             runner_state = (train_states, env_state, last_obs, train_state_buffer, rng)
-            return runner_state, (metric, validation_metrics)
+            return runner_state, (metric, metric.max_timestep)
 
         rng, _rng = jax.random.split(rng)
         runner_state = (train_states, env_state, obsv, train_state_buffer, _rng)
-        runner_state, metrics = jax.lax.scan(
+        runner_state, (metric, global_timesteps) = jax.lax.scan(
             _update_step, runner_state, None, config.num_updates
         )
 
         agent_state = cls._agent_state(train_states=runner_state[0])
+        env_state_out = runner_state[1]
+
+        # Single evaluation after training completes
+        if mh is not None:
+            final_train_states = runner_state[0]
+            final_rng = runner_state[-1]
+            
+            def _final_eval_env(runner_state, unused):
+                train_states, env_state, last_obs, train_state_buffer, rng = runner_state
+
+                # SELECT ACTION
+                rng, _rng = jax.random.split(rng)
+                agent_actions = {}
+                new_train_states = dict(train_states)
+
+                keys = jax.random.split(_rng, len(agent_names) + 1)
+                rng_next = keys[0]
+                agent_keys = keys[1:]
+
+                for name, k in zip(agent_names, agent_keys):
+                    ts = new_train_states[name]
+                    net = agent_conf.networks[name]
+
+                    y, updates = net.apply(
+                        {"params": ts.params, "run_stats": ts.run_stats},
+                        last_obs,
+                        mutable=["run_stats"],
+                    )
+                    pi, _ = y
+                    ts = ts.replace(run_stats=updates["run_stats"])
+                    a = pi.sample(seed=k)
+
+                    agent_actions[name] = a
+                    new_train_states[name] = ts
+
+                action = _scatter_actions(
+                    config.validation.num_envs,
+                    env.info.action_space.shape[0],
+                    agent_actions,
+                    agent_action_idx
+                )
+                # STEP ENV
+                obsv, reward, absorbing, done, info, env_state = env.step(env_state, action)
+
+                # GET METRICS
+                log_env_state = env_state.find(RichLogEnvState)
+                logged_metrics = log_env_state.metrics
+
+                transition = MetricHandlerTransition(env_state, logged_metrics)
+
+                runner_state = (new_train_states, env_state, obsv, train_state_buffer, rng_next)
+                return runner_state, transition
+
+            eval_rng = final_rng
+            reset_rng = jax.random.split(eval_rng, config.validation.num_envs)
+            obsv, eval_env_state = env.reset(reset_rng, env_id=jnp.arange(config.validation.num_envs))
+            train_state_buffer = TrainStateBuffer.create(next(iter(final_train_states.values())), config.validation.num)
+            runner_state_eval = (final_train_states, eval_env_state, obsv, train_state_buffer, eval_rng)
+
+            # do evaluation runs
+            _, traj_batch_eval = jax.lax.scan(
+                _final_eval_env, runner_state_eval, None, config.validation.num_steps
+            )
+
+            env_states = traj_batch_eval.env_state
+            validation_metrics = mh(env_states)
+        else:
+            validation_metrics = ValidationSummary()
 
         return {"agent_state": agent_state,
-                "training_metrics": metrics[0],
-                "validation_metrics": metrics[1]}
+                "env_state": env_state_out,
+                "training_metrics": metric,
+                "validation_metrics": validation_metrics,
+                "global_timesteps": global_timesteps}
 
     @classmethod
     def play_policy(cls, env,
