@@ -221,6 +221,12 @@ class Mjx(Mujoco):
             carry = carry.replace(history=history)
         carry = carry.replace(cur_step_in_episode=carry.cur_step_in_episode + 1)
         carry = carry.replace(time_step_in_episode=carry.time_step_in_episode + 1)
+        carry = carry.replace(
+            max_time_step_in_episode=jnp.maximum(
+                carry.max_time_step_in_episode,
+                carry.time_step_in_episode,
+            )
+        )
         # create state
         state = state.replace(data=data, observation=cur_obs, reward=reward,
                               absorbing=absorbing, done=done, info=cur_info, additional_carry=carry)
@@ -230,7 +236,7 @@ class Mjx(Mujoco):
         # restore absorbing dict
         state = state.replace(additional_carry=state.additional_carry.replace(terminal_state_handler_state=state.additional_carry.terminal_state_handler_state.replace(is_absorbing_dict=absorbing_dict)))
         # update last qpos and qvel
-        state = state.replace(additional_carry=state.additional_carry.replace(init_state_buffer=state.additional_carry.init_state_buffer.replace(last_qpos=data.qpos, last_qvel=data.qvel)))
+        state = state.replace(additional_carry=state.additional_carry.replace(init_state_buffer=state.additional_carry.init_state_buffer.replace(last_qpos=state.data.qpos, last_qvel=state.data.qvel)))
         return state
 
     def _mjx_create_observation(self, model: Model,

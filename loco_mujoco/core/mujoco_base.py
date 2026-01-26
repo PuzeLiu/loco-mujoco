@@ -91,6 +91,7 @@ class AdditionalCarry:
     curriculum: CurriculumState
     init_state_buffer: InitStateBuffer
     time_step_in_episode: int
+    max_time_step_in_episode: int
     last_obs: np.ndarray | jax.Array
     last_delta_action: np.ndarray | jax.Array
 
@@ -937,6 +938,7 @@ class Mujoco:
                 last_qvel=backend.zeros(model.nv),
             ),
             time_step_in_episode=1,
+            max_time_step_in_episode=1,
             last_obs=backend.zeros(self.info.observation_space.shape[-1]),
             last_delta_action=backend.zeros(self.info.action_space.shape[-1]),
         )

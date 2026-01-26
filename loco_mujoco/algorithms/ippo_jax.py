@@ -42,7 +42,7 @@ def step_to_bin(step, B, max_episode_len):
     step = jnp.clip(step.astype(jnp.int32), 0, max_episode_len - 1)
     return (step * B) // max_episode_len  # [N] -> bins in [0,B-1]
 
-def buffer_update(buf, value, obs, carry):
+def buffer_update(carry, value, obs, value_fn=None):
     """
     buf.qpos:  [B, nq]
     buf.qvel:  [B, nv]
@@ -52,12 +52,31 @@ def buffer_update(buf, value, obs, carry):
     last_qpos: [N, nq]
     last_qvel: [N, nv]
     """
-    B = buf.value.shape[1]
+    buf = carry.init_state_buffer
+    buf_value = buf.value[0] if buf.value.ndim == 2 else buf.value
+    buf_step = buf.step[0] if buf.step.ndim == 2 else buf.step
+    buf_qpos = buf.qpos[0] if buf.qpos.ndim == 3 else buf.qpos
+    buf_qvel = buf.qvel[0] if buf.qvel.ndim == 3 else buf.qvel
+    buf_env_id = buf.env_id[0] if buf.env_id.ndim == 2 else buf.env_id
+    buf_obs = buf.obs[0] if buf.obs.ndim == 3 else buf.obs
+    buf_delta_action = buf.delta_action[0] if buf.delta_action.ndim == 3 else buf.delta_action
+
+    B = buf_value.shape[0]
     N = value.shape[0]
+    if value_fn is not None:
+        reeval_values = value_fn(buf_obs)
+        buf_value = reeval_values
+        if buf.value.ndim == 2:
+            buf = buf.replace(value=jnp.repeat(reeval_values[None, :], N, axis=0))
+        else:
+            buf = buf.replace(value=reeval_values)
     step = carry.time_step_in_episode
     env_id = carry.env_id
     dt = 0.02
     max_pattern_len = jnp.round(carry.pattern_state.pattern_cycle_time / dt).astype(jnp.int32)
+    max_timestep = jnp.max(carry.max_time_step_in_episode).astype(jnp.int32)
+    # max_pattern_len = jnp.minimum(max_pattern_len, max_timestep)
+    max_pattern_len = jnp.maximum(max_pattern_len, 1)
     step_pattern_len = carry.time_step_in_episode % max_pattern_len
     bins = step_to_bin(step_pattern_len, B, max_pattern_len)               # [N]
     qpos = buf.last_qpos
@@ -88,28 +107,18 @@ def buffer_update(buf, value, obs, carry):
     qvel_new = qvel[safe_idx]                                 # [B, nv]
     val_new  = value[safe_idx]                                # [B]
     step_new = step[safe_idx].astype(jnp.int32)               # [B]
-    jax.debug.print("step_new: {}", step_new)
     env_id_new = env_id[safe_idx].astype(jnp.int32)           # [B]
     obs_new = obs[safe_idx]                                   # [B, obs_dim]
     delta_action_new = delta_action[safe_idx]                 # [B, action_dim]
     # Replace rule vs existing buffer:
     # - if slot empty -> fill if has_candidate
     # - else replace only if val_new > buf.value
-    buf_value = buf.value[0]
-    buf_step = buf.step[0]
-    buf_qpos = buf.qpos[0]
-    buf_qvel = buf.qvel[0]
-    buf_env_id = buf.env_id[0]
-    buf_obs = buf.obs[0]
-    buf_delta_action = buf.delta_action[0]
     do_update = has_candidate & (val_new > buf_value)
 
     qpos_out = jnp.where(do_update[:, None], qpos_new, buf_qpos)[None, :, :]
     qvel_out = jnp.where(do_update[:, None], qvel_new, buf_qvel)[None, :, :]
     val_out  = jnp.where(do_update, val_new, buf_value)[None, :]
     step_out = jnp.where(do_update, step_new, buf_step)[None, :]
-    jax.debug.print("do_update: {}", do_update)
-    jax.debug.print("step_out: {}", step_out)
     env_id_out = jnp.where(do_update, env_id_new, buf_env_id)[None, :]
     obs_out = jnp.where(do_update[:, None], obs_new, buf_obs)[None, :, :]
     delta_action_out = jnp.where(do_update[:, None], delta_action_new, buf_delta_action)[None, :, :]
@@ -322,6 +331,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                 agent_actions = {}
                 agent_values = {}
                 agent_log_probs = {}
+                total_values = jnp.zeros(num_envs)
 
                 # update run_stats per agent during action selection
                 new_train_states = dict(train_states)
@@ -348,8 +358,39 @@ class IPPOJax(JaxRLAlgorithmBase):
 
                     agent_actions[name] = a
                     agent_values[name] = value
+                    total_values = total_values + value
                     agent_log_probs[name] = lp
                     new_train_states[name] = ts
+
+                def _buffer_value_fn(buffer_obs):
+                    total = jnp.zeros((buffer_obs.shape[0],), dtype=buffer_obs.dtype)
+                    for name in agent_names:
+                        ts = new_train_states[name]
+                        net = agent_conf.networks[name]
+                        y = net.apply(
+                            {"params": ts.params, "run_stats": ts.run_stats},
+                            buffer_obs,
+                        )
+                        _, value = y
+                        total = total + value
+                    return total
+
+                # update init state buffer
+                init_state_buffer = buffer_update(
+                    env_state.additional_carry,
+                    total_values,
+                    last_obs,
+                    value_fn=_buffer_value_fn,
+                )
+                env_state = env_state.replace(
+                    env_state=env_state.env_state.replace(
+                        env_state=env_state.env_state.env_state.replace(
+                            additional_carry=env_state.env_state.env_state.additional_carry.replace(
+                                init_state_buffer=init_state_buffer
+                            )
+                        )
+                    )
+                )
 
                 action = _scatter_actions(num_envs, full_action_dim, agent_actions, agent_action_idx)
 
@@ -816,13 +857,18 @@ class IPPOJax(JaxRLAlgorithmBase):
             agent_keys = keys[1:]
             total_values = jnp.zeros(n_envs)
 
+            if use_mujoco:
+                obs_for_policy = obs
+            else:
+                obs_for_policy = env.find_attr(env_state, "observation") if hasattr(env, "find_attr") else env_state.observation
+
             for name, k in zip(agent_names, agent_keys):
                 ts = new_train_states[name]
                 net = agent_conf.networks[name]
 
                 y, updates = net.apply(
                     {"params": ts.params, "run_stats": ts.run_stats},
-                    obs,
+                    obs_for_policy,
                     mutable=["run_stats"]
                 )
                 pi, value = y
@@ -835,14 +881,33 @@ class IPPOJax(JaxRLAlgorithmBase):
                 new_train_states[name] = ts
 
             train_states = new_train_states
-            # init_state_buffer = jax.lax.cond(i < 50, lambda x: buffer_update(x, total_values, obs, env_state.additional_carry), lambda x: x, env_state.additional_carry.init_state_buffer)
-            # env_state = env_state.replace(
-            #         env_state=env_state.env_state.replace(
-            #             env_state=env_state.env_state.env_state.replace(
-            #                 additional_carry=env_state.env_state.env_state.additional_carry.replace(init_state_buffer=init_state_buffer)
-            #             )
-            #         )
-            #     )
+
+            def _buffer_value_fn(buffer_obs):
+                total = jnp.zeros((buffer_obs.shape[0],), dtype=buffer_obs.dtype)
+                for name in agent_names:
+                    ts = train_states[name]
+                    net = agent_conf.networks[name]
+                    y = net.apply(
+                        {"params": ts.params, "run_stats": ts.run_stats},
+                        buffer_obs,
+                    )
+                    _, value = y
+                    total = total + value
+                return total
+
+            init_state_buffer = buffer_update(
+                env_state.additional_carry,
+                total_values,
+                obs_for_policy,
+                value_fn=_buffer_value_fn,
+            )
+            env_state = env_state.replace(
+                    env_state=env_state.env_state.replace(
+                        env_state=env_state.env_state.env_state.replace(
+                            additional_carry=env_state.env_state.env_state.additional_carry.replace(init_state_buffer=init_state_buffer)
+                        )
+                    )
+                )
 
             # === scatter into full env action ===
             action = jnp.zeros((n_envs, full_action_dim), dtype=jnp.float32)

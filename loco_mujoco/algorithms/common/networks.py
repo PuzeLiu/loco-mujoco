@@ -151,6 +151,11 @@ class RunningMeanStd(nn.Module):
         var = self.variable('run_stats', 'var', lambda: jnp.ones(x.shape[-1]))
         count = self.variable('run_stats', 'count', lambda: jnp.array(1e-6))
 
+        # If run_stats is immutable, do not update state (eval/inference mode).
+        if not self.is_mutable_collection("run_stats"):
+            normalized_x = (x - mean.value) / jnp.sqrt(var.value + 1e-8)
+            return jnp.squeeze(normalized_x)
+
         # Compute batch mean and variance
         batch_mean = jnp.mean(x, axis=0)
         batch_var = jnp.var(x, axis=0) + 1e-6  # Add epsilon for numerical stability
