@@ -65,6 +65,7 @@ class InitStateBuffer:
     obs: np.ndarray | jax.Array
     delta_action: np.ndarray | jax.Array
     env_id: np.ndarray | jax.Array
+    ball_errors: np.ndarray | jax.Array
     last_qpos: np.ndarray | jax.Array
     last_qvel: np.ndarray | jax.Array
 
@@ -94,6 +95,7 @@ class AdditionalCarry:
     max_time_step_in_episode: int
     last_obs: np.ndarray | jax.Array
     last_delta_action: np.ndarray | jax.Array
+    ball_errors: np.ndarray | jax.Array
 
 
 class Mujoco:
@@ -934,6 +936,7 @@ class Mujoco:
                 obs=backend.zeros((5, self.info.observation_space.shape[-1])),
                 delta_action=backend.zeros((5, self.info.action_space.shape[-1])),
                 env_id=backend.zeros(5),
+                ball_errors=backend.zeros(5),
                 last_qpos=backend.zeros(model.nq),
                 last_qvel=backend.zeros(model.nv),
             ),
@@ -941,6 +944,7 @@ class Mujoco:
             max_time_step_in_episode=1,
             last_obs=backend.zeros(self.info.observation_space.shape[-1]),
             last_delta_action=backend.zeros(self.info.action_space.shape[-1]),
+            ball_errors=backend.zeros(self.n_balls),
         )
 
         return carry

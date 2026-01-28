@@ -60,6 +60,7 @@ def buffer_update(carry, value, obs, value_fn=None):
     buf_env_id = buf.env_id[0] if buf.env_id.ndim == 2 else buf.env_id
     buf_obs = buf.obs[0] if buf.obs.ndim == 3 else buf.obs
     buf_delta_action = buf.delta_action[0] if buf.delta_action.ndim == 3 else buf.delta_action
+    buf_ball_errors = buf.ball_errors[0] if buf.ball_errors.ndim == 2 else buf.ball_errors
 
     B = buf_value.shape[0]
     N = value.shape[0]
@@ -72,6 +73,9 @@ def buffer_update(carry, value, obs, value_fn=None):
             buf = buf.replace(value=reeval_values)
     step = carry.time_step_in_episode
     env_id = carry.env_id
+    ball_errors = jnp.max(carry.ball_errors, axis=-1)
+    # mask out value to negative infinity if ball error is greater than 0.05
+    value = jnp.where(ball_errors > 0.1, -jnp.inf, value)
     dt = 0.02
     max_pattern_len = jnp.round(carry.pattern_state.pattern_cycle_time / dt).astype(jnp.int32)
     max_timestep = jnp.max(carry.max_time_step_in_episode).astype(jnp.int32)
@@ -110,6 +114,7 @@ def buffer_update(carry, value, obs, value_fn=None):
     env_id_new = env_id[safe_idx].astype(jnp.int32)           # [B]
     obs_new = obs[safe_idx]                                   # [B, obs_dim]
     delta_action_new = delta_action[safe_idx]                 # [B, action_dim]
+    ball_errors_new = ball_errors[safe_idx]                   # [B]
     # Replace rule vs existing buffer:
     # - if slot empty -> fill if has_candidate
     # - else replace only if val_new > buf.value
@@ -122,6 +127,7 @@ def buffer_update(carry, value, obs, value_fn=None):
     env_id_out = jnp.where(do_update, env_id_new, buf_env_id)[None, :]
     obs_out = jnp.where(do_update[:, None], obs_new, buf_obs)[None, :, :]
     delta_action_out = jnp.where(do_update[:, None], delta_action_new, buf_delta_action)[None, :, :]
+    ball_errors_out = jnp.where(do_update, ball_errors_new, buf_ball_errors)[None, :]
     # repeat buf.value with val_out
     buf_qpos_out = jnp.repeat(qpos_out, N, axis=0)
     buf_qvel_out = jnp.repeat(qvel_out, N, axis=0)
@@ -130,7 +136,15 @@ def buffer_update(carry, value, obs, value_fn=None):
     buf_env_id_out = jnp.repeat(env_id_out, N, axis=0)
     buf_obs_out = jnp.repeat(obs_out, N, axis=0)
     buf_delta_action_out = jnp.repeat(delta_action_out, N, axis=0)
-    return buf.replace(qpos=buf_qpos_out, qvel=buf_qvel_out, value=buf_value_out, step=buf_step_out, env_id=buf_env_id_out, obs=buf_obs_out, delta_action=buf_delta_action_out)
+    buf_ball_errors_out = jnp.repeat(ball_errors_out, N, axis=0)
+    return buf.replace(qpos=buf_qpos_out, 
+                        qvel=buf_qvel_out, 
+                        value=buf_value_out, 
+                        step=buf_step_out, 
+                        env_id=buf_env_id_out, 
+                        obs=buf_obs_out, 
+                        delta_action=buf_delta_action_out, 
+                        ball_errors=buf_ball_errors_out)
 
 @dataclass(frozen=True)
 class IPPOAgentConf(AgentConfBase):
@@ -412,6 +426,9 @@ class IPPOJax(JaxRLAlgorithmBase):
                         )
                     )
                 )
+                ball_errors = jnp.ones_like(logged_metrics.ball_errors)
+                ball_errors = ball_errors.at[:5].set(init_state_buffer.ball_errors[0])
+                logged_metrics = logged_metrics.replace(ball_errors=ball_errors)
 
                 transition = IPPOTransition(
                     done=done,
@@ -615,6 +632,9 @@ class IPPOJax(JaxRLAlgorithmBase):
                 frac_absorbed=jnp.sum(jnp.where(logged_metrics.done, logged_metrics.absorbed, 0.0)) / (jnp.sum(logged_metrics.done) + 1e-6),
                 mean_episode_return_components=mean_episode_return_components,
                 curriculum_step=jnp.mean(logged_metrics.curriculum_step),
+                ball_errors_mean=jnp.mean(logged_metrics.ball_errors[:, :5]),
+                ball_errors_max=jnp.max(logged_metrics.ball_errors[:, :5]),
+                ball_errors_min=jnp.min(logged_metrics.ball_errors[:, :5]),
             )
 
             def _evaluation_step():
@@ -695,6 +715,9 @@ class IPPOJax(JaxRLAlgorithmBase):
                 frac_absorbed = metric.frac_absorbed
                 mean_ep_return_components = metric.mean_episode_return_components                
                 curriculum_step = metric.curriculum_step
+                ball_errors_mean = metric.ball_errors_mean
+                ball_errors_max = metric.ball_errors_max
+                ball_errors_min = metric.ball_errors_min
 
                 if config.debug:
                     print(f"timestep={timestep}, episodic return={mean_ep_return}, episodic length={mean_ep_length}, absorbed={frac_absorbed}")
@@ -704,6 +727,9 @@ class IPPOJax(JaxRLAlgorithmBase):
                     wandb_log_dict["Live Info/Mean Episode Length"] = mean_ep_length
                     wandb_log_dict["Live Info/Absorbed Envs"] = frac_absorbed
                     wandb_log_dict["Live Info/Curriculum Step"] = curriculum_step
+                    wandb_log_dict["Live Info/Ball Errors Mean"] = ball_errors_mean
+                    wandb_log_dict["Live Info/Ball Errors Max"] = ball_errors_max
+                    wandb_log_dict["Live Info/Ball Errors Min"] = ball_errors_min
                     # also log other live info
                     for key, value in live_info.items():
                         wandb_log_dict["Live Info/" + key] = value

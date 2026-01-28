@@ -111,6 +111,9 @@ class SummaryRichMetrics:
     frac_absorbed: float = 0.0
     mean_episode_return_components: dict = dataclasses.field(default_factory=lambda: {})
     curriculum_step: int = 0
+    ball_errors_mean: float = 0.0
+    ball_errors_max: float = 0.0
+    ball_errors_min: float = 0.0
 
 @struct.dataclass
 class Metrics:
@@ -133,6 +136,7 @@ class RichMetrics:
     episode_return_components: dict[str, float]
     returned_episode_return_components: dict[str, float]
     curriculum_step: int
+    ball_errors: float
 
 
 @struct.dataclass
@@ -189,7 +193,7 @@ class RichLogWrapper(BaseWrapper):
 
         state = RichLogEnvState(env_state, 
                             metrics=RichMetrics(0, 0, 0, 0, 0, False, False, 
-                                                zero_components.copy(), zero_components.copy(), 0))
+                                                zero_components.copy(), zero_components.copy(), 0, 0.0))
         return obs, state
 
     @partial(jax.jit, static_argnums=(0,))
@@ -242,6 +246,7 @@ class RichLogWrapper(BaseWrapper):
                 episode_return_components=episode_return_components,
                 returned_episode_return_components=returned_episode_return_components,
                 curriculum_step=env_state.additional_carry.curriculum.step,
+                ball_errors=0.0,
                 ),
         )
         return next_observation, reward, absorbing, done, info, state
