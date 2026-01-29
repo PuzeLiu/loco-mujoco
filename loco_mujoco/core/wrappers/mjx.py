@@ -114,6 +114,9 @@ class SummaryRichMetrics:
     ball_errors_mean: float = 0.0
     ball_errors_max: float = 0.0
     ball_errors_min: float = 0.0
+    value_mean: float = 0.0
+    value_std: float = 0.0
+    value_lower_bound: float = 0.0
 
 @struct.dataclass
 class Metrics:
@@ -463,4 +466,3 @@ class NormalizeVecRewardDict(BaseWrapper):
         info['agent_rewards'] = agent_rewards
 
         return next_observation, reward, absorbing, done, info, state
-

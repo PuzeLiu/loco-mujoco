@@ -106,6 +106,7 @@ class ActorCritic(nn.Module):
     hidden_layer_dims: Sequence[int] = (1024, 512)
     actor_obs_ind: jnp.ndarray = None
     critic_obs_ind: jnp.ndarray = None
+    value_ensemble_size: int = 1
     # random: bool = False
 
     def setup(self):
@@ -133,9 +134,32 @@ class ActorCritic(nn.Module):
 
         # build critic
         critic_x = x if self.critic_obs_ind is None else x[..., self.critic_obs_ind]
-        critic = FullyConnectedNet(self.hidden_layer_dims, 1, self.activation, None, False, False)(critic_x)
+        if self.value_ensemble_size == 1:
+            critic = FullyConnectedNet(
+                self.hidden_layer_dims,
+                1,
+                self.activation,
+                None,
+                False,
+                False,
+            )(critic_x)
+            return pi, jnp.squeeze(critic, axis=-1)
 
-        return pi, jnp.squeeze(critic, axis=-1)
+        critics = []
+        for i in range(self.value_ensemble_size):
+            critic_i = FullyConnectedNet(
+                self.hidden_layer_dims,
+                1,
+                self.activation,
+                None,
+                False,
+                False,
+                name=f"critic_{i}",
+            )(critic_x)
+            critics.append(jnp.squeeze(critic_i, axis=-1))
+
+        critic = jnp.stack(critics, axis=-1)
+        return pi, critic
 
 
 class RunningMeanStd(nn.Module):

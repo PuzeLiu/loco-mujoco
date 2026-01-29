@@ -19,6 +19,21 @@ from loco_mujoco.algorithms import (JaxRLAlgorithmBase, AgentConfBase, AgentStat
 from loco_mujoco.core.wrappers import RichLogWrapper, NStepWrapper, RichLogEnvState, VecEnv, NormalizeVecRewardDict, SummaryRichMetrics
 from loco_mujoco.utils import MetricsHandler, ValidationSummary
 
+VALUE_UNCERTAINTY_BETA = 1.0
+
+
+def _value_stats(value: jnp.ndarray, beta: float = VALUE_UNCERTAINTY_BETA):
+    if value.ndim == 1:
+        value_ensemble = value[:, None]
+        value_mean = value
+        value_std = jnp.zeros_like(value)
+    else:
+        value_ensemble = value
+        value_mean = jnp.mean(value_ensemble, axis=-1)
+        value_std = jnp.std(value_ensemble, axis=-1)
+    value_lower_bound = value_mean - beta * value_std
+    return value_mean, value_std, value_lower_bound, value_ensemble
+
 
 def _scatter_actions(num_envs: int,
                      full_action_dim: int,
@@ -43,18 +58,21 @@ def step_to_bin(step, B, max_episode_len):
     step = jnp.clip(step.astype(jnp.int32), 0, max_episode_len - 1)
     return (step * B) // max_episode_len  # [N] -> bins in [0,B-1]
 
-def buffer_update(carry, value, obs, value_fn=None):
+def buffer_update(carry, value_mean, value_std, value_lower_bound, obs, value_fn=None):
     """
     buf.qpos:  [B, nq]
     buf.qvel:  [B, nv]
     buf.value: [B]
-    value: [N]
+    value_mean/value_std/value_lower_bound: [N]
     step: [N]
     last_qpos: [N, nq]
     last_qvel: [N, nv]
     """
     buf = carry.init_state_buffer
     buf_value = buf.value[0] if buf.value.ndim == 2 else buf.value
+    buf_value_mean = buf.value_mean[0] if buf.value_mean.ndim == 2 else buf.value_mean
+    buf_value_std = buf.value_std[0] if buf.value_std.ndim == 2 else buf.value_std
+    buf_value_lower_bound = buf.value_lower_bound[0] if buf.value_lower_bound.ndim == 2 else buf.value_lower_bound
     buf_step = buf.step[0] if buf.step.ndim == 2 else buf.step
     buf_qpos = buf.qpos[0] if buf.qpos.ndim == 3 else buf.qpos
     buf_qvel = buf.qvel[0] if buf.qvel.ndim == 3 else buf.qvel
@@ -64,19 +82,32 @@ def buffer_update(carry, value, obs, value_fn=None):
     buf_ball_errors = buf.ball_errors[0] if buf.ball_errors.ndim == 2 else buf.ball_errors
 
     B = buf_value.shape[0]
-    N = value.shape[0]
+    N = value_lower_bound.shape[0]
     if value_fn is not None:
-        reeval_values = value_fn(buf_obs)
-        buf_value = reeval_values
+        reeval_value_mean, reeval_value_std, reeval_value_lower_bound = value_fn(buf_obs)
+        buf_value_mean = reeval_value_mean
+        buf_value_std = reeval_value_std
+        buf_value_lower_bound = reeval_value_lower_bound
+        buf_value = reeval_value_lower_bound
         if buf.value.ndim == 2:
-            buf = buf.replace(value=jnp.repeat(reeval_values[None, :], N, axis=0))
+            buf = buf.replace(
+                value=jnp.repeat(reeval_value_lower_bound[None, :], N, axis=0),
+                value_mean=jnp.repeat(reeval_value_mean[None, :], N, axis=0),
+                value_std=jnp.repeat(reeval_value_std[None, :], N, axis=0),
+                value_lower_bound=jnp.repeat(reeval_value_lower_bound[None, :], N, axis=0),
+            )
         else:
-            buf = buf.replace(value=reeval_values)
+            buf = buf.replace(
+                value=reeval_value_lower_bound,
+                value_mean=reeval_value_mean,
+                value_std=reeval_value_std,
+                value_lower_bound=reeval_value_lower_bound,
+            )
     step = carry.time_step_in_episode
     env_id = carry.env_id
     ball_errors = jnp.max(carry.ball_errors, axis=-1)
     # mask out value to negative infinity if ball error is greater than 0.05
-    value = jnp.where(ball_errors > 0.1, -jnp.inf, value)
+    value = jnp.where(ball_errors > 0.1, -jnp.inf, value_lower_bound)
     value = jnp.where(ball_errors < 0.01, -jnp.inf, value)
     # value = jnp.where(carry.total_timestep < 7000, -jnp.inf, value)
     dt = 0.02
@@ -113,6 +144,9 @@ def buffer_update(carry, value, obs, value_fn=None):
     qpos_new = qpos[safe_idx]                                 # [B, nq]
     qvel_new = qvel[safe_idx]                                 # [B, nv]
     val_new  = value[safe_idx]                                # [B]
+    val_mean_new = value_mean[safe_idx]                       # [B]
+    val_std_new = value_std[safe_idx]                         # [B]
+    val_lb_new = value_lower_bound[safe_idx]                  # [B]
     step_new = step[safe_idx].astype(jnp.int32)               # [B]
     env_id_new = env_id[safe_idx].astype(jnp.int32)           # [B]
     obs_new = obs[safe_idx]                                   # [B, obs_dim]
@@ -126,6 +160,9 @@ def buffer_update(carry, value, obs, value_fn=None):
     qpos_out = jnp.where(do_update[:, None], qpos_new, buf_qpos)[None, :, :]
     qvel_out = jnp.where(do_update[:, None], qvel_new, buf_qvel)[None, :, :]
     val_out  = jnp.where(do_update, val_new, buf_value)[None, :]
+    val_mean_out = jnp.where(do_update, val_mean_new, buf_value_mean)[None, :]
+    val_std_out = jnp.where(do_update, val_std_new, buf_value_std)[None, :]
+    val_lb_out = jnp.where(do_update, val_lb_new, buf_value_lower_bound)[None, :]
     step_out = jnp.where(do_update, step_new, buf_step)[None, :]
     env_id_out = jnp.where(do_update, env_id_new, buf_env_id)[None, :]
     obs_out = jnp.where(do_update[:, None], obs_new, buf_obs)[None, :, :]
@@ -135,6 +172,9 @@ def buffer_update(carry, value, obs, value_fn=None):
     buf_qpos_out = jnp.repeat(qpos_out, N, axis=0)
     buf_qvel_out = jnp.repeat(qvel_out, N, axis=0)
     buf_value_out = jnp.repeat(val_out, N, axis=0)
+    buf_value_mean_out = jnp.repeat(val_mean_out, N, axis=0)
+    buf_value_std_out = jnp.repeat(val_std_out, N, axis=0)
+    buf_value_lower_bound_out = jnp.repeat(val_lb_out, N, axis=0)
     buf_step_out = jnp.repeat(step_out, N, axis=0)
     buf_env_id_out = jnp.repeat(env_id_out, N, axis=0)
     buf_obs_out = jnp.repeat(obs_out, N, axis=0)
@@ -143,6 +183,9 @@ def buffer_update(carry, value, obs, value_fn=None):
     return buf.replace(qpos=buf_qpos_out, 
                         qvel=buf_qvel_out, 
                         value=buf_value_out, 
+                        value_mean=buf_value_mean_out,
+                        value_std=buf_value_std_out,
+                        value_lower_bound=buf_value_lower_bound_out,
                         step=buf_step_out, 
                         env_id=buf_env_id_out, 
                         obs=buf_obs_out, 
@@ -226,6 +269,7 @@ class IPPOJax(JaxRLAlgorithmBase):
 
         networks = {}
         txs = {}
+        value_ensemble_size = int(getattr(config.experiment, "value_ensemble_size", 1))
 
         # config.agent is a DictConfig: {agent_name: {...}}
         for agent_name, agent_cfg in config.env.agent.items():
@@ -256,6 +300,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                 hidden_layer_dims=hidden_layers,
                 actor_obs_ind=actor_obs_ind,
                 critic_obs_ind=critic_obs_ind,
+                value_ensemble_size=value_ensemble_size,
                 # random=agent_cfg.get("random_action", False)
             )
 
@@ -348,7 +393,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                 agent_actions = {}
                 agent_values = {}
                 agent_log_probs = {}
-                total_values = jnp.zeros(num_envs)
+                total_value_ensemble = None
 
                 # update run_stats per agent during action selection
                 new_train_states = dict(train_states)
@@ -368,19 +413,23 @@ class IPPOJax(JaxRLAlgorithmBase):
                         mutable=["run_stats"],
                     )
                     pi, value = y
+                    value_mean, _, _, value_ensemble = _value_stats(value)
 
                     ts = ts.replace(run_stats=updates["run_stats"])
                     a = pi.sample(seed=k)
                     lp = pi.log_prob(a)
 
                     agent_actions[name] = a
-                    agent_values[name] = value
-                    total_values = total_values + value
+                    agent_values[name] = value_mean
+                    if total_value_ensemble is None:
+                        total_value_ensemble = value_ensemble
+                    else:
+                        total_value_ensemble = total_value_ensemble + value_ensemble
                     agent_log_probs[name] = lp
                     new_train_states[name] = ts
 
                 def _buffer_value_fn(buffer_obs):
-                    total = jnp.zeros((buffer_obs.shape[0],), dtype=buffer_obs.dtype)
+                    total = None
                     for name in agent_names:
                         ts = new_train_states[name]
                         net = agent_conf.networks[name]
@@ -389,13 +438,22 @@ class IPPOJax(JaxRLAlgorithmBase):
                             buffer_obs,
                         )
                         _, value = y
-                        total = total + value
-                    return total
+                        _, _, _, value_ensemble = _value_stats(value)
+                        if total is None:
+                            total = value_ensemble
+                        else:
+                            total = total + value_ensemble
+                    total_mean, total_std, total_lower_bound, _ = _value_stats(total)
+                    return total_mean, total_std, total_lower_bound
+
+                total_value_mean, total_value_std, total_value_lower_bound, _ = _value_stats(total_value_ensemble)
 
                 # update init state buffer
                 init_state_buffer = buffer_update(
                     env_state.additional_carry,
-                    total_values,
+                    total_value_mean,
+                    total_value_std,
+                    total_value_lower_bound,
                     last_obs,
                     value_fn=_buffer_value_fn,
                 )
@@ -462,8 +520,9 @@ class IPPOJax(JaxRLAlgorithmBase):
                 ts = train_states[name]
                 net = agent_conf.networks[name]
                 y, _ = net.apply({"params": ts.params, "run_stats": ts.run_stats}, last_obs, mutable=["run_stats"])
-                _, last_val = y
-                last_vals[name] = last_val
+                _, value = y
+                value_mean, _, _, _ = _value_stats(value)
+                last_vals[name] = value_mean
 
             def _calculate_gae(traj_batch: IPPOTransition, last_vals: Dict[str, jnp.ndarray]):
                 def _get_advantages(gae_and_next_value, transition):
@@ -540,15 +599,18 @@ class IPPOJax(JaxRLAlgorithmBase):
                             y, _ = net.apply({"params": params, "run_stats": ts.run_stats},
                                                 traj_mb.obs, mutable=["run_stats"])
                             pi, value = y
+                            _, _, _, value_ensemble = _value_stats(value)
                             # recompute logprob on stored per-agent actions
                             a = traj_mb.action_dict[name]
                             log_prob = pi.log_prob(a)
 
                             # value loss (clipped)
                             old_v = traj_mb.value[name]
-                            v_clipped = old_v + (value - old_v).clip(-config.clip_eps, config.clip_eps)
-                            v_loss1 = jnp.square(value - tgt_mb[name])
-                            v_loss2 = jnp.square(v_clipped - tgt_mb[name])
+                            old_v = old_v[:, None]
+                            tgt = tgt_mb[name][:, None]
+                            v_clipped = old_v + (value_ensemble - old_v).clip(-config.clip_eps, config.clip_eps)
+                            v_loss1 = jnp.square(value_ensemble - tgt)
+                            v_loss2 = jnp.square(v_clipped - tgt)
                             value_loss = 0.5 * jnp.maximum(v_loss1, v_loss2).mean()
 
                             # actor loss (PPO clip)
@@ -628,6 +690,14 @@ class IPPOJax(JaxRLAlgorithmBase):
             for key in logged_metrics.returned_episode_return_components.keys():
                 mean_episode_return_components[key] = jnp.sum(jnp.where(logged_metrics.done, logged_metrics.returned_episode_return_components[key], 0.0)) / jnp.sum(logged_metrics.done)
 
+            init_state_buffer = env_state.additional_carry.init_state_buffer
+            value_mean_buf = init_state_buffer.value_mean[0] if init_state_buffer.value_mean.ndim == 2 else init_state_buffer.value_mean
+            value_std_buf = init_state_buffer.value_std[0] if init_state_buffer.value_std.ndim == 2 else init_state_buffer.value_std
+            value_lower_bound_buf = init_state_buffer.value_lower_bound[0] if init_state_buffer.value_lower_bound.ndim == 2 else init_state_buffer.value_lower_bound
+            value_mean_metric = jnp.mean(value_mean_buf)
+            value_std_metric = jnp.mean(value_std_buf)
+            value_lower_bound_metric = jnp.mean(value_lower_bound_buf)
+
             metric = SummaryRichMetrics(
                 mean_episode_return=jnp.sum(jnp.where(logged_metrics.done, logged_metrics.returned_episode_returns, 0.0)) / jnp.sum(logged_metrics.done),
                 mean_episode_length=jnp.sum(jnp.where(logged_metrics.done, logged_metrics.returned_episode_lengths, 0.0)) / jnp.sum(logged_metrics.done),
@@ -638,6 +708,9 @@ class IPPOJax(JaxRLAlgorithmBase):
                 ball_errors_mean=jnp.mean(logged_metrics.ball_errors[:, :5]),
                 ball_errors_max=jnp.max(logged_metrics.ball_errors[:, :5]),
                 ball_errors_min=jnp.min(logged_metrics.ball_errors[:, :5]),
+                value_mean=value_mean_metric,
+                value_std=value_std_metric,
+                value_lower_bound=value_lower_bound_metric,
             )
 
             def _save_init_state_buffer():
@@ -653,9 +726,13 @@ class IPPOJax(JaxRLAlgorithmBase):
                 last_qpos = init_state_buffer.last_qpos
                 last_qvel = init_state_buffer.last_qvel
                 value = init_state_buffer.value[0] if init_state_buffer.value.ndim == 2 else init_state_buffer.value
+                value_mean = init_state_buffer.value_mean[0] if init_state_buffer.value_mean.ndim == 2 else init_state_buffer.value_mean
+                value_std = init_state_buffer.value_std[0] if init_state_buffer.value_std.ndim == 2 else init_state_buffer.value_std
+                value_lower_bound = init_state_buffer.value_lower_bound[0] if init_state_buffer.value_lower_bound.ndim == 2 else init_state_buffer.value_lower_bound
 
                 def _save_state_callback(timestep, qpos, qvel, step, obs, delta_action,
-                                         env_id, ball_errors, last_qpos, last_qvel, value):
+                                         env_id, ball_errors, last_qpos, last_qvel, value,
+                                         value_mean, value_std, value_lower_bound):
                     states_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "states_info"))
                     os.makedirs(states_dir, exist_ok=True)
                     timestep_int = int(np.asarray(timestep))
@@ -673,6 +750,9 @@ class IPPOJax(JaxRLAlgorithmBase):
                         last_qpos=np.asarray(last_qpos),
                         last_qvel=np.asarray(last_qvel),
                         value=np.asarray(value),
+                        value_mean=np.asarray(value_mean),
+                        value_std=np.asarray(value_std),
+                        value_lower_bound=np.asarray(value_lower_bound),
                     )
 
                 jax.debug.callback(
@@ -688,6 +768,9 @@ class IPPOJax(JaxRLAlgorithmBase):
                     last_qpos,
                     last_qvel,
                     value,
+                    value_mean,
+                    value_std,
+                    value_lower_bound,
                 )
 
             save_interval = 750
@@ -775,6 +858,9 @@ class IPPOJax(JaxRLAlgorithmBase):
                 ball_errors_mean = metric.ball_errors_mean
                 ball_errors_max = metric.ball_errors_max
                 ball_errors_min = metric.ball_errors_min
+                value_mean = metric.value_mean
+                value_std = metric.value_std
+                value_lower_bound = metric.value_lower_bound
 
                 if config.debug:
                     print(f"timestep={timestep}, episodic return={mean_ep_return}, episodic length={mean_ep_length}, absorbed={frac_absorbed}")
@@ -787,6 +873,9 @@ class IPPOJax(JaxRLAlgorithmBase):
                     wandb_log_dict["Live Info/Ball Errors Mean"] = ball_errors_mean
                     wandb_log_dict["Live Info/Ball Errors Max"] = ball_errors_max
                     wandb_log_dict["Live Info/Ball Errors Min"] = ball_errors_min
+                    wandb_log_dict["Live Info/Value Mean"] = value_mean
+                    wandb_log_dict["Live Info/Value Std"] = value_std
+                    wandb_log_dict["Live Info/Value Lower Bound"] = value_lower_bound
                     # also log other live info
                     for key, value in live_info.items():
                         wandb_log_dict["Live Info/" + key] = value
@@ -938,7 +1027,7 @@ class IPPOJax(JaxRLAlgorithmBase):
 
             keys = jax.random.split(step_rng, len(agent_names) + 1)
             agent_keys = keys[1:]
-            total_values = jnp.zeros(n_envs)
+            total_value_ensemble = None
 
             if use_mujoco:
                 obs_for_policy = obs
@@ -955,7 +1044,11 @@ class IPPOJax(JaxRLAlgorithmBase):
                     mutable=["run_stats"]
                 )
                 pi, value = y
-                total_values = total_values + value
+                _, _, _, value_ensemble = _value_stats(value)
+                if total_value_ensemble is None:
+                    total_value_ensemble = value_ensemble
+                else:
+                    total_value_ensemble = total_value_ensemble + value_ensemble
 
                 ts = ts.replace(run_stats=updates["run_stats"])
                 a = pi.sample(seed=k)
@@ -966,7 +1059,7 @@ class IPPOJax(JaxRLAlgorithmBase):
             train_states = new_train_states
 
             def _buffer_value_fn(buffer_obs):
-                total = jnp.zeros((buffer_obs.shape[0],), dtype=buffer_obs.dtype)
+                total = None
                 for name in agent_names:
                     ts = train_states[name]
                     net = agent_conf.networks[name]
@@ -975,12 +1068,21 @@ class IPPOJax(JaxRLAlgorithmBase):
                         buffer_obs,
                     )
                     _, value = y
-                    total = total + value
-                return total
+                    _, _, _, value_ensemble = _value_stats(value)
+                    if total is None:
+                        total = value_ensemble
+                    else:
+                        total = total + value_ensemble
+                total_mean, total_std, total_lower_bound, _ = _value_stats(total)
+                return total_mean, total_std, total_lower_bound
+
+            total_value_mean, total_value_std, total_value_lower_bound, _ = _value_stats(total_value_ensemble)
 
             init_state_buffer = buffer_update(
                 env_state.additional_carry,
-                total_values,
+                total_value_mean,
+                total_value_std,
+                total_value_lower_bound,
                 obs_for_policy,
                 value_fn=_buffer_value_fn,
             )

@@ -60,6 +60,9 @@ class CurriculumState:
 @struct.dataclass
 class InitStateBuffer:
     value: np.ndarray | jax.Array
+    value_mean: np.ndarray | jax.Array
+    value_std: np.ndarray | jax.Array
+    value_lower_bound: np.ndarray | jax.Array
     qpos: np.ndarray | jax.Array
     qvel: np.ndarray | jax.Array
     step: np.ndarray | jax.Array
@@ -894,6 +897,9 @@ class Mujoco:
             debug_state_file = os.path.abspath(os.path.expanduser(debug_state_file))
             state = dict(np.load(debug_state_file))
             init_state_value = backend.asarray(state["value"])
+            init_state_value_mean = backend.asarray(state.get("value_mean", state["value"]))
+            init_state_value_std = backend.asarray(state.get("value_std", np.zeros_like(state["value"])))
+            init_state_value_lower_bound = backend.asarray(state.get("value_lower_bound", state["value"]))
             init_state_qpos = backend.asarray(state["qpos"])
             init_state_qvel = backend.asarray(state["qvel"])
             init_state_step = backend.asarray(state["step"])
@@ -905,6 +911,9 @@ class Mujoco:
             init_state_last_qvel = backend.asarray(state["last_qvel"])
         else:
             init_state_value = backend.zeros(5)
+            init_state_value_mean = backend.zeros(5)
+            init_state_value_std = backend.zeros(5)
+            init_state_value_lower_bound = backend.zeros(5)
             init_state_qpos = backend.zeros((5, model.nq))
             init_state_qvel = backend.zeros((5, model.nv))
             init_state_step = backend.zeros(5)
@@ -960,6 +969,9 @@ class Mujoco:
             curriculum=CurriculumState(absorb_ratio=1.0, step=0),
             init_state_buffer=InitStateBuffer(
                 value=init_state_value,
+                value_mean=init_state_value_mean,
+                value_std=init_state_value_std,
+                value_lower_bound=init_state_value_lower_bound,
                 qpos=init_state_qpos,
                 qvel=init_state_qvel,
                 step=init_state_step,
