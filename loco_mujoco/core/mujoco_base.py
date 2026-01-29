@@ -1,4 +1,5 @@
 import atexit
+import os
 from copy import deepcopy
 from typing import Union, List, Dict, Tuple, Optional
 from types import ModuleType
@@ -885,6 +886,35 @@ class Mujoco:
         """
         key, _k1, _k2, _k3, _k4, _k5, _k6, _k7 = jax.random.split(key, 8)
 
+        debug_state_file = None
+        env_cfg = getattr(self, "env_cfg", None)
+        if env_cfg is not None:
+            debug_state_file = getattr(env_cfg, "debug_state", None)
+        if debug_state_file:
+            debug_state_file = os.path.abspath(os.path.expanduser(debug_state_file))
+            state = dict(np.load(debug_state_file))
+            init_state_value = backend.asarray(state["value"])
+            init_state_qpos = backend.asarray(state["qpos"])
+            init_state_qvel = backend.asarray(state["qvel"])
+            init_state_step = backend.asarray(state["step"])
+            init_state_obs = backend.asarray(state["obs"])
+            init_state_delta_action = backend.asarray(state["delta_action"])
+            init_state_env_id = backend.asarray(state["env_id"])
+            init_state_ball_errors = backend.asarray(state["ball_errors"])
+            init_state_last_qpos = backend.asarray(state["last_qpos"])
+            init_state_last_qvel = backend.asarray(state["last_qvel"])
+        else:
+            init_state_value = backend.zeros(5)
+            init_state_qpos = backend.zeros((5, model.nq))
+            init_state_qvel = backend.zeros((5, model.nv))
+            init_state_step = backend.zeros(5)
+            init_state_obs = backend.zeros((5, self.info.observation_space.shape[-1]))
+            init_state_delta_action = backend.zeros((5, self.info.action_space.shape[-1]))
+            init_state_env_id = backend.zeros(5)
+            init_state_ball_errors = backend.zeros(5)
+            init_state_last_qpos = backend.zeros(model.nq)
+            init_state_last_qvel = backend.zeros(model.nv)
+
         carry = AdditionalCarry(
             key=key,
             env_id=env_id,
@@ -929,16 +959,16 @@ class Mujoco:
             reach_goal_state=False,
             curriculum=CurriculumState(absorb_ratio=1.0, step=0),
             init_state_buffer=InitStateBuffer(
-                value=backend.zeros(5),
-                qpos=backend.zeros((5, model.nq)),
-                qvel=backend.zeros((5, model.nv)),
-                step=backend.zeros(5),
-                obs=backend.zeros((5, self.info.observation_space.shape[-1])),
-                delta_action=backend.zeros((5, self.info.action_space.shape[-1])),
-                env_id=backend.zeros(5),
-                ball_errors=backend.zeros(5),
-                last_qpos=backend.zeros(model.nq),
-                last_qvel=backend.zeros(model.nv),
+                value=init_state_value,
+                qpos=init_state_qpos,
+                qvel=init_state_qvel,
+                step=init_state_step,
+                obs=init_state_obs,
+                delta_action=init_state_delta_action,
+                env_id=init_state_env_id,
+                ball_errors=init_state_ball_errors,
+                last_qpos=init_state_last_qpos,
+                last_qvel=init_state_last_qvel,
             ),
             time_step_in_episode=1,
             max_time_step_in_episode=1,
@@ -1463,4 +1493,3 @@ class Mujoco:
             return env.generate(*args, **kwargs)
         else:
             return env(*args, **kwargs)
-

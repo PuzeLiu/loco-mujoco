@@ -1,4 +1,5 @@
 import ast
+import os
 from omegaconf import open_dict
 import warnings
 from dataclasses import dataclass
@@ -639,19 +640,59 @@ class IPPOJax(JaxRLAlgorithmBase):
                 ball_errors_min=jnp.min(logged_metrics.ball_errors[:, :5]),
             )
 
-            def _print_debug_info():
-                qpos = env_state.additional_carry.init_state_buffer.qpos[0]
-                qvel = env_state.additional_carry.init_state_buffer.qvel[0]
-                ball_errors = env_state.additional_carry.init_state_buffer.ball_errors[0]
-                jax.debug.print("timestep: {}", jnp.max(logged_metrics.timestep * config.num_envs))
-                jax.debug.print("qpos: {}", qpos)
-                jax.debug.print("qvel: {}", qvel)
-                jax.debug.print("env_id: {}", env_state.additional_carry.init_state_buffer.env_id[0])
-                jax.debug.print("delta_action: {}", env_state.additional_carry.init_state_buffer.delta_action[0])
-                jax.debug.print("step: {}", env_state.additional_carry.init_state_buffer.step[0])
-                jax.debug.print("ball_errors: {}", ball_errors)
-                jax.debug.print("--------------------------------")
-            jax.lax.cond(jnp.max(logged_metrics.timestep) % 1250 == 0, _print_debug_info, lambda: None)
+            def _save_init_state_buffer():
+                init_state_buffer = env_state.additional_carry.init_state_buffer
+                timestep = jnp.max(logged_metrics.timestep * config.num_envs).astype(jnp.int32)
+                qpos = init_state_buffer.qpos[0]
+                qvel = init_state_buffer.qvel[0]
+                step = init_state_buffer.step[0]
+                obs = init_state_buffer.obs[0]
+                delta_action = init_state_buffer.delta_action[0]
+                env_id = init_state_buffer.env_id[0]
+                ball_errors = init_state_buffer.ball_errors[0]
+                last_qpos = init_state_buffer.last_qpos
+                last_qvel = init_state_buffer.last_qvel
+                value = init_state_buffer.value[0] if init_state_buffer.value.ndim == 2 else init_state_buffer.value
+
+                def _save_state_callback(timestep, qpos, qvel, step, obs, delta_action,
+                                         env_id, ball_errors, last_qpos, last_qvel, value):
+                    states_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "states_info"))
+                    os.makedirs(states_dir, exist_ok=True)
+                    timestep_int = int(np.asarray(timestep))
+                    state_path = os.path.join(states_dir, f"state_{timestep_int}.npz")
+                    np.savez_compressed(
+                        state_path,
+                        timestep=timestep_int,
+                        qpos=np.asarray(qpos),
+                        qvel=np.asarray(qvel),
+                        step=np.asarray(step),
+                        obs=np.asarray(obs),
+                        delta_action=np.asarray(delta_action),
+                        env_id=np.asarray(env_id),
+                        ball_errors=np.asarray(ball_errors),
+                        last_qpos=np.asarray(last_qpos),
+                        last_qvel=np.asarray(last_qvel),
+                        value=np.asarray(value),
+                    )
+
+                jax.debug.callback(
+                    _save_state_callback,
+                    timestep,
+                    qpos,
+                    qvel,
+                    step,
+                    obs,
+                    delta_action,
+                    env_id,
+                    ball_errors,
+                    last_qpos,
+                    last_qvel,
+                    value,
+                )
+
+            save_interval = 750
+            timestep = jnp.max(logged_metrics.timestep).astype(jnp.int32)
+            jax.lax.cond(timestep % save_interval == 0, _save_init_state_buffer, lambda: None)
 
             def _evaluation_step():
 
