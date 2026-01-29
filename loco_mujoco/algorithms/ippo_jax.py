@@ -76,6 +76,8 @@ def buffer_update(carry, value, obs, value_fn=None):
     ball_errors = jnp.max(carry.ball_errors, axis=-1)
     # mask out value to negative infinity if ball error is greater than 0.05
     value = jnp.where(ball_errors > 0.1, -jnp.inf, value)
+    value = jnp.where(ball_errors < 0.01, -jnp.inf, value)
+    # value = jnp.where(carry.total_timestep < 7000, -jnp.inf, value)
     dt = 0.02
     max_pattern_len = jnp.round(carry.pattern_state.pattern_cycle_time / dt).astype(jnp.int32)
     max_timestep = jnp.max(carry.max_time_step_in_episode).astype(jnp.int32)
@@ -636,6 +638,20 @@ class IPPOJax(JaxRLAlgorithmBase):
                 ball_errors_max=jnp.max(logged_metrics.ball_errors[:, :5]),
                 ball_errors_min=jnp.min(logged_metrics.ball_errors[:, :5]),
             )
+
+            def _print_debug_info():
+                qpos = env_state.additional_carry.init_state_buffer.qpos[0]
+                qvel = env_state.additional_carry.init_state_buffer.qvel[0]
+                ball_errors = env_state.additional_carry.init_state_buffer.ball_errors[0]
+                jax.debug.print("timestep: {}", jnp.max(logged_metrics.timestep * config.num_envs))
+                jax.debug.print("qpos: {}", qpos)
+                jax.debug.print("qvel: {}", qvel)
+                jax.debug.print("env_id: {}", env_state.additional_carry.init_state_buffer.env_id[0])
+                jax.debug.print("delta_action: {}", env_state.additional_carry.init_state_buffer.delta_action[0])
+                jax.debug.print("step: {}", env_state.additional_carry.init_state_buffer.step[0])
+                jax.debug.print("ball_errors: {}", ball_errors)
+                jax.debug.print("--------------------------------")
+            jax.lax.cond(jnp.max(logged_metrics.timestep) % 1250 == 0, _print_debug_info, lambda: None)
 
             def _evaluation_step():
 
