@@ -107,8 +107,9 @@ def buffer_update(carry, value_mean, value_std, value_lower_bound, obs, value_fn
     env_id = carry.env_id
     ball_errors = jnp.max(carry.ball_errors, axis=-1)
     # mask out value to negative infinity if ball error is greater than 0.05
-    value = jnp.where(ball_errors > 0.1, -jnp.inf, value_lower_bound)
-    value = jnp.where(ball_errors < 0.01, -jnp.inf, value)
+    # value = value_lower_bound
+    value = jnp.where(value_std > 0.04, -jnp.inf, value_lower_bound)
+    # value = jnp.where(ball_errors < 0.01, -jnp.inf, value)
     # value = jnp.where(carry.total_timestep < 7000, -jnp.inf, value)
     dt = 0.02
     max_pattern_len = jnp.round(carry.pattern_state.pattern_cycle_time / dt).astype(jnp.int32)
@@ -773,9 +774,9 @@ class IPPOJax(JaxRLAlgorithmBase):
                     value_lower_bound,
                 )
 
-            save_interval = 750
-            timestep = jnp.max(logged_metrics.timestep).astype(jnp.int32)
-            jax.lax.cond(timestep % save_interval == 0, _save_init_state_buffer, lambda: None)
+            # save_interval = 750
+            # timestep = jnp.max(logged_metrics.timestep).astype(jnp.int32)
+            # jax.lax.cond(timestep % save_interval == 0, _save_init_state_buffer, lambda: None)
 
             def _evaluation_step():
 
