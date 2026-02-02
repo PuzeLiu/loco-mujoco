@@ -31,6 +31,7 @@ class IPPOTransition:
     action: jnp.ndarray
     action_dict: Dict[str, jnp.ndarray]   # === CHANGE: store per-agent action ===
     value: Dict[str, jnp.ndarray]
+    value_ensemble: Dict[str, jnp.ndarray]
     reward: Dict[str, jnp.ndarray]
     log_prob: Dict[str, jnp.ndarray]
     obs: jnp.ndarray

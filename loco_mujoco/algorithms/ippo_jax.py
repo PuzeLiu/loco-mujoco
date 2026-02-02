@@ -19,10 +19,8 @@ from loco_mujoco.algorithms import (JaxRLAlgorithmBase, AgentConfBase, AgentStat
 from loco_mujoco.core.wrappers import RichLogWrapper, NStepWrapper, RichLogEnvState, VecEnv, NormalizeVecRewardDict, SummaryRichMetrics
 from loco_mujoco.utils import MetricsHandler, ValidationSummary
 
-VALUE_UNCERTAINTY_BETA = 1.0
 
-
-def _value_stats(value: jnp.ndarray, beta: float = VALUE_UNCERTAINTY_BETA):
+def _value_stats(value: jnp.ndarray, beta: float):
     if value.ndim == 1:
         value_ensemble = value[:, None]
         value_mean = value
@@ -108,16 +106,17 @@ def buffer_update(carry, value_mean, value_std, value_lower_bound, obs, value_fn
     ball_errors = jnp.max(carry.ball_errors, axis=-1)
     # mask out value to negative infinity if ball error is greater than 0.05
     # value = value_lower_bound
-    value = jnp.where(value_std > 0.04, -jnp.inf, value_lower_bound)
-    # value = jnp.where(ball_errors < 0.01, -jnp.inf, value)
+    value = jnp.where(ball_errors > 0.1, -jnp.inf, value_lower_bound)
+    # value = jnp.where(value_std > 0.05, -jnp.inf, value_lower_bound)
     # value = jnp.where(carry.total_timestep < 7000, -jnp.inf, value)
     dt = 0.02
     max_pattern_len = jnp.round(carry.pattern_state.pattern_cycle_time / dt).astype(jnp.int32)
     max_timestep = jnp.max(carry.max_time_step_in_episode).astype(jnp.int32)
-    # max_pattern_len = jnp.minimum(max_pattern_len, max_timestep)
+    max_pattern_len = jnp.minimum(max_pattern_len, max_timestep)
     max_pattern_len = jnp.maximum(max_pattern_len, 1)
     step_pattern_len = carry.time_step_in_episode % max_pattern_len
     bins = step_to_bin(step_pattern_len, B, max_pattern_len)               # [N]
+    # bins = (jnp.arange(step_pattern_len.shape[0], dtype=jnp.int32) % B)     # [N]
     qpos = buf.last_qpos
     qvel = buf.last_qvel
     delta_action = carry.delta_action
@@ -382,7 +381,10 @@ class IPPOJax(JaxRLAlgorithmBase):
         obsv, env_state = env.reset(reset_rng, env_id=jnp.arange(config.num_envs))
 
         train_state_buffer = TrainStateBuffer.create(next(iter(train_states.values())), config.validation.num)
-
+        import time
+        # current global time and date
+        current_time = time.strftime("%Y%m%d_%H%M%S")
+        beta = float(getattr(config, "value_uncertainty_beta", 1.0))
         # TRAIN LOOP
         def _update_step(runner_state, unused):
             # COLLECT TRAJECTORIES
@@ -393,6 +395,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                 rng, _rng = jax.random.split(rng)
                 agent_actions = {}
                 agent_values = {}
+                agent_values_ensemble = {}
                 agent_log_probs = {}
                 total_value_ensemble = None
 
@@ -414,7 +417,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                         mutable=["run_stats"],
                     )
                     pi, value = y
-                    value_mean, _, _, value_ensemble = _value_stats(value)
+                    value_mean, _, _, value_ensemble = _value_stats(value, beta)
 
                     ts = ts.replace(run_stats=updates["run_stats"])
                     a = pi.sample(seed=k)
@@ -422,6 +425,7 @@ class IPPOJax(JaxRLAlgorithmBase):
 
                     agent_actions[name] = a
                     agent_values[name] = value_mean
+                    agent_values_ensemble[name] = value_ensemble
                     if total_value_ensemble is None:
                         total_value_ensemble = value_ensemble
                     else:
@@ -439,15 +443,15 @@ class IPPOJax(JaxRLAlgorithmBase):
                             buffer_obs,
                         )
                         _, value = y
-                        _, _, _, value_ensemble = _value_stats(value)
+                        _, _, _, value_ensemble = _value_stats(value, beta)
                         if total is None:
                             total = value_ensemble
                         else:
                             total = total + value_ensemble
-                    total_mean, total_std, total_lower_bound, _ = _value_stats(total)
+                    total_mean, total_std, total_lower_bound, _ = _value_stats(total, beta)
                     return total_mean, total_std, total_lower_bound
 
-                total_value_mean, total_value_std, total_value_lower_bound, _ = _value_stats(total_value_ensemble)
+                total_value_mean, total_value_std, total_value_lower_bound, _ = _value_stats(total_value_ensemble, beta)
 
                 # update init state buffer
                 init_state_buffer = buffer_update(
@@ -499,6 +503,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                     action=action,
                     action_dict=agent_actions,
                     value=agent_values,
+                    value_ensemble=agent_values_ensemble,
                     reward=agent_rewards,
                     log_prob=agent_log_probs,
                     obs=last_obs,
@@ -522,7 +527,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                 net = agent_conf.networks[name]
                 y, _ = net.apply({"params": ts.params, "run_stats": ts.run_stats}, last_obs, mutable=["run_stats"])
                 _, value = y
-                value_mean, _, _, _ = _value_stats(value)
+                value_mean, _, _, _ = _value_stats(value, beta)
                 last_vals[name] = value_mean
 
             def _calculate_gae(traj_batch: IPPOTransition, last_vals: Dict[str, jnp.ndarray]):
@@ -584,7 +589,10 @@ class IPPOJax(JaxRLAlgorithmBase):
                     lambda x: jnp.reshape(x, [config.num_minibatches, -1] + list(x.shape[1:])),
                     shuffled_batch
                 )
-                def _update_minibatch(train_states, batch_info):
+                value_ensemble_bootstrap_p = float(getattr(config, "value_ensemble_bootstrap_p", 1.0))
+
+                def _update_minibatch(update_state, batch_info):
+                    train_states, rng = update_state
                     traj_mb, adv_mb, tgt_mb = batch_info
                     new_train_states = dict(train_states)
 
@@ -595,24 +603,30 @@ class IPPOJax(JaxRLAlgorithmBase):
                         ts = new_train_states[name]
                         net = agent_conf.networks[name]
 
-                        def _loss_fn(params):
+                        rng, mask_rng = jax.random.split(rng)
+
+                        def _loss_fn(params, mask_rng):
                             # RERUN NETWORK
                             y, _ = net.apply({"params": params, "run_stats": ts.run_stats},
                                                 traj_mb.obs, mutable=["run_stats"])
                             pi, value = y
-                            _, _, _, value_ensemble = _value_stats(value)
+                            _, _, _, value_ensemble = _value_stats(value, beta)
                             # recompute logprob on stored per-agent actions
                             a = traj_mb.action_dict[name]
                             log_prob = pi.log_prob(a)
 
                             # value loss (clipped)
-                            old_v = traj_mb.value[name]
-                            old_v = old_v[:, None]
+                            old_v = traj_mb.value_ensemble[name]
                             tgt = tgt_mb[name][:, None]
                             v_clipped = old_v + (value_ensemble - old_v).clip(-config.clip_eps, config.clip_eps)
                             v_loss1 = jnp.square(value_ensemble - tgt)
                             v_loss2 = jnp.square(v_clipped - tgt)
-                            value_loss = 0.5 * jnp.maximum(v_loss1, v_loss2).mean()
+                            v_loss = 0.5 * jnp.maximum(v_loss1, v_loss2)
+                            mask = jax.random.bernoulli(
+                                mask_rng, value_ensemble_bootstrap_p, value_ensemble.shape
+                            ).astype(value_ensemble.dtype)
+                            denom = jnp.maximum(mask.sum(), 1.0)
+                            value_loss = jnp.sum(v_loss * mask) / denom
 
                             # actor loss (PPO clip)
                             ratio = jnp.exp(log_prob - traj_mb.log_prob[name])
@@ -629,7 +643,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                             return total_loss, (value_loss, loss_actor, entropy, ratio)
 
                         grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-                        (total_loss, (value_loss, loss_actor, entropy, ratio)), grads = grad_fn(ts.params)\
+                        (total_loss, (value_loss, loss_actor, entropy, ratio)), grads = grad_fn(ts.params, mask_rng)\
                         
                         # apply grads
                         ts = ts.apply_gradients(grads=grads)
@@ -666,9 +680,9 @@ class IPPOJax(JaxRLAlgorithmBase):
                         new_train_states[name] = ts
                         loss_logs[name] = (total_loss, value_loss, loss_actor, entropy)
 
-                    return new_train_states, loss_logs
+                    return (new_train_states, rng), loss_logs
 
-                train_states, loss_logs = jax.lax.scan(_update_minibatch, train_states, minibatches)
+                (train_states, rng), loss_logs = jax.lax.scan(_update_minibatch, (train_states, _rng), minibatches)
                 update_state = (train_states, traj_batch, advantages, targets, rng)
                 return update_state, loss_logs
 
@@ -732,9 +746,10 @@ class IPPOJax(JaxRLAlgorithmBase):
                 value_lower_bound = init_state_buffer.value_lower_bound[0] if init_state_buffer.value_lower_bound.ndim == 2 else init_state_buffer.value_lower_bound
 
                 def _save_state_callback(timestep, qpos, qvel, step, obs, delta_action,
-                                         env_id, ball_errors, last_qpos, last_qvel, value,
+                                         env_id, ball_errors, last_qpos, last_qvel, value,  
                                          value_mean, value_std, value_lower_bound):
-                    states_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "states_info"))
+                    import os
+                    states_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "states_info", current_time))
                     os.makedirs(states_dir, exist_ok=True)
                     timestep_int = int(np.asarray(timestep))
                     state_path = os.path.join(states_dir, f"state_{timestep_int}.npz")
@@ -774,9 +789,9 @@ class IPPOJax(JaxRLAlgorithmBase):
                     value_lower_bound,
                 )
 
-            # save_interval = 750
-            # timestep = jnp.max(logged_metrics.timestep).astype(jnp.int32)
-            # jax.lax.cond(timestep % save_interval == 0, _save_init_state_buffer, lambda: None)
+            save_interval = 750
+            timestep = jnp.max(logged_metrics.timestep).astype(jnp.int32)
+            jax.lax.cond(timestep % save_interval == 0, _save_init_state_buffer, lambda: None)
 
             def _evaluation_step():
 
@@ -1019,6 +1034,8 @@ class IPPOJax(JaxRLAlgorithmBase):
         if n_steps is None:
             n_steps = jnp.iinfo(jnp.int32).max
 
+        beta = float(getattr(config, "value_uncertainty_beta", 1.0))
+
         for i in range(n_steps):
 
             # SAMPLE ACTION
@@ -1045,7 +1062,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                     mutable=["run_stats"]
                 )
                 pi, value = y
-                _, _, _, value_ensemble = _value_stats(value)
+                _, _, _, value_ensemble = _value_stats(value, beta)
                 if total_value_ensemble is None:
                     total_value_ensemble = value_ensemble
                 else:
@@ -1069,15 +1086,15 @@ class IPPOJax(JaxRLAlgorithmBase):
                         buffer_obs,
                     )
                     _, value = y
-                    _, _, _, value_ensemble = _value_stats(value)
+                    _, _, _, value_ensemble = _value_stats(value, beta)
                     if total is None:
                         total = value_ensemble
                     else:
                         total = total + value_ensemble
-                total_mean, total_std, total_lower_bound, _ = _value_stats(total)
+                total_mean, total_std, total_lower_bound, _ = _value_stats(total, beta)
                 return total_mean, total_std, total_lower_bound
 
-            total_value_mean, total_value_std, total_value_lower_bound, _ = _value_stats(total_value_ensemble)
+            total_value_mean, total_value_std, total_value_lower_bound, _ = _value_stats(total_value_ensemble, beta)
 
             init_state_buffer = buffer_update(
                 env_state.additional_carry,
