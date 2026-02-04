@@ -37,6 +37,7 @@ class PDControl(ControlFunction):
                  env: Any,
                  p_gain: Union[float, np.ndarray],
                  d_gain: Union[float, np.ndarray],
+                 joint_limit: Union[np.ndarray, None] = None,
                  nominal_joint_positions: np.ndarray = None,
                  scale_action_to_jnt_limits: bool = True,
                  **kwargs: Any):
@@ -71,6 +72,10 @@ class PDControl(ControlFunction):
         # sort according to action ind
         self._ctrl_ranges = np.concatenate([self._ctrl_ranges[i].reshape(1, 2) for i in env._action_indices])
         self._jnt_ranges = np.concatenate([self._jnt_ranges[i].reshape(1, 2) for i in env._action_indices])
+        if joint_limit is not None:
+            joint_limit = np.array(joint_limit)
+            assert joint_limit.shape == self._jnt_ranges.shape, "joint_limit must have the same shape as self._jnt_ranges"
+            self._jnt_ranges = joint_limit
         self._jnt_names = [self._jnt_names[i] for i in env._action_indices]
 
         # get qpos and qvel ids

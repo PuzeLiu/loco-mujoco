@@ -838,7 +838,11 @@ class ProjectedGravityVector(Observation):
 
     def _init_from_mj(self, env, model, data, current_obs_size):
         self.min, self.max = [-np.inf] * self.dim, [np.inf] * self.dim
-        self.data_type_ind = np.array(mj_jntname2qposid(self.xml_name, model))[3:]  # only the quaternion part is needed
+        # self.data_type_ind = np.array(mj_jntname2qposid(self.xml_name, model))[3:]  # only the quaternion part is needed
+        sensor_id = model.sensor("orientation").id
+        sensor_adr = model.sensor_adr[sensor_id]
+        sensor_dim = model.sensor_dim[sensor_id]
+        self.data_type_ind = np.arange(sensor_adr, sensor_adr + sensor_dim)
         self.obs_ind = np.array([j for j in range(current_obs_size, current_obs_size + self.dim)])
         self._initialized_from_mj = True
 
@@ -869,7 +873,8 @@ class ProjectedGravityVector(Observation):
         if data_ind_cont.ProjectedGravityVector.size == 0:
             return backend.empty(shape=(0,))
         else:
-            xquats = data.qpos[data_ind_cont.ProjectedGravityVector]
+            # xquats = data.qpos[data_ind_cont.ProjectedGravityVector]
+            xquats = data.sensordata[data_ind_cont.ProjectedGravityVector]
             xquats = xquats.reshape(-1, 4)
 
             # normalize the quaternions to avoid nans
