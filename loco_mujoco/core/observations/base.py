@@ -207,11 +207,12 @@ class Observation:
 
     registered = dict()
 
-    def __init__(self, obs_name: str, group: Union[str, List(str)] = None, allow_randomization: bool = True):
+    def __init__(self, obs_name: str, group: Union[str, List(str)] = None, allow_randomization: bool = True, randomization_scale: float = 0.0):
         self.name = obs_name
         self.obs_container = None
         self.group = [group] if isinstance(group, str) or group is None else group
         self.allow_randomization = allow_randomization
+        self.randomization_scale = randomization_scale
 
         # these attributes *must* be initialized in the _init_from_mj method
         self.obs_ind = None

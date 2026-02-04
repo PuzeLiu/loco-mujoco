@@ -780,6 +780,23 @@ class Mujoco:
             merged = merged.at[indices].set(obs_not_stateful)
             merged = merged.at[stateful_obs_ind].set(obs_stateful)
 
+        if backend == jnp:
+            key = carry.key
+
+        for obs in self.obs_container.values():
+            if not obs.allow_randomization or obs.randomization_scale == 0.0:
+                continue
+            if backend == np:
+                noise = np.random.normal(0.0, obs.randomization_scale, size=obs.obs_ind.shape)
+                merged[obs.obs_ind] = merged[obs.obs_ind] + noise
+            elif backend == jnp:
+                key, subkey = jax.random.split(key)
+                noise = jax.random.normal(subkey, shape=obs.obs_ind.shape) * obs.randomization_scale
+                merged = merged.at[obs.obs_ind].add(noise)
+
+        if backend == jnp:
+            carry = carry.replace(key=key)
+
         return merged, carry
 
     @staticmethod
