@@ -10,7 +10,7 @@ from scipy.spatial.transform import Rotation as np_R
 import mujoco
 from mujoco import MjData, MjModel
 from mujoco.mjx import Data, Model
-
+from omegaconf import ListConfig
 from loco_mujoco.core.reward.base import Reward
 from loco_mujoco.core.utils import mj_jntname2qposid, mj_jntname2qvelid, mj_jntid2qposid, mj_check_collisions
 from loco_mujoco.core.utils.math import quat_scalarfirst2scalarlast
@@ -1042,6 +1042,24 @@ class HumanoidLocomotionReward(Reward):
         symmetry_air_reward = 0.0
 
         # ==================== SCALE REWARDS BY COEFFICIENTS ====================
+        if isinstance(self._action_rate_coeff, ListConfig):
+            assert len(self._action_rate_coeff) == 2
+            coeff_scale = jnp.linspace(self._action_rate_coeff[0], self._action_rate_coeff[1], 5)
+            action_rate_coeff = coeff_scale[carry.curriculum.step]
+        else:
+            action_rate_coeff = self._action_rate_coeff
+        if isinstance(self._base_height_coeff, ListConfig):
+            assert len(self._base_height_coeff) == 2
+            coeff_scale = jnp.linspace(self._base_height_coeff[0], self._base_height_coeff[1], 5)
+            base_height_coeff = coeff_scale[carry.curriculum.step]
+        else:
+            base_height_coeff = self._base_height_coeff
+        if isinstance(self._joint_acc_coeff, ListConfig):
+            assert len(self._joint_acc_coeff) == 2
+            coeff_scale = jnp.linspace(self._joint_acc_coeff[0], self._joint_acc_coeff[1], 5)
+            joint_acc_coeff = coeff_scale[carry.curriculum.step]
+        else:
+            joint_acc_coeff = self._joint_acc_coeff
         
         survival_reward *= (self._survival * env.dt)
         tracking_reward_linvel_x *= (self._tracking_w_sum_linvel_x * env.dt)
@@ -1049,16 +1067,16 @@ class HumanoidLocomotionReward(Reward):
         tracking_reward_angvel *= (self._tracking_w_sum_angvel * env.dt)
         joint_qpos_reward *= (self._nominal_joint_pos_coeff * env.dt)
         joint_deviation_l1_penalty *= (self._joint_deviation_l1_coeff * env.dt)
-        base_height_reward *= (self._base_height_coeff * env.dt)
+        base_height_reward *= (base_height_coeff * env.dt)
         orientation_reward *= (self.orientation_coeff * env.dt)
         torque_reward *= (self._joint_torque_coeff * env.dt)
         energy_reward *= (self._energy_coeff * env.dt)
         z_vel_reward *= (self._z_vel_coeff * env.dt)
         roll_pitch_vel_reward *= (self._roll_pitch_vel_coeff * env.dt)
         joint_vel_reward *= (self._joint_vel_coeff * env.dt)
-        acceleration_reward *= (self._joint_acc_coeff * env.dt)
+        acceleration_reward *= (joint_acc_coeff * env.dt)
         root_acceleration_reward *= (self._root_acc_coeff * env.dt)
-        action_rate_reward *= (self._action_rate_coeff * env.dt)
+        action_rate_reward *= (action_rate_coeff * env.dt)
         joint_position_limit_reward *= (self._joint_position_limit_coeff * env.dt)
         feet_slip_reward *= (self._feet_slip_coeff * env.dt)
         feet_yaw_diff_reward *= (self._feet_yaw_diff_coeff * env.dt)
