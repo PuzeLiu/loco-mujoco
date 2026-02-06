@@ -588,7 +588,7 @@ class Mjx(Mujoco):
         """
         carry = super()._init_additional_carry(key, model, data, backend, env_id)
         return MjxAdditionalCarry(final_observation=backend.zeros(self.info.observation_space.shape),
-                                  final_info={},
+                                  final_info={"no_ball": backend.array(False)},
                                   **vars(carry))
 
     @property

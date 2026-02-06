@@ -207,6 +207,13 @@ class IPPOJax(JaxRLAlgorithmBase):
 
         agent_names = tuple(agent_conf.networks.keys())
 
+        stand_cfg = agent_conf.config.env.get("stand_phase", None)
+        stand_phase_enabled = False
+        stand_phase_active_agents = set()
+        if stand_cfg is not None and stand_cfg.get("enabled", False):
+            stand_phase_enabled = True
+            stand_phase_active_agents = set(stand_cfg.get("active_agents", []))
+
         # === CHANGE: action indices per agent for scattering ===
         agent_action_idx = {
             name: jnp.array(agent_conf.config.env.agent[name].action_idx, dtype=jnp.int32)
@@ -416,6 +423,12 @@ class IPPOJax(JaxRLAlgorithmBase):
                         ts = new_train_states[name]
                         net = agent_conf.networks[name]
 
+                        mask = jnp.ones(traj_mb.done.shape, dtype=jnp.float32)
+                        if stand_phase_enabled and name not in stand_phase_active_agents:
+                            mask = 1.0 - traj_mb.info["no_ball"]
+                            mask = mask.astype(jnp.float32)
+                        mask_denom = jnp.sum(mask) + 1e-8
+
                         def _loss_fn(params):
                             # RERUN NETWORK
                             y, _ = net.apply({"params": params, "run_stats": ts.run_stats},
@@ -430,18 +443,21 @@ class IPPOJax(JaxRLAlgorithmBase):
                             v_clipped = old_v + (value - old_v).clip(-config.clip_eps, config.clip_eps)
                             v_loss1 = jnp.square(value - tgt_mb[name])
                             v_loss2 = jnp.square(v_clipped - tgt_mb[name])
-                            value_loss = 0.5 * jnp.maximum(v_loss1, v_loss2).mean()
+                            value_loss = 0.5 * jnp.maximum(v_loss1, v_loss2)
+                            value_loss = (value_loss * mask).sum() / mask_denom
 
                             # actor loss (PPO clip)
                             ratio = jnp.exp(log_prob - traj_mb.log_prob[name])
                             gae = adv_mb[name]
-                            gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                            gae_mean = (gae * mask).sum() / mask_denom
+                            gae_var = ((gae - gae_mean) ** 2 * mask).sum() / mask_denom
+                            gae = (gae - gae_mean) / (jnp.sqrt(gae_var) + 1e-8)
 
                             loss1 = ratio * gae
                             loss2 = jnp.clip(ratio, 1.0 - config.clip_eps, 1.0 + config.clip_eps) * gae
-                            loss_actor = -jnp.minimum(loss1, loss2).mean()
+                            loss_actor = -(jnp.minimum(loss1, loss2) * mask).sum() / mask_denom
 
-                            entropy = pi.entropy().mean()
+                            entropy = (pi.entropy() * mask).sum() / mask_denom
 
                             total_loss = loss_actor + config.vf_coef * value_loss - config.ent_coef * entropy
                             return total_loss, (value_loss, loss_actor, entropy, ratio)
@@ -456,7 +472,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                         if config.get("adaptive_lr", False):
                             current_lr = ts.adaptive_lr_state.learning_rate
                             eps = 1e-7
-                            approx_kl = jnp.mean((ratio - 1.0 + eps) - jnp.log(ratio + eps))
+                            approx_kl = ((ratio - 1.0 + eps) - jnp.log(ratio + eps))
+                            approx_kl = (approx_kl * mask).sum() / mask_denom
 
                             next_lr = jax.lax.cond(
                                 approx_kl > config.kl_target * config.kl_margin,

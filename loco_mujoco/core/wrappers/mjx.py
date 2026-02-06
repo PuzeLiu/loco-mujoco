@@ -395,6 +395,12 @@ class NormalizeVecRewardDict(BaseWrapper):
         self.gamma = gamma
         self.env_cfg = env.env_cfg
         self.agent_names = self.env_cfg.agent.keys()
+        stand_cfg = getattr(self.env_cfg, "stand_phase", None)
+        self.stand_phase_enabled = False
+        self.stand_phase_active_agents = set()
+        if stand_cfg is not None and stand_cfg.get("enabled", False):
+            self.stand_phase_enabled = True
+            self.stand_phase_active_agents = set(stand_cfg.get("active_agents", []))
 
     def reset(self, key, env_id=None):
         obs, state = self.env.reset(key, env_id)
@@ -412,6 +418,9 @@ class NormalizeVecRewardDict(BaseWrapper):
         next_observation, reward, absorbing, done, info, env_state = self.env.step(state.env_state, action)
         reward_components = env_state.additional_carry.reward_state.reward_components
         absorbing_dict = env_state.additional_carry.terminal_state_handler_state.is_absorbing_dict
+        no_ball = info.get("no_ball", None)
+        if no_ball is None:
+            no_ball = jnp.zeros_like(done, dtype=bool)
         agent_rewards = {}
         new_mean_dict = {}
         new_var_dict = {}
@@ -421,27 +430,73 @@ class NormalizeVecRewardDict(BaseWrapper):
             absorb = absorbing_dict[self.env_cfg.agent[name].absorbing_key]
             terms = list(self.env_cfg.agent[name].reward_terms)
             cur_reward = _parse_agent_reward_by_terms(reward_components, terms)
-            # use logical or to combine done and absorbing
-            # done_or_absorb = jnp.logical_or(done, absorb)
-            return_val = (state.return_val[name] * self.gamma * (1 - done) + cur_reward)
-            batch_mean = jnp.mean(return_val, axis=0)
-            batch_var = jnp.var(return_val, axis=0)
-            # only count non-absorbing steps
-            batch_count = jnp.sum(~absorb)
 
-            delta = batch_mean - state.mean[name]
-            tot_count = state.count[name] + batch_count
+            def _unmasked_stats(_):
+                return_val = (state.return_val[name] * self.gamma * (1 - done) + cur_reward)
+                batch_mean = jnp.mean(return_val, axis=0)
+                batch_var = jnp.var(return_val, axis=0)
+                # only count non-absorbing steps
+                batch_count = jnp.sum(~absorb)
 
-            new_mean = state.mean[name] + delta * batch_count / tot_count
-            m_a = state.var[name] * state.count[name]
-            m_b = batch_var * batch_count
-            M2 = m_a + m_b + jnp.square(delta) * state.count[name] * batch_count / tot_count
-            new_var = M2 / tot_count
-            new_count = tot_count
-            if self.env_cfg.agent[name].normalize_reward:
-                agent_rewards[name] = cur_reward / jnp.sqrt(new_var + 1e-8)
+                delta = batch_mean - state.mean[name]
+                tot_count = state.count[name] + batch_count
+
+                new_mean = state.mean[name] + delta * batch_count / tot_count
+                m_a = state.var[name] * state.count[name]
+                m_b = batch_var * batch_count
+                M2 = m_a + m_b + jnp.square(delta) * state.count[name] * batch_count / tot_count
+                new_var = M2 / tot_count
+                new_count = tot_count
+                if self.env_cfg.agent[name].normalize_reward:
+                    agent_reward = cur_reward / jnp.sqrt(new_var + 1e-8)
+                else:
+                    agent_reward = cur_reward
+                return new_mean, new_var, new_count, return_val, agent_reward
+
+            def _masked_stats(_):
+                mask = jnp.logical_not(no_ball)
+                return_val = (state.return_val[name] * self.gamma * (1 - done) + cur_reward)
+                return_val = jnp.where(mask, return_val, state.return_val[name])
+                valid = jnp.logical_and(mask, ~absorb)
+                batch_count = jnp.sum(valid)
+
+                def _update(_):
+                    batch_mean = jnp.sum(jnp.where(valid, return_val, 0.0)) / batch_count
+                    batch_var = jnp.sum(jnp.where(valid, (return_val - batch_mean) ** 2, 0.0)) / batch_count
+
+                    delta = batch_mean - state.mean[name]
+                    tot_count = state.count[name] + batch_count
+
+                    new_mean = state.mean[name] + delta * batch_count / tot_count
+                    m_a = state.var[name] * state.count[name]
+                    m_b = batch_var * batch_count
+                    M2 = m_a + m_b + jnp.square(delta) * state.count[name] * batch_count / tot_count
+                    new_var = M2 / tot_count
+                    new_count = tot_count
+                    if self.env_cfg.agent[name].normalize_reward:
+                        agent_reward = cur_reward / jnp.sqrt(new_var + 1e-8)
+                    else:
+                        agent_reward = cur_reward
+                    agent_reward = jnp.where(mask, agent_reward, jnp.zeros_like(agent_reward))
+                    return new_mean, new_var, new_count, return_val, agent_reward
+
+                def _keep(_):
+                    return state.mean[name], state.var[name], state.count[name], state.return_val[name], jnp.zeros_like(cur_reward)
+
+                return jax.lax.cond(batch_count > 0, _update, _keep, operand=None)
+
+            if self.stand_phase_enabled and name not in self.stand_phase_active_agents:
+                masking_active = jnp.any(no_ball)
+                new_mean, new_var, new_count, return_val, agent_reward = jax.lax.cond(
+                    masking_active,
+                    _masked_stats,
+                    _unmasked_stats,
+                    operand=None,
+                )
             else:
-                agent_rewards[name] = cur_reward
+                new_mean, new_var, new_count, return_val, agent_reward = _unmasked_stats(None)
+
+            agent_rewards[name] = agent_reward
             new_mean_dict[name] = new_mean
             new_var_dict[name] = new_var
             new_count_dict[name] = new_count

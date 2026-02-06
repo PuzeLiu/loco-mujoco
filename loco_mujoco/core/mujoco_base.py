@@ -77,6 +77,7 @@ class AdditionalCarry:
     pattern_state: PatternState
     reach_goal_state: bool
     curriculum: CurriculumState
+    stand_end_step: int
 
 
 class Mujoco:
@@ -926,6 +927,7 @@ class Mujoco:
             ),
             reach_goal_state=False,
             curriculum=CurriculumState(absorb_ratio=1.0, step=0),
+            stand_end_step=0,
         )
 
         return carry
