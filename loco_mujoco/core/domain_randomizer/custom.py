@@ -232,6 +232,11 @@ class CustomRandomizer(DomainRandomizer):
 
         assert_backend_is_supported(backend)
 
+        model_in, data_in, carry_in = model, data, carry
+        update_enabled = carry.curriculum.step > 0
+        if backend != jnp and update_enabled <= 0:
+            return model, data, carry
+
         domrand_state = carry.domain_randomizer_state
 
         sampled_base_mass_multiplier = domrand_state.link_mass_multipliers[0]
@@ -454,6 +459,13 @@ class CustomRandomizer(DomainRandomizer):
 
         carry = carry.replace(domain_randomizer_state=domrand_state)
 
+        if backend == jnp:
+            return jax.lax.cond(
+                update_enabled,
+                lambda _: (model, data, carry),
+                lambda _: (model_in, data_in, carry_in),
+                operand=None,
+            )
         return model, data, carry
 
     def update_observation(self,
