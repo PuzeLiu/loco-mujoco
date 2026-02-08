@@ -308,19 +308,6 @@ class IPPOJax(JaxRLAlgorithmBase):
                 # GET METRICS
                 log_env_state = env_state.find(RichLogEnvState)
                 logged_metrics = log_env_state.metrics
-                # update absorb ratio
-                absorb_ratio = jnp.sum(jnp.where(logged_metrics.done, logged_metrics.absorbed, 0.0)) / (jnp.sum(logged_metrics.done) + 1e-6)
-                absorb_ratio = absorb_ratio * jnp.ones_like(env_state.additional_carry.curriculum.absorb_ratio)
-                curriculum = env_state.additional_carry.curriculum
-                curriculum = curriculum.replace(absorb_ratio=absorb_ratio)
-                env_state = env_state.replace(
-                    env_state=env_state.env_state.replace(
-                        env_state=env_state.env_state.env_state.replace(
-                            additional_carry=env_state.env_state.env_state.additional_carry.replace(curriculum=curriculum)
-                        )
-                    )
-                )
-
                 transition = IPPOTransition(
                     done=done,
                     absorbing=absorbing,
@@ -342,8 +329,24 @@ class IPPOJax(JaxRLAlgorithmBase):
                 _env_step, runner_state, None, config.num_steps
             )
 
-            # CALCULATE ADVANTAGE
             train_states, env_state, last_obs, train_state_buffer, rng = runner_state
+            traj_metrics = traj_batch.metrics
+            absorb_ratio = jnp.sum(
+                jnp.where(traj_metrics.done, traj_metrics.absorbed, 0.0)
+            ) / (jnp.sum(traj_metrics.done) + 1e-6)
+            absorb_ratio = absorb_ratio * jnp.ones_like(env_state.additional_carry.curriculum.absorb_ratio)
+            curriculum = env_state.additional_carry.curriculum
+            curriculum = curriculum.replace(absorb_ratio=absorb_ratio)
+            env_state = env_state.replace(
+                env_state=env_state.env_state.replace(
+                    env_state=env_state.env_state.env_state.replace(
+                        additional_carry=env_state.env_state.env_state.additional_carry.replace(curriculum=curriculum)
+                    )
+                )
+            )
+            runner_state = (train_states, env_state, last_obs, train_state_buffer, rng)
+
+            # CALCULATE ADVANTAGE
             # bootstrap values per agent
             last_vals = {}
             for name in agent_names:

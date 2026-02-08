@@ -1060,6 +1060,12 @@ class HumanoidLocomotionReward(Reward):
             joint_acc_coeff = coeff_scale[carry.curriculum.step]
         else:
             joint_acc_coeff = self._joint_acc_coeff
+        if isinstance(self._feet_slip_coeff, ListConfig):
+            assert len(self._feet_slip_coeff) == 2
+            coeff_scale = jnp.linspace(self._feet_slip_coeff[0], self._feet_slip_coeff[1], 5)
+            feet_slip_coeff = coeff_scale[carry.curriculum.step]
+        else:
+            feet_slip_coeff = self._feet_slip_coeff
         
         survival_reward *= (self._survival * env.dt)
         tracking_reward_linvel_x *= (self._tracking_w_sum_linvel_x * env.dt)
@@ -1078,7 +1084,7 @@ class HumanoidLocomotionReward(Reward):
         root_acceleration_reward *= (self._root_acc_coeff * env.dt)
         action_rate_reward *= (action_rate_coeff * env.dt)
         joint_position_limit_reward *= (self._joint_position_limit_coeff * env.dt)
-        feet_slip_reward *= (self._feet_slip_coeff * env.dt)
+        feet_slip_reward *= (feet_slip_coeff * env.dt)
         feet_yaw_diff_reward *= (self._feet_yaw_diff_coeff * env.dt)
         feet_yaw_mean_reward *= (self._feet_yaw_mean_coeff * env.dt)
         feet_roll_reward *= (self._feet_roll_coeff * env.dt)
