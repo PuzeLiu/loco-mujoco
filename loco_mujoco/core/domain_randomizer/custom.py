@@ -233,7 +233,7 @@ class CustomRandomizer(DomainRandomizer):
         assert_backend_is_supported(backend)
 
         model_in, data_in, carry_in = model, data, carry
-        update_enabled = carry.curriculum.step > 0
+        update_enabled = carry.curriculum.step >= self.rand_conf["start_curriculum_step"]
         if backend != jnp and update_enabled <= 0:
             return model, data, carry
 
