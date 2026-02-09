@@ -109,6 +109,8 @@ class SummaryRichMetrics:
     mean_episode_length: float = 0.0
     max_timestep: int = 0.0
     frac_absorbed: float = 0.0
+    juggle_absorbed: float = 0.0
+    loco_absorbed: float = 0.0
     mean_episode_return_components: dict = dataclasses.field(default_factory=lambda: {})
     curriculum_step: int = 0
 
@@ -130,6 +132,8 @@ class RichMetrics:
     timestep: int
     done: bool
     absorbed: bool
+    juggle_absorbed: bool
+    loco_absorbed: bool
     episode_return_components: dict[str, float]
     returned_episode_return_components: dict[str, float]
     curriculum_step: int
@@ -189,7 +193,7 @@ class RichLogWrapper(BaseWrapper):
 
         state = RichLogEnvState(env_state, 
                             metrics=RichMetrics(0, 0, 0, 0, 0, False, False, 
-                                                zero_components.copy(), zero_components.copy(), 0))
+                                                False, False, zero_components.copy(), zero_components.copy(), 0))
         return obs, state
 
     @partial(jax.jit, static_argnums=(0,))
@@ -239,6 +243,8 @@ class RichLogWrapper(BaseWrapper):
                 timestep=state.metrics.timestep + 1,
                 done=done,
                 absorbed=absorbing,
+                juggle_absorbed=env_state.additional_carry.terminal_state_handler_state.is_absorbing_dict["juggle"],
+                loco_absorbed=env_state.additional_carry.terminal_state_handler_state.is_absorbing_dict["loco"],
                 episode_return_components=episode_return_components,
                 returned_episode_return_components=returned_episode_return_components,
                 curriculum_step=env_state.additional_carry.curriculum.step,

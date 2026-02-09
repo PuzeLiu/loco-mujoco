@@ -529,6 +529,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                 mean_episode_length=jnp.sum(jnp.where(logged_metrics.done, logged_metrics.returned_episode_lengths, 0.0)) / jnp.sum(logged_metrics.done),
                 max_timestep=global_timesteps + jnp.max(logged_metrics.timestep * config.num_envs),
                 frac_absorbed=jnp.sum(jnp.where(logged_metrics.done, logged_metrics.absorbed, 0.0)) / (jnp.sum(logged_metrics.done) + 1e-6),
+                juggle_absorbed=jnp.sum(jnp.where(logged_metrics.done, logged_metrics.juggle_absorbed, 0.0)) / (jnp.sum(logged_metrics.done) + 1e-6),
+                loco_absorbed=jnp.sum(jnp.where(logged_metrics.done, logged_metrics.loco_absorbed, 0.0)) / (jnp.sum(logged_metrics.done) + 1e-6),
                 mean_episode_return_components=mean_episode_return_components,
                 curriculum_step=jnp.mean(logged_metrics.curriculum_step),
             )
@@ -538,6 +540,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                 mean_ep_length = metric.mean_episode_length
                 timestep = metric.max_timestep
                 frac_absorbed = metric.frac_absorbed
+                juggle_absorbed = metric.juggle_absorbed
+                loco_absorbed = metric.loco_absorbed
                 mean_ep_return_components = metric.mean_episode_return_components                
                 curriculum_step = metric.curriculum_step
 
@@ -549,6 +553,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                     wandb_log_dict["Live Info/Mean Episode Length"] = mean_ep_length
                     wandb_log_dict["Live Info/Absorbed Envs"] = frac_absorbed
                     wandb_log_dict["Live Info/Curriculum Step"] = curriculum_step
+                    wandb_log_dict["Live Info/Juggle Absorbed"] = juggle_absorbed
+                    wandb_log_dict["Live Info/Loco Absorbed"] = loco_absorbed
                     # also log other live info
                     for key, value in live_info.items():
                         wandb_log_dict["Live Info/" + key] = value
@@ -712,8 +718,8 @@ class IPPOJax(JaxRLAlgorithmBase):
             warnings.warn("No rendering, no record, no n_steps specified. This will run forever with no effect.")
 
         # create env
-        if wrap_env and not use_mujoco:
-            env = cls._wrap_env(env, config)
+        # if wrap_env and not use_mujoco:
+        #     env = cls._wrap_env(env, config)
 
         if rng is None:
             rng = jax.random.key(0)
@@ -727,7 +733,11 @@ class IPPOJax(JaxRLAlgorithmBase):
         else:
             keys = jax.random.split(rng, n_envs + 1)
             rng, env_keys = keys[0], keys[1:]
-            obs, env_state = env.reset(env_keys, env_id=jnp.arange(n_envs))
+            from flax import nnx
+            jv_reset = nnx.jit(nnx.vmap(env.mjx_reset, in_axes=(0, 0)))
+            jv_step = nnx.jit(nnx.vmap(env.mjx_step, in_axes=(0, 0)))
+            state = jv_reset(env_keys, jnp.arange(n_envs))
+            obs = state.observation
 
         if n_steps is None:
             n_steps = jnp.iinfo(jnp.int32).max
@@ -771,13 +781,14 @@ class IPPOJax(JaxRLAlgorithmBase):
             if use_mujoco:
                 obs, reward, absorbing, done, info = env.step(action)
             else:
-                obs, reward, absorbing, done, info, env_state = env.step(env_state, action)
+                state = jv_step(state, action) 
+                obs = state.observation
 
             # RENDER
             if use_mujoco:
                 env.render(record=True)
             else:
-                env.mjx_render(env_state, record=record)
+                env.mjx_render(state)
 
             # RESET MUJOCO ENV (MJX resets by itself)
             if use_mujoco:
