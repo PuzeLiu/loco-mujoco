@@ -588,11 +588,24 @@ class HumanoidLocomotionReward(Reward):
         self._free_joint_qpos_ind = np.array(mj_jntname2qposid(self._free_jnt_name, model))
         self._free_joint_qvel_ind = np.array(mj_jntname2qvelid(self._free_jnt_name, model))
         
-        self._free_joint_qpos_mask = np.zeros(model.nq, dtype=bool)
-        self._free_joint_qpos_mask[self._free_joint_qpos_ind] = True
+        # self._free_joint_qpos_mask = np.zeros(model.nq, dtype=bool)
+        # self._free_joint_qpos_mask[self._free_joint_qpos_ind] = True
         
-        self._free_joint_qvel_mask = np.zeros(model.nv, dtype=bool)
-        self._free_joint_qvel_mask[self._free_joint_qvel_ind] = True
+        # self._free_joint_qvel_mask = np.zeros(model.nv, dtype=bool)
+        # self._free_joint_qvel_mask[self._free_joint_qvel_ind] = True
+        
+        self.qpos_joint_adr = []
+        self.qvel_joint_adr = []
+        self.control_joint_ind = np.array(env.env_cfg.agent.agent_lower_body.action_idx)
+        for jn in env.env_cfg.robot.joint_names:
+            self.qpos_joint_adr.append(env.model.jnt_qposadr[env.model.joint(jn).id])
+            self.qvel_joint_adr.append(env.model.jnt_dofadr[env.model.joint(jn).id])
+        self.qpos_joint_adr = np.array(self.qpos_joint_adr)[self.control_joint_ind]
+        self.qvel_joint_adr = np.array(self.qvel_joint_adr)[self.control_joint_ind]
+        self._free_joint_qpos_mask = np.ones(model.nq, dtype=bool)
+        self._free_joint_qvel_mask = np.ones(model.nv, dtype=bool)
+        self._free_joint_qpos_mask[self.qpos_joint_adr] = False
+        self._free_joint_qvel_mask[self.qvel_joint_adr] = False
 
         # Initialize floor and foot geometry IDs
         self._floor_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
@@ -871,7 +884,7 @@ class HumanoidLocomotionReward(Reward):
         ).sum()
 
         # Action rate penalty
-        action_rate_reward = (backend.square(action - reward_state.last_action)).sum()
+        action_rate_reward = (backend.square(action[self.control_joint_ind] - reward_state.last_action[self.control_joint_ind])).sum()
 
         # Joint position limit penalty
         joint_positions = backend.array(data.qpos[self._limited_joints_qpos_id])
