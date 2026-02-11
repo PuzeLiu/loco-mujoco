@@ -386,75 +386,93 @@ class CustomRandomizer(DomainRandomizer):
 
 
         if self.rand_conf["push_robots"]:
-            # Pushing
-            # push_robots: true
-            # push_force_amplitude: 20 # Newtons
-            # push_torque_amplitude: 2.0 # Newton-meters
-            # push_active_duration: 1.0 # seconds
-            # push_relief_duration: 3.0 # seconds
-            # Rely on carry.cur_step_in_episode
+            push_enabled = env._is_stand_phase(carry)
 
-            push_prob = self.rand_conf["push_prob"]
-            push_force_amplitude = self.rand_conf["push_force_amplitude"]
-            push_active_duration = backend.array(self.rand_conf["push_active_duration"] / env.dt, dtype=backend.int32)
-            push_relief_duration = backend.array(self.rand_conf["push_relief_duration"] / env.dt, dtype=backend.int32)
-            push_torque_amplitude = self.rand_conf["push_torque_amplitude"]
+            def _apply_push(_):
+                # Pushing
+                # push_robots: true
+                # push_force_amplitude: 20 # Newtons
+                # push_torque_amplitude: 2.0 # Newton-meters
+                # push_active_duration: 1.0 # seconds
+                # push_relief_duration: 3.0 # seconds
+                # Rely on carry.cur_step_in_episode
 
-            is_push_active = (domrand_state.push_counter < push_active_duration)
-            domrand_state = domrand_state.replace(push_counter=domrand_state.push_counter + 1)
+                push_prob = self.rand_conf["push_prob"]
+                push_force_amplitude = self.rand_conf["push_force_amplitude"]
+                push_active_duration = backend.array(self.rand_conf["push_active_duration"] / env.dt, dtype=backend.int32)
+                push_relief_duration = backend.array(self.rand_conf["push_relief_duration"] / env.dt, dtype=backend.int32)
+                push_torque_amplitude = self.rand_conf["push_torque_amplitude"]
 
-            # if push is inactive, and a push is sampled, then randomly generate a push force (cartesian and torque), and save it in domrand state
-            # if push is active, then use the saved push force from domrand state. so just increment the push counter
-            if backend == jnp:
-                key = carry.key
-                key, _k = jax.random.split(key)
-                random_value = jax.random.uniform(_k, shape=(1,))
-                carry = carry.replace(key=key)
-                
-                def inactive_push_branch(_):
-                    # Generate random push force
-                    random_push_force = jax.random.uniform(_k, shape=(6,), minval=-1.0, maxval=1.0)
-                    random_push_force = random_push_force * backend.array([push_force_amplitude, push_force_amplitude, push_force_amplitude,
-                                                                            push_torque_amplitude, push_torque_amplitude, push_torque_amplitude])
+                is_push_active = (domrand_state.push_counter < push_active_duration)
+                domrand_state_local = domrand_state.replace(push_counter=domrand_state.push_counter + 1)
+                data_local = data
+                carry_local = carry
+
+                # if push is inactive, and a push is sampled, then randomly generate a push force (cartesian and torque), and save it in domrand state
+                # if push is active, then use the saved push force from domrand state. so just increment the push counter
+                if backend == jnp:
+                    key = carry_local.key
+                    key, _k = jax.random.split(key)
+                    random_value = jax.random.uniform(_k, shape=(1,))
+                    carry_local = carry_local.replace(key=key)
                     
-                    def apply_push(_):
-                        new_state = domrand_state.replace(active_root_push_force=random_push_force)
-                        return new_state.replace(push_counter=0)  # reset push counter
-                    
-                    def no_push(_):
-                        return domrand_state.replace(active_root_push_force=backend.zeros_like(domrand_state.active_root_push_force))
-                    
-                    return jax.lax.cond(random_value[0] < push_prob, apply_push, no_push, operand=None)
-                
-                def active_push_branch(_):
-                    return domrand_state
-                
-                domrand_state = jax.lax.cond(~is_push_active, inactive_push_branch, active_push_branch, operand=None)
-
-            else:
-                if not is_push_active:
-                    # sample a push force with a random prob
-                    random_value = np.random.uniform(size=(1,))
-                    if random_value[0] < push_prob:
-                        random_push_force = np.random.uniform(-1.0, 1.0, size=(6,))
+                    def inactive_push_branch(_):
+                        # Generate random push force
+                        random_push_force = jax.random.uniform(_k, shape=(6,), minval=-1.0, maxval=1.0)
                         random_push_force = random_push_force * backend.array([push_force_amplitude, push_force_amplitude, push_force_amplitude,
-                                                                            push_torque_amplitude, push_torque_amplitude, push_torque_amplitude])
-                        domrand_state = domrand_state.replace(active_root_push_force=random_push_force)
-                        domrand_state = domrand_state.replace(push_counter=0)  # reset push counter
-                else:
-                    domrand_state = domrand_state.replace(active_root_push_force=backend.zeros_like(domrand_state.active_root_push_force))
+                                                                                push_torque_amplitude, push_torque_amplitude, push_torque_amplitude])
+                        
+                        def apply_push(_):
+                            new_state = domrand_state_local.replace(active_root_push_force=random_push_force)
+                            return new_state.replace(push_counter=0)  # reset push counter
+                        
+                        def no_push(_):
+                            return domrand_state_local.replace(active_root_push_force=backend.zeros_like(domrand_state_local.active_root_push_force))
+                        
+                        return jax.lax.cond(random_value[0] < push_prob, apply_push, no_push, operand=None)
+                    
+                    def active_push_branch(_):
+                        return domrand_state_local
+                    
+                    domrand_state_local = jax.lax.cond(~is_push_active, inactive_push_branch, active_push_branch, operand=None)
 
-            push_force = domrand_state.active_root_push_force[:3]
-            push_torque = domrand_state.active_root_push_force[3:]
+                else:
+                    if not is_push_active:
+                        # sample a push force with a random prob
+                        random_value = np.random.uniform(size=(1,))
+                        if random_value[0] < push_prob:
+                            random_push_force = np.random.uniform(-1.0, 1.0, size=(6,))
+                            random_push_force = random_push_force * backend.array([push_force_amplitude, push_force_amplitude, push_force_amplitude,
+                                                                                push_torque_amplitude, push_torque_amplitude, push_torque_amplitude])
+                            domrand_state_local = domrand_state_local.replace(active_root_push_force=random_push_force)
+                            domrand_state_local = domrand_state_local.replace(push_counter=0)  # reset push counter
+                    else:
+                        domrand_state_local = domrand_state_local.replace(active_root_push_force=backend.zeros_like(domrand_state_local.active_root_push_force))
+
+                push_force = domrand_state_local.active_root_push_force[:3]
+                push_torque = domrand_state_local.active_root_push_force[3:]
+
+                if backend == jnp:
+                    # Apply the push force to the root body (body index 0)
+                    data_local = data_local.replace(xfrc_applied=data_local.xfrc_applied.at[self._root_body_id, :3].set(push_force))
+                    data_local = data_local.replace(xfrc_applied=data_local.xfrc_applied.at[self._root_body_id, 3:].set(push_torque))                
+                else:
+                    # Apply the push force to the root body (body index 0)
+                    data_local.xfrc_applied[self._root_body_id, :3] = push_force
+                    data_local.xfrc_applied[self._root_body_id, 3:] = push_torque
+
+                return domrand_state_local, data_local, carry_local
 
             if backend == jnp:
-                # Apply the push force to the root body (body index 0)
-                data = data.replace(xfrc_applied=data.xfrc_applied.at[self._root_body_id, :3].set(push_force))
-                data = data.replace(xfrc_applied=data.xfrc_applied.at[self._root_body_id, 3:].set(push_torque))                
+                domrand_state, data, carry = jax.lax.cond(
+                    push_enabled,
+                    _apply_push,
+                    lambda _: (domrand_state, data, carry),
+                    operand=None,
+                )
             else:
-                # Apply the push force to the root body (body index 0)
-                data.xfrc_applied[self._root_body_id, :3] = push_force
-                data.xfrc_applied[self._root_body_id, 3:] = push_torque
+                if push_enabled:
+                    domrand_state, data, carry = _apply_push(None)
 
 
         carry = carry.replace(domain_randomizer_state=domrand_state)
