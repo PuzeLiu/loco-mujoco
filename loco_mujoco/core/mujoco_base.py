@@ -78,6 +78,7 @@ class AdditionalCarry:
     reach_goal_state: bool
     curriculum: CurriculumState
     stand_end_step: int
+    ball_com_ipos: Union[np.ndarray, jax.Array]
 
 
 class Mujoco:
@@ -928,6 +929,7 @@ class Mujoco:
             reach_goal_state=False,
             curriculum=CurriculumState(absorb_ratio=1.0, step=0),
             stand_end_step=0,
+            ball_com_ipos=backend.zeros((getattr(self, 'n_balls', 0), 3)),
         )
 
         return carry
