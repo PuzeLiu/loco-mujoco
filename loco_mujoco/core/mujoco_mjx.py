@@ -102,6 +102,7 @@ class Mjx(Mujoco):
         absorbing = jnp.array(False, dtype=bool)
         done = jnp.array(False, dtype=bool)
         info = self._mjx_reset_info_dictionary(obs, data, subkey)
+        carry = carry.replace(final_info=info)
 
         return MjxState(data=data, observation=obs, reward=reward, absorbing=absorbing, done=done,
                         info=info, additional_carry=carry)
@@ -210,6 +211,7 @@ class Mjx(Mujoco):
         total_timestep = carry.total_timestep
         total_timestep = total_timestep + 1
         carry = carry.replace(total_timestep=total_timestep)
+        carry = carry.replace(final_info=cur_info)
 
         # update history
         if self.history_length > 0:
@@ -600,4 +602,3 @@ class Mjx(Mujoco):
     def mjx_env(self) -> bool:
         """Indicates whether this is an MJX environment."""
         return True
-

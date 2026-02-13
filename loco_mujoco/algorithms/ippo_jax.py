@@ -18,6 +18,8 @@ from loco_mujoco.algorithms import (JaxRLAlgorithmBase, AgentConfBase, AgentStat
 from loco_mujoco.core.wrappers import RichLogWrapper, NStepWrapper, RichLogEnvState, VecEnv, NormalizeVecRewardDict, SummaryRichMetrics
 from loco_mujoco.core.wrappers.mjx import BaseWrapper
 from loco_mujoco.utils import MetricsHandler, ValidationSummary
+from loco_mujoco.algorithms.common.world_model import WorldModelTXL, world_model_loss
+from loco_mujoco.algorithms.world_model_agent import IPPOWorldConf, IPPOWorldState
 
 
 def _scatter_actions(num_envs: int,
@@ -152,6 +154,50 @@ class IPPOJax(JaxRLAlgorithmBase):
 
             txs[agent_name] = cls._get_optimizer(config)
         return cls._agent_conf(config=config, networks=networks, txs=txs)
+
+    @classmethod
+    def init_world_conf(cls, env, config) -> IPPOWorldConf | None:
+        wm_cfg = config.experiment.get("world_model", None)
+        if wm_cfg is None or not wm_cfg.get("enabled", False):
+            return None
+
+        obs_group = wm_cfg.get("obs_group", None)
+        obs_ind = None
+        if obs_group is not None:
+            obs_ind = env.obs_container.get_obs_ind_by_group(obs_group)
+            if obs_ind.size == 0:
+                raise ValueError(f"World model obs_group '{obs_group}' produced empty indices.")
+        else:
+            obs_cfg = wm_cfg.get("obs_ind", None)
+            if obs_cfg is not None and len(obs_cfg) > 0:
+                obs_ind = jnp.array(obs_cfg, dtype=jnp.int32)
+
+        if obs_ind is None:
+            raise ValueError("World model obs_group/obs_ind not configured.")
+
+        obs_ind = jnp.array(obs_ind, dtype=jnp.int32)
+        input_dim = int(obs_ind.shape[0] + (3 if wm_cfg.get("use_prev_pred_disp", True) else 0))
+        with open_dict(config.experiment.world_model):
+            config.experiment.world_model.obs_ind = obs_ind.tolist()
+            config.experiment.world_model.input_dim = input_dim
+
+        model = WorldModelTXL(
+            input_dim=input_dim,
+            model_dim=wm_cfg.model_dim,
+            n_layers=wm_cfg.n_layers,
+            n_heads=wm_cfg.n_heads,
+            ff_dim=wm_cfg.ff_dim,
+            dropout=wm_cfg.dropout,
+            mem_len=wm_cfg.mem_len,
+        )
+        tx = cls._get_world_model_optimizer(config)
+        return IPPOWorldConf(
+            config=config,
+            model=model,
+            tx=tx,
+            obs_ind=obs_ind,
+            obs_group=obs_group,
+        )
     
     @classmethod
     def _get_optimizer(cls, config):
@@ -173,16 +219,26 @@ class IPPOJax(JaxRLAlgorithmBase):
         return tx
 
     @classmethod
-    def build_train_fn(cls, env, agent_conf: IPPOAgentConf, mh: MetricsHandler = None, wandb_run=None):
+    def _get_world_model_optimizer(cls, config):
+        wm_cfg = config.experiment.world_model
+        return optax.chain(
+            optax.clip_by_global_norm(config.experiment.max_grad_norm),
+            optax.adamw(wm_cfg.lr, weight_decay=wm_cfg.weight_decay, eps=1e-5),
+        )
+
+    @classmethod
+    def build_train_fn(cls, env, agent_conf: IPPOAgentConf, world_conf: IPPOWorldConf | None = None, mh: MetricsHandler = None, wandb_run=None):
         """Returns the main train function of IPPO with optional timestep offset."""
         config = agent_conf.config.experiment
         wrapped_env = env if isinstance(env, BaseWrapper) else cls._wrap_env(env, config)
         return (
-            lambda rng_key, agent_state=None, env_state=None, timesteps=0: cls._train_fn(
+            lambda rng_key, agent_state=None, world_state=None, env_state=None, timesteps=0: cls._train_fn(
                 rng_key,
                 wrapped_env,
                 agent_conf,
                 agent_state,
+                world_conf=world_conf,
+                world_state=world_state,
                 mh=mh,
                 wandb_run=wandb_run,
                 env_state=env_state,
@@ -194,6 +250,8 @@ class IPPOJax(JaxRLAlgorithmBase):
     def _train_fn(cls, rng, env,
                   agent_conf: IPPOAgentConf,
                   agent_state: IPPOAgentState = None,
+                  world_conf: IPPOWorldConf | None = None,
+                  world_state: IPPOWorldState | None = None,
                   mh: MetricsHandler = None,
                   wandb_run=None,
                   env_state=None,
@@ -206,6 +264,9 @@ class IPPOJax(JaxRLAlgorithmBase):
             env = cls._wrap_env(env, config)
 
         agent_names = tuple(agent_conf.networks.keys())
+        world_model_enabled = world_conf is not None
+        wm_obs_ind = world_conf.obs_ind if world_model_enabled else None
+        wm_cfg = config.world_model if world_model_enabled else None
 
         stand_cfg = agent_conf.config.env.get("stand_phase", None)
         stand_phase_enabled = False
@@ -226,6 +287,7 @@ class IPPOJax(JaxRLAlgorithmBase):
         global_timesteps = timesteps if env_state is None else jnp.zeros_like(timesteps)
 
         # extract current agent state
+        world_model_state = world_state
         if agent_state is not None:
             train_states = agent_state.train_states
         else:
@@ -250,6 +312,19 @@ class IPPOJax(JaxRLAlgorithmBase):
                     tx=agent_conf.txs[name],
                 )
 
+        if world_model_enabled and world_model_state is None:
+            rng, subkey = jax.random.split(rng)
+            dummy_x = jnp.zeros((1, 1, wm_cfg.input_dim), dtype=jnp.float32)
+            params = world_conf.model.init(subkey, dummy_x, mems=None, attn_mask=None, train=False)
+            wm_ts = TrainState.create(
+                apply_fn=world_conf.model.apply,
+                params=params["params"],
+                run_stats={},
+                adaptive_lr_state=None,
+                tx=world_conf.tx,
+            )
+            world_model_state = IPPOWorldState(train_state=wm_ts)
+
         # INIT ENV (only if no previous env_state is provided)
         if env_state is None:
             rng, _rng = jax.random.split(rng)
@@ -264,7 +339,7 @@ class IPPOJax(JaxRLAlgorithmBase):
         def _update_step(runner_state, unused):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
-                train_states, env_state, last_obs, train_state_buffer, rng = runner_state
+                train_states, world_model_state, env_state, last_obs, train_state_buffer, rng = runner_state
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
@@ -322,14 +397,14 @@ class IPPOJax(JaxRLAlgorithmBase):
                     traj_state=env_state.additional_carry.traj_state,
                     metrics=logged_metrics,
                 )
-                runner_state = (new_train_states, env_state, obsv, train_state_buffer, _rng_next)
+                runner_state = (new_train_states, world_model_state, env_state, obsv, train_state_buffer, _rng_next)
                 return runner_state, transition
 
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, config.num_steps
             )
 
-            train_states, env_state, last_obs, train_state_buffer, rng = runner_state
+            train_states, world_model_state, env_state, last_obs, train_state_buffer, rng = runner_state
             traj_metrics = traj_batch.metrics
             absorb_ratio = jnp.sum(
                 jnp.where(traj_metrics.done, traj_metrics.absorbed, 0.0)
@@ -344,7 +419,37 @@ class IPPOJax(JaxRLAlgorithmBase):
                     )
                 )
             )
-            runner_state = (train_states, env_state, last_obs, train_state_buffer, rng)
+            runner_state = (train_states, world_model_state, env_state, last_obs, train_state_buffer, rng)
+
+            world_model_metrics = None
+            if world_model_enabled:
+                # Train world model on post-step observations to match info targets.
+                rng, wm_rng = jax.random.split(rng)
+                obs_next = jnp.concatenate([traj_batch.obs[1:], last_obs[None, ...]], axis=0)
+                wm_obs = obs_next[..., wm_obs_ind]
+                wm_inputs = wm_obs
+
+                def _wm_loss_fn(params):
+                    return world_model_loss(
+                        world_conf.model,
+                        params,
+                        wm_inputs,
+                        traj_batch.info["base_disp"],
+                        traj_batch.info["base_linvel"],
+                        traj_batch.done,
+                        wm_cfg.seg_len,
+                        wm_cfg.mem_len,
+                        wm_cfg.aux_vel_weight,
+                        wm_rng,
+                        # wm_cfg.get("use_prev_pred_disp", True),
+                    )
+
+                wm_ts = world_model_state.train_state
+                (wm_loss, world_model_metrics), wm_grads = jax.value_and_grad(
+                    _wm_loss_fn, has_aux=True
+                )(wm_ts.params)
+                wm_ts = wm_ts.apply_gradients(grads=wm_grads)
+                world_model_state = world_model_state.replace(train_state=wm_ts)
 
             # CALCULATE ADVANTAGE
             # bootstrap values per agent
@@ -572,21 +677,28 @@ class IPPOJax(JaxRLAlgorithmBase):
                 "Learning Rate": ts.adaptive_lr_state.learning_rate
                 if config.get("adaptive_lr", False) else config.lr,
             }
+            if world_model_metrics is not None:
+                live_info.update({
+                    "WorldModel Loss": world_model_metrics["wm_loss"],
+                    "WorldModel Disp RMSE": world_model_metrics["wm_disp_rmse"],
+                    "WorldModel Vel RMSE": world_model_metrics["wm_vel_rmse"]
+                })
             jax.debug.callback(callback, metric, live_info=live_info)
 
             # no train state buffering during training (validation only at end)
 
-            runner_state = (train_states, env_state, last_obs, train_state_buffer, rng)
+            runner_state = (train_states, world_model_state, env_state, last_obs, train_state_buffer, rng)
             return runner_state, (metric, metric.max_timestep)
 
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_states, env_state, obsv, train_state_buffer, _rng)
+        runner_state = (train_states, world_model_state, env_state, obsv, train_state_buffer, _rng)
         runner_state, (metric, global_timesteps) = jax.lax.scan(
             _update_step, runner_state, None, config.num_updates
         )
 
         agent_state = cls._agent_state(train_states=runner_state[0])
-        env_state_out = runner_state[1]
+        world_state = runner_state[1]
+        env_state_out = runner_state[2]
 
         # Single evaluation after training completes
         if mh is not None:
@@ -656,6 +768,7 @@ class IPPOJax(JaxRLAlgorithmBase):
             validation_metrics = ValidationSummary()
 
         return {"agent_state": agent_state,
+                "world_state": world_state,
                 "env_state": env_state_out,
                 "training_metrics": metric,
                 "validation_metrics": validation_metrics,
