@@ -97,18 +97,20 @@ class WorldModelTXL(nn.Module):
 
     def step(self,
              x_t: jnp.ndarray,
-             cache: Optional[List[Tuple[jnp.ndarray, jnp.ndarray]]],
-             train: bool = False) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], List[Tuple[jnp.ndarray, jnp.ndarray]]]:
+             cache: Optional[List[Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]],
+             train: bool = False,
+             mem_len: Optional[int] = None) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], List[Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]]:
         """
         Single-step prediction with KV-cache for fast inference.
 
         Args:
             x_t: (B, input_dim)
-            cache: list of (k_cache, v_cache) per layer
+            cache: list of (k_cache, v_cache, cache_len) per layer
+            mem_len: optional override for cache length
         """
         h = self.in_proj(x_t)
         h = self.in_ln(h)
-        h, new_cache = self.txl.step(h, cache, train)
+        h, new_cache = self.txl.step(h, cache, train, mem_len=mem_len)
         pred_disp = self.out_disp(h)
         pred_vel = self.out_vel(h)
         return (pred_disp, pred_vel), new_cache

@@ -176,11 +176,20 @@ class IPPOJax(JaxRLAlgorithmBase):
             raise ValueError("World model obs_group/obs_ind not configured.")
 
         obs_ind = jnp.array(obs_ind, dtype=jnp.int32)
-        input_dim = int(obs_ind.shape[0] + (3 if wm_cfg.get("use_prev_pred_disp", True) else 0))
+        input_dim = int(obs_ind.shape[0])
+        if hasattr(env, "info") and hasattr(env.info, "action_space"):
+            action_dim = int(env.info.action_space.shape[0])
+        else:
+            action_dim = int(env.action_dim)
+        input_dim += action_dim
+        if wm_cfg.get("use_prev_pred_disp", True):
+            input_dim += 3
         with open_dict(config.experiment.world_model):
             config.experiment.world_model.obs_ind = obs_ind.tolist()
             config.experiment.world_model.input_dim = input_dim
+            config.experiment.world_model.action_dim = action_dim
 
+        train_mem_len = wm_cfg.get("train_mem_len", wm_cfg.mem_len)
         model = WorldModelTXL(
             input_dim=input_dim,
             model_dim=wm_cfg.model_dim,
@@ -188,7 +197,7 @@ class IPPOJax(JaxRLAlgorithmBase):
             n_heads=wm_cfg.n_heads,
             ff_dim=wm_cfg.ff_dim,
             dropout=wm_cfg.dropout,
-            mem_len=wm_cfg.mem_len,
+            mem_len=train_mem_len,
         )
         tx = cls._get_world_model_optimizer(config)
         return IPPOWorldConf(
@@ -335,11 +344,77 @@ class IPPOJax(JaxRLAlgorithmBase):
 
         train_state_buffer = TrainStateBuffer.create(next(iter(train_states.values())), config.validation.num)
 
+        wm_eval_mem_len = wm_cfg.get("eval_mem_len", wm_cfg.mem_len)
+
+        def _wm_build_inputs(obs, action, prev_pred_disp):
+            wm_obs = obs[..., wm_obs_ind]
+            wm_inputs = jnp.concatenate([wm_obs, action], axis=-1)
+            if wm_cfg.get("use_prev_pred_disp", False):
+                wm_inputs = jnp.concatenate([wm_inputs, prev_pred_disp], axis=-1)
+            return wm_inputs
+
+        def _wm_predict_step(obs, action, prev_pred_disp, cache, params):
+            wm_inputs = _wm_build_inputs(obs, action, prev_pred_disp)
+            if wm_eval_mem_len <= 0:
+                (pred_disp, pred_vel), _ = world_conf.model.apply(
+                    {"params": params},
+                    wm_inputs,
+                    cache=None,
+                    train=False,
+                    mem_len=0,
+                    method=WorldModelTXL.step,
+                )
+                return pred_disp, pred_vel, None
+            (pred_disp, pred_vel), new_cache = world_conf.model.apply(
+                {"params": params},
+                wm_inputs,
+                cache=cache,
+                train=False,
+                mem_len=wm_eval_mem_len,
+                method=WorldModelTXL.step,
+            )
+            return pred_disp, pred_vel, new_cache
+
+        def _wm_reset_cache(cache, done):
+            if cache is None:
+                return None
+            done_mask = done[:, None, None, None]
+            new_cache = []
+            for layer_cache in cache:
+                if layer_cache is None:
+                    new_cache.append(None)
+                    continue
+                k_cache, v_cache, cache_len = layer_cache
+                k_cache = jnp.where(done_mask, jnp.zeros_like(k_cache), k_cache)
+                v_cache = jnp.where(done_mask, jnp.zeros_like(v_cache), v_cache)
+                cache_len = jnp.where(done, jnp.zeros_like(cache_len), cache_len)
+                new_cache.append((k_cache, v_cache, cache_len))
+            return new_cache
+
+        wm_kv_cache = None
+        wm_prev_pred_disp = jnp.zeros((num_envs, 3), dtype=jnp.float32)
+        if world_model_enabled:
+            if wm_eval_mem_len > 0:
+                head_dim = world_conf.model.model_dim // world_conf.model.n_heads
+                wm_kv_cache = [
+                    (
+                        jnp.zeros((num_envs, world_conf.model.n_heads, wm_eval_mem_len, head_dim), dtype=jnp.float32),
+                        jnp.zeros((num_envs, world_conf.model.n_heads, wm_eval_mem_len, head_dim), dtype=jnp.float32),
+                        jnp.zeros((num_envs,), dtype=jnp.int32),
+                    )
+                    for _ in range(world_conf.model.n_layers)
+                ]
+            else:
+                wm_kv_cache = None
+            if wm_cfg.get("use_prev_pred_disp", False):
+                wm_prev_pred_disp = jnp.zeros((obsv.shape[0], 3), dtype=obsv.dtype)
+
         # TRAIN LOOP
         def _update_step(runner_state, unused):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
-                train_states, world_model_state, env_state, last_obs, train_state_buffer, rng = runner_state
+                (train_states, world_model_state, env_state, last_obs, train_state_buffer, rng,
+                 wm_kv_cache, wm_prev_pred_disp) = runner_state
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
@@ -377,9 +452,30 @@ class IPPOJax(JaxRLAlgorithmBase):
 
                 action = _scatter_actions(num_envs, full_action_dim, agent_actions, agent_action_idx)
 
+                wm_prev_pred_disp_used = wm_prev_pred_disp
+                wm_pred_disp_mse = jnp.zeros((num_envs,), dtype=jnp.float32)
+                wm_pred_vel_mse = jnp.zeros((num_envs,), dtype=jnp.float32)
+                if world_model_enabled:
+                    pred_disp_t, pred_vel_t, wm_kv_cache = _wm_predict_step(
+                        last_obs,
+                        action,
+                        wm_prev_pred_disp_used,
+                        wm_kv_cache,
+                        world_model_state.train_state.params,
+                    )
+                    if wm_cfg.get("use_prev_pred_disp", False):
+                        wm_prev_pred_disp_next = pred_disp_t
+                    else:
+                        wm_prev_pred_disp_next = wm_prev_pred_disp
+                else:
+                    wm_prev_pred_disp_next = wm_prev_pred_disp
+
                 # STEP ENV
                 obsv, reward, absorbing, done, info, env_state = env.step(env_state, action)
                 agent_rewards = info['agent_rewards']
+                if world_model_enabled:
+                    wm_pred_disp_mse = jnp.mean((pred_disp_t - info["base_disp"]) ** 2, axis=-1)
+                    wm_pred_vel_mse = jnp.mean((pred_vel_t - info["base_linvel"]) ** 2, axis=-1)
                 # GET METRICS
                 log_env_state = env_state.find(RichLogEnvState)
                 logged_metrics = log_env_state.metrics
@@ -393,18 +489,29 @@ class IPPOJax(JaxRLAlgorithmBase):
                     reward=agent_rewards,
                     log_prob=agent_log_probs,
                     obs=last_obs,
+                    wm_prev_pred_disp=wm_prev_pred_disp_used,
+                    wm_pred_disp_mse=wm_pred_disp_mse,
+                    wm_pred_vel_mse=wm_pred_vel_mse,
                     info=info,
                     traj_state=env_state.additional_carry.traj_state,
                     metrics=logged_metrics,
                 )
-                runner_state = (new_train_states, world_model_state, env_state, obsv, train_state_buffer, _rng_next)
+                if world_model_enabled:
+                    if wm_cfg.get("use_prev_pred_disp", False):
+                        bootstrap_prev = jnp.zeros((num_envs, 3), dtype=jnp.float32)
+                        wm_prev_pred_disp_next = jnp.where(done[:, None], bootstrap_prev, wm_prev_pred_disp_next)
+                    wm_kv_cache = _wm_reset_cache(wm_kv_cache, done)
+
+                runner_state = (new_train_states, world_model_state, env_state, obsv, train_state_buffer, _rng_next,
+                                wm_kv_cache, wm_prev_pred_disp_next)
                 return runner_state, transition
 
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, config.num_steps
             )
 
-            train_states, world_model_state, env_state, last_obs, train_state_buffer, rng = runner_state
+            (train_states, world_model_state, env_state, last_obs, train_state_buffer, rng,
+             wm_kv_cache, wm_prev_pred_disp) = runner_state
             traj_metrics = traj_batch.metrics
             absorb_ratio = jnp.sum(
                 jnp.where(traj_metrics.done, traj_metrics.absorbed, 0.0)
@@ -419,15 +526,18 @@ class IPPOJax(JaxRLAlgorithmBase):
                     )
                 )
             )
-            runner_state = (train_states, world_model_state, env_state, last_obs, train_state_buffer, rng)
+            runner_state = (train_states, world_model_state, env_state, last_obs, train_state_buffer, rng,
+                            wm_kv_cache, wm_prev_pred_disp)
 
             world_model_metrics = None
             if world_model_enabled:
-                # Train world model on post-step observations to match info targets.
+                # Train world model on pre-step observations + action to match info targets.
                 rng, wm_rng = jax.random.split(rng)
-                obs_next = jnp.concatenate([traj_batch.obs[1:], last_obs[None, ...]], axis=0)
-                wm_obs = obs_next[..., wm_obs_ind]
-                wm_inputs = wm_obs
+                wm_obs = traj_batch.obs[..., wm_obs_ind]
+                wm_inputs = jnp.concatenate([wm_obs, traj_batch.action], axis=-1)
+                if wm_cfg.get("use_prev_pred_disp", False):
+                    prev_pred_disp = jax.lax.stop_gradient(traj_batch.wm_prev_pred_disp)
+                    wm_inputs = jnp.concatenate([wm_inputs, prev_pred_disp], axis=-1)
 
                 def _wm_loss_fn(params):
                     return world_model_loss(
@@ -438,7 +548,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                         traj_batch.info["base_linvel"],
                         traj_batch.done,
                         wm_cfg.seg_len,
-                        wm_cfg.mem_len,
+                        wm_cfg.get("train_mem_len", wm_cfg.mem_len),
                         wm_cfg.aux_vel_weight,
                         wm_rng,
                         # wm_cfg.get("use_prev_pred_disp", True),
@@ -683,15 +793,21 @@ class IPPOJax(JaxRLAlgorithmBase):
                     "WorldModel Disp RMSE": world_model_metrics["wm_disp_rmse"],
                     "WorldModel Vel RMSE": world_model_metrics["wm_vel_rmse"]
                 })
+                live_info.update({
+                    "WorldModel Rollout Disp RMSE": jnp.sqrt(jnp.mean(traj_batch.wm_pred_disp_mse) + 1e-8),
+                    "WorldModel Rollout Vel RMSE": jnp.sqrt(jnp.mean(traj_batch.wm_pred_vel_mse) + 1e-8),
+                })
             jax.debug.callback(callback, metric, live_info=live_info)
 
             # no train state buffering during training (validation only at end)
 
-            runner_state = (train_states, world_model_state, env_state, last_obs, train_state_buffer, rng)
+            runner_state = (train_states, world_model_state, env_state, last_obs, train_state_buffer, rng,
+                            wm_kv_cache, wm_prev_pred_disp)
             return runner_state, (metric, metric.max_timestep)
 
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_states, world_model_state, env_state, obsv, train_state_buffer, _rng)
+        runner_state = (train_states, world_model_state, env_state, obsv, train_state_buffer, _rng,
+                        wm_kv_cache, wm_prev_pred_disp)
         runner_state, (metric, global_timesteps) = jax.lax.scan(
             _update_step, runner_state, None, config.num_updates
         )
@@ -703,7 +819,7 @@ class IPPOJax(JaxRLAlgorithmBase):
         # Single evaluation after training completes
         if mh is not None:
             final_train_states = runner_state[0]
-            final_rng = runner_state[-1]
+            final_rng = runner_state[5]
             
             def _final_eval_env(runner_state, unused):
                 train_states, env_state, last_obs, train_state_buffer, rng = runner_state

@@ -116,17 +116,36 @@ class MultiHeadSelfAttentionXL(nn.Module):
 
     def step(self,
              x_t: jnp.ndarray,
-             cache: Optional[Tuple[jnp.ndarray, jnp.ndarray]],
-             mem_len: int,
-             train: bool) -> Tuple[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
+             cache: Optional[Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]],
+             mem_len: Optional[int],
+             train: bool) -> Tuple[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
         """
         Single-step attention with KV cache for fast inference.
 
         Args:
             x_t: (B, D)
-            cache: (k_cache, v_cache) each (B, H, L, Hd)
-            mem_len: max cache length
+            cache: (k_cache, v_cache, cache_len) with k/v (B, H, L, Hd) and cache_len (B,)
+            mem_len: max cache length (overrides module mem_len if provided)
         """
+        effective_mem_len = self.mem_len if mem_len is None else mem_len
+        if effective_mem_len <= 0:
+            q = self.q_proj(x_t)  # (B, D)
+            k = self.k_proj(x_t)
+            v = self.v_proj(x_t)
+            b = q.shape[0]
+            head_dim = self.model_dim // self.n_heads
+            q = q.reshape(b, self.n_heads, head_dim)
+            k = k.reshape(b, self.n_heads, 1, head_dim)
+            v = v.reshape(b, self.n_heads, 1, head_dim)
+
+            scale = 1.0 / math.sqrt(head_dim)
+            attn_scores = jnp.einsum("bhd,bhkd->bhk", q, k) * scale
+            attn = jax.nn.softmax(attn_scores, axis=-1)
+            out = jnp.einsum("bhk,bhkd->bhd", attn, v)
+            out = out.reshape(b, self.model_dim)
+            out = self.o_proj(out)
+            return out, None
+
         q = self.q_proj(x_t)  # (B, D)
         k = self.k_proj(x_t)
         v = self.v_proj(x_t)
@@ -138,14 +157,30 @@ class MultiHeadSelfAttentionXL(nn.Module):
         v = v.reshape(b, self.n_heads, 1, head_dim)
 
         if cache is None:
-            k_cache, v_cache = k, v
+            k_cache = jnp.zeros((b, self.n_heads, effective_mem_len, head_dim), dtype=k.dtype)
+            v_cache = jnp.zeros((b, self.n_heads, effective_mem_len, head_dim), dtype=v.dtype)
+            cache_len = jnp.zeros((b,), dtype=jnp.int32)
         else:
-            k_cache, v_cache = cache
-            k_cache = jnp.concatenate([k_cache, k], axis=2)
-            v_cache = jnp.concatenate([v_cache, v], axis=2)
-            if mem_len > 0:
-                k_cache = k_cache[:, :, -mem_len:, :]
-                v_cache = v_cache[:, :, -mem_len:, :]
+            k_cache, v_cache, cache_len = cache
+
+        def _update_single(kc, vc, kn, vn, cl):
+            def _append():
+                kc_new = jax.lax.dynamic_update_slice(kc, kn, (0, cl, 0))
+                vc_new = jax.lax.dynamic_update_slice(vc, vn, (0, cl, 0))
+                return kc_new, vc_new
+
+            def _shift():
+                kc_new = jnp.concatenate([kc[:, 1:, :], kn], axis=1)
+                vc_new = jnp.concatenate([vc[:, 1:, :], vn], axis=1)
+                return kc_new, vc_new
+
+            kc_out, vc_out = jax.lax.cond(cl < effective_mem_len, _append, _shift)
+            cl_out = jnp.minimum(cl + 1, effective_mem_len)
+            return kc_out, vc_out, cl_out
+
+        k_cache, v_cache, cache_len = jax.vmap(
+            _update_single, in_axes=(0, 0, 0, 0, 0)
+        )(k_cache, v_cache, k, v, cache_len)
 
         scale = 1.0 / math.sqrt(head_dim)
         attn_scores = jnp.einsum("bhd,bhkd->bhk", q, k_cache) * scale
@@ -153,7 +188,7 @@ class MultiHeadSelfAttentionXL(nn.Module):
         out = jnp.einsum("bhk,bhkd->bhd", attn, v_cache)
         out = out.reshape(b, self.model_dim)
         out = self.o_proj(out)
-        return out, (k_cache, v_cache)
+        return out, (k_cache, v_cache, cache_len)
 
 
 class TransformerXLLayer(nn.Module):
@@ -190,9 +225,9 @@ class TransformerXLLayer(nn.Module):
 
     def step(self,
              x_t: jnp.ndarray,
-             cache: Optional[Tuple[jnp.ndarray, jnp.ndarray]],
-             mem_len: int,
-             train: bool) -> Tuple[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
+             cache: Optional[Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]],
+             mem_len: Optional[int],
+             train: bool) -> Tuple[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
         h = self.ln1(x_t)
         h, cache = self.attn.step(h, cache, mem_len, train)
         x_t = x_t + h
@@ -247,19 +282,21 @@ class TransformerXL(nn.Module):
 
     def step(self,
              x_t: jnp.ndarray,
-             cache: Optional[List[Tuple[jnp.ndarray, jnp.ndarray]]],
-             train: bool) -> Tuple[jnp.ndarray, List[Tuple[jnp.ndarray, jnp.ndarray]]]:
+             cache: Optional[List[Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]],
+             train: bool,
+             mem_len: Optional[int] = None) -> Tuple[jnp.ndarray, List[Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]]:
         """
         Single-step forward with KV-cache for fast inference.
 
         Args:
             x_t: (B, D)
-            cache: list of (k_cache, v_cache) per layer
+            cache: list of (k_cache, v_cache, cache_len) per layer
         """
+        effective_mem_len = self.mem_len if mem_len is None else mem_len
         new_cache = []
         h = x_t
         for i, layer in enumerate(self.layers):
             layer_cache = cache[i] if cache is not None else None
-            h, layer_cache = layer.step(h, layer_cache, self.mem_len, train)
+            h, layer_cache = layer.step(h, layer_cache, effective_mem_len, train)
             new_cache.append(layer_cache)
         return h, new_cache
