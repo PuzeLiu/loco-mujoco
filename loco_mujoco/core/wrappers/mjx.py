@@ -1,15 +1,18 @@
 from copy import deepcopy
 from functools import partial
 import dataclasses
-from typing import Optional, Tuple, Union, Any, Dict
+from typing import Optional, Tuple, Union, Any, Dict, TYPE_CHECKING
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 from flax import struct
 
-from loco_mujoco.core import MjxState, Mjx
+from loco_mujoco.core.mujoco_mjx import Mjx, MjxState
 from loco_mujoco.core.utils.env import Box
+
+if TYPE_CHECKING:
+    from loco_mujoco.algorithms.common.world_model import WorldModelTXL
 
 
 class LocoMjxWrapper:
@@ -297,6 +300,134 @@ class NStepWrapper(BaseWrapper):
         return next_observation, reward, absorbing, done, info, state
 
 
+@struct.dataclass
+class WorldModelWrapperState(BaseWrapperState):
+    env_state: MjxState
+    wm_kv_cache: Any
+    wm_prev_pred_disp: jnp.ndarray
+    wm_params: Any
+
+
+class WorldModelWrapper(BaseWrapper):
+
+    def __init__(self,
+                 env,
+                 model: "WorldModelTXL",
+                 wm_obs_ind: jnp.ndarray,
+                 eval_mem_len: int,
+                 use_prev_pred_disp: bool):
+        super().__init__(env)
+        self.model = model
+        self.wm_obs_ind = wm_obs_ind
+        self.eval_mem_len = int(eval_mem_len)
+        self.use_prev_pred_disp = bool(use_prev_pred_disp)
+
+    def _build_inputs(self, obs, action, prev_pred_disp):
+        wm_obs = obs[..., self.wm_obs_ind]
+        wm_inputs = jnp.concatenate([wm_obs, action], axis=-1)
+        if self.use_prev_pred_disp:
+            wm_inputs = jnp.concatenate([wm_inputs, prev_pred_disp], axis=-1)
+        return wm_inputs
+
+    def _reset_cache(self, cache, done):
+        if cache is None:
+            return None
+        done_mask = done[:, None, None, None]
+        new_cache = []
+        for k_cache, v_cache, cache_len in cache:
+            k_cache = jnp.where(done_mask, jnp.zeros_like(k_cache), k_cache)
+            v_cache = jnp.where(done_mask, jnp.zeros_like(v_cache), v_cache)
+            cache_len = jnp.where(done, jnp.zeros_like(cache_len), cache_len)
+            new_cache.append((k_cache, v_cache, cache_len))
+        return new_cache
+
+    def reset(self, rng_key, env_id=None):
+        obs, env_state = self.env.reset(rng_key, env_id=env_id)
+        batch_size = obs.shape[0]
+        if self.eval_mem_len > 0:
+            head_dim = self.model.model_dim // self.model.n_heads
+            wm_kv_cache = [
+                (
+                    jnp.zeros((batch_size, self.model.n_heads, self.eval_mem_len, head_dim), dtype=jnp.float32),
+                    jnp.zeros((batch_size, self.model.n_heads, self.eval_mem_len, head_dim), dtype=jnp.float32),
+                    jnp.zeros((batch_size,), dtype=jnp.int32),
+                )
+                for _ in range(self.model.n_layers)
+            ]
+        else:
+            wm_kv_cache = None
+        wm_prev_pred_disp = jnp.zeros((batch_size, 3), dtype=obs.dtype)
+        state = WorldModelWrapperState(
+            env_state=env_state,
+            wm_kv_cache=wm_kv_cache,
+            wm_prev_pred_disp=wm_prev_pred_disp,
+            wm_params=None,
+        )
+        return obs, state
+
+    def step(self, state: WorldModelWrapperState, action: Union[int, float]):
+        obs = state.observation
+        wm_prev_pred_disp_used = state.wm_prev_pred_disp
+        wm_kv_cache = state.wm_kv_cache
+
+        batch_size = obs.shape[0]
+        pred_disp = jnp.zeros((batch_size, 3), dtype=obs.dtype)
+        pred_vel = jnp.zeros((batch_size, 3), dtype=obs.dtype)
+
+        if state.wm_params is not None:
+            wm_inputs = self._build_inputs(obs, action, wm_prev_pred_disp_used)
+            if self.eval_mem_len > 0:
+                (pred_disp, pred_vel), wm_kv_cache = self.model.apply(
+                    {"params": state.wm_params},
+                    wm_inputs,
+                    cache=wm_kv_cache,
+                    train=False,
+                    mem_len=self.eval_mem_len,
+                    method=self.model.__class__.step,
+                )
+            else:
+                (pred_disp, pred_vel), _ = self.model.apply(
+                    {"params": state.wm_params},
+                    wm_inputs,
+                    cache=None,
+                    train=False,
+                    mem_len=0,
+                    method=self.model.__class__.step,
+                )
+                wm_kv_cache = None
+
+        # step env
+        next_obs, reward, absorbing, done, info, env_state = self.env.step(state.env_state, action)
+
+        wm_pred_disp_mse = jnp.mean((pred_disp - info["base_disp"]) ** 2, axis=-1)
+        wm_pred_vel_mse = jnp.mean((pred_vel - info["base_linvel"]) ** 2, axis=-1)
+
+        if self.use_prev_pred_disp:
+            wm_prev_pred_disp_next = pred_disp
+            wm_prev_pred_disp_next = jnp.where(
+                done[:, None],
+                jnp.zeros_like(wm_prev_pred_disp_next),
+                wm_prev_pred_disp_next,
+            )
+        else:
+            wm_prev_pred_disp_next = wm_prev_pred_disp_used
+
+        wm_kv_cache = self._reset_cache(wm_kv_cache, done)
+
+        info = dict(info)
+        info["wm_prev_pred_disp"] = wm_prev_pred_disp_used
+        info["wm_pred_disp_mse"] = wm_pred_disp_mse
+        info["wm_pred_vel_mse"] = wm_pred_vel_mse
+
+        state = WorldModelWrapperState(
+            env_state=env_state,
+            wm_kv_cache=wm_kv_cache,
+            wm_prev_pred_disp=wm_prev_pred_disp_next,
+            wm_params=state.wm_params,
+        )
+        return next_obs, reward, absorbing, done, info, state
+
+
 class VecEnv(BaseWrapper):
 
     def __init__(self, env):
@@ -519,4 +650,3 @@ class NormalizeVecRewardDict(BaseWrapper):
         info['agent_rewards'] = agent_rewards
 
         return next_observation, reward, absorbing, done, info, state
-

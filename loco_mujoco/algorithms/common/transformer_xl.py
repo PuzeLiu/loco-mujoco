@@ -127,7 +127,10 @@ class MultiHeadSelfAttentionXL(nn.Module):
             cache: (k_cache, v_cache, cache_len) with k/v (B, H, L, Hd) and cache_len (B,)
             mem_len: max cache length (overrides module mem_len if provided)
         """
-        effective_mem_len = self.mem_len if mem_len is None else mem_len
+        if mem_len is None:
+            effective_mem_len = 0 if cache is None else cache[0].shape[2]
+        else:
+            effective_mem_len = int(mem_len)
         if effective_mem_len <= 0:
             q = self.q_proj(x_t)  # (B, D)
             k = self.k_proj(x_t)
@@ -183,9 +186,32 @@ class MultiHeadSelfAttentionXL(nn.Module):
         )(k_cache, v_cache, k, v, cache_len)
 
         scale = 1.0 / math.sqrt(head_dim)
-        attn_scores = jnp.einsum("bhd,bhkd->bhk", q, k_cache) * scale
-        attn = jax.nn.softmax(attn_scores, axis=-1)
-        out = jnp.einsum("bhk,bhkd->bhd", attn, v_cache)
+
+        def _attend_single(q_b, k_b, v_b, cl):
+            def _body(i, state):
+                max_logit, sum_exp, out = state
+                logit = jnp.einsum("hd,hd->h", q_b, k_b[:, i, :]) * scale
+
+                def _include(s):
+                    m, s_exp, o = s
+                    new_m = jnp.maximum(m, logit)
+                    exp_logit = jnp.exp(logit - new_m)
+                    s_exp = s_exp * jnp.exp(m - new_m) + exp_logit
+                    o = o * jnp.exp(m - new_m)[:, None] + v_b[:, i, :] * exp_logit[:, None]
+                    return new_m, s_exp, o
+
+                return jax.lax.cond(i < cl, _include, lambda s: s, state)
+
+            init_max = jnp.full((self.n_heads,), -jnp.inf)
+            init_sum = jnp.zeros((self.n_heads,))
+            init_out = jnp.zeros((self.n_heads, head_dim))
+            max_logit, sum_exp, out = jax.lax.fori_loop(
+                0, effective_mem_len, _body, (init_max, init_sum, init_out)
+            )
+            out = out / (sum_exp[:, None] + 1e-8)
+            return out
+
+        out = jax.vmap(_attend_single, in_axes=(0, 0, 0, 0))(q, k_cache, v_cache, cache_len)
         out = out.reshape(b, self.model_dim)
         out = self.o_proj(out)
         return out, (k_cache, v_cache, cache_len)
