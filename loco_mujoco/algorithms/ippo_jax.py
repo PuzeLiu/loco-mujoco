@@ -1,4 +1,6 @@
 import ast
+import pickle
+from pathlib import Path
 from omegaconf import open_dict
 import warnings
 from dataclasses import dataclass
@@ -100,6 +102,36 @@ class IPPOJax(JaxRLAlgorithmBase):
 
     _agent_conf = IPPOAgentConf
     _agent_state = IPPOAgentState
+
+    @classmethod
+    def serialize(cls,
+                  agent_conf: IPPOAgentConf,
+                  agent_state: IPPOAgentState,
+                  world_conf: IPPOWorldConf | None = None,
+                  world_state: IPPOWorldState | None = None):
+        serialized = super().serialize(agent_conf, agent_state)
+        if world_conf is not None:
+            serialized["world_model_conf"] = world_conf.serialize()
+        if world_state is not None:
+            serialized["world_model_state"] = world_state.serialize()
+        return serialized
+
+    @classmethod
+    def save_agent(cls,
+                   path,
+                   agent_conf: IPPOAgentConf,
+                   agent_state: IPPOAgentState,
+                   world_conf: IPPOWorldConf | None = None,
+                   world_state: IPPOWorldState | None = None):
+        """Save agent + optional world model to a single file."""
+        path = Path(path)
+        path = path / (cls.__name__ + "_saved")
+        path = path.with_suffix(cls._saved_agent_suffix)
+        serialized_state = cls.serialize(agent_conf, agent_state, world_conf, world_state)
+        with open(path, 'wb') as file:
+            pickle.dump(serialized_state, file)
+        print(f"\nSaved agent to: {path}\n")
+        return path
 
     @classmethod
     def init_agent_conf(cls, env, config):
