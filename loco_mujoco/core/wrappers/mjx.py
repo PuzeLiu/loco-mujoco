@@ -396,8 +396,20 @@ class WorldModelWrapper(BaseWrapper):
                 )
                 wm_kv_cache = None
 
+        def _set_pred_disp(env_state):
+            fields = getattr(env_state, "__dataclass_fields__", {})
+            if "additional_carry" in fields:
+                return env_state.replace(
+                    additional_carry=env_state.additional_carry.replace(pred_disp=pred_disp)
+                )
+            if "env_state" in fields:
+                return env_state.replace(env_state=_set_pred_disp(env_state.env_state))
+            return env_state
+
+        env_state = _set_pred_disp(state.env_state)
+
         # step env
-        next_obs, reward, absorbing, done, info, env_state = self.env.step(state.env_state, action)
+        next_obs, reward, absorbing, done, info, env_state = self.env.step(env_state, action)
 
         wm_pred_disp_mse = jnp.mean((pred_disp - info["base_disp"]) ** 2, axis=-1)
         wm_pred_vel_mse = jnp.mean((pred_vel - info["base_linvel"]) ** 2, axis=-1)

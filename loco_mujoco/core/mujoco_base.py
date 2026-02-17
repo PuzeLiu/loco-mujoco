@@ -74,6 +74,7 @@ class AdditionalCarry:
     env_offset: Union[np.ndarray, jax.Array, None]
     base_site_pos0: Union[np.ndarray, jax.Array]
     base_site_rot0: Union[np.ndarray, jax.Array]
+    pred_disp: Union[np.ndarray, jax.Array]
     delta_action: Union[np.ndarray, jax.Array, None]
     history: Union[np.ndarray, jax.Array]
     pattern_state: PatternState
@@ -893,6 +894,7 @@ class Mujoco:
             env_offset=backend.zeros(3),
             base_site_pos0=backend.zeros(3),
             base_site_rot0=backend.eye(3),
+            pred_disp=backend.zeros(3),
             cur_step_in_episode=1,
             total_timestep=0,
             delta_action=backend.zeros(4),
