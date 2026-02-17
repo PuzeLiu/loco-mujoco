@@ -134,6 +134,19 @@ class IPPOJax(JaxRLAlgorithmBase):
         return path
 
     @classmethod
+    def from_dict(cls, d):
+        """ Load conf and state of an agent from a dictionary. """
+        agent_conf = cls._agent_conf.from_dict(d["agent_conf"])
+        agent_state = cls._agent_state.from_dict(d["agent_state"], agent_conf)
+        world_conf = None
+        world_state = None
+        if "world_model_conf" in d:
+            world_conf = IPPOWorldConf.from_dict(d["world_model_conf"])
+        if "world_model_state" in d:
+            world_state = IPPOWorldState.from_dict(d["world_model_state"], world_conf)
+        return agent_conf, agent_state, world_conf, world_state
+
+    @classmethod
     def init_agent_conf(cls, env, config):
 
         with (open_dict(config.experiment)):
