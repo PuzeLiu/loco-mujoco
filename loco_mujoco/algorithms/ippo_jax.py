@@ -495,26 +495,61 @@ class IPPOJax(JaxRLAlgorithmBase):
                     prev_pred_disp = jax.lax.stop_gradient(traj_batch.info["wm_prev_pred_disp"])
                     wm_inputs = jnp.concatenate([wm_inputs, prev_pred_disp], axis=-1)
 
-                def _wm_loss_fn(params):
-                    return world_model_loss(
-                        world_conf.model,
-                        params,
-                        wm_inputs,
-                        traj_batch.info["base_disp"],
-                        traj_batch.info["base_linvel"],
-                        traj_batch.done,
-                        wm_cfg.seg_len,
-                        wm_cfg.get("train_mem_len", wm_cfg.mem_len),
-                        wm_cfg.aux_vel_weight,
-                        wm_rng,
-                        # wm_cfg.get("use_prev_pred_disp", True),
-                    )
-
                 wm_ts = world_model_state.train_state
-                (wm_loss, world_model_metrics), wm_grads = jax.value_and_grad(
-                    _wm_loss_fn, has_aux=True
-                )(wm_ts.params)
-                wm_ts = wm_ts.apply_gradients(grads=wm_grads)
+                wm_epochs = int(wm_cfg.get("epochs", 1))
+                wm_minibatch_size = int(wm_cfg.get("minibatch_size", wm_inputs.shape[1]))
+                wm_batch_size = wm_inputs.shape[1] if wm_minibatch_size >= wm_inputs.shape[1] else wm_minibatch_size
+                wm_num_minibatches = 1 if wm_batch_size == wm_inputs.shape[1] else wm_inputs.shape[1] // wm_batch_size
+
+                def _wm_minibatch_update(wm_ts, batch):
+                    mb_idx, mb_rng = batch
+                    batch_inputs = jnp.take(wm_inputs, mb_idx, axis=1)
+                    batch_disp = jnp.take(traj_batch.info["base_disp"], mb_idx, axis=1)
+                    batch_linvel = jnp.take(traj_batch.info["base_linvel"], mb_idx, axis=1)
+                    batch_done = jnp.take(traj_batch.done, mb_idx, axis=1)
+
+                    def _wm_loss_fn(params):
+                        return world_model_loss(
+                            world_conf.model,
+                            params,
+                            batch_inputs,
+                            batch_disp,
+                            batch_linvel,
+                            batch_done,
+                            wm_cfg.seg_len,
+                            wm_cfg.get("train_mem_len", wm_cfg.mem_len),
+                            wm_cfg.aux_vel_weight,
+                            mb_rng,
+                        )
+
+                    (_, wm_metrics), wm_grads = jax.value_and_grad(
+                        _wm_loss_fn, has_aux=True
+                    )(wm_ts.params)
+                    wm_ts = wm_ts.apply_gradients(grads=wm_grads)
+                    return wm_ts, wm_metrics
+
+                def _wm_epoch_update(carry, _):
+                    wm_ts, rng = carry
+                    rng, perm_key, mb_key = jax.random.split(rng, 3)
+                    perm = jax.random.permutation(perm_key, wm_inputs.shape[1])
+                    perm = perm[: wm_num_minibatches * wm_batch_size]
+                    perm = perm.reshape((wm_num_minibatches, wm_batch_size))
+                    mb_keys = jax.random.split(mb_key, wm_num_minibatches)
+                    wm_ts, mb_metrics = jax.lax.scan(
+                        _wm_minibatch_update,
+                        wm_ts,
+                        (perm, mb_keys),
+                    )
+                    mb_metrics = jax.tree.map(lambda x: jnp.mean(x, axis=0), mb_metrics)
+                    return (wm_ts, rng), mb_metrics
+
+                (wm_ts, wm_rng), epoch_metrics = jax.lax.scan(
+                    _wm_epoch_update,
+                    (wm_ts, wm_rng),
+                    None,
+                    wm_epochs,
+                )
+                world_model_metrics = jax.tree.map(lambda x: jnp.mean(x, axis=0), epoch_metrics)
                 world_model_state = world_model_state.replace(train_state=wm_ts)
                 env_state = env_state.replace(wm_params=wm_ts.params)
 
