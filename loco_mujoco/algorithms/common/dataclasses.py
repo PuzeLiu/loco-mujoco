@@ -34,9 +34,6 @@ class IPPOTransition:
     reward: Dict[str, jnp.ndarray]
     log_prob: Dict[str, jnp.ndarray]
     obs: jnp.ndarray
-    wm_prev_pred_disp: Any
-    wm_pred_disp_mse: Any
-    wm_pred_vel_mse: Any
     info: Any
     traj_state: Any
     metrics: Any

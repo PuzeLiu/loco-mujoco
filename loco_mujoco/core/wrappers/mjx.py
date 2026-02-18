@@ -304,13 +304,16 @@ class NStepWrapper(BaseWrapper):
 class WorldModelWrapperState(BaseWrapperState):
     env_state: MjxState
     wm_kv_cache: Any
-    wm_prev_pred_disp: jnp.ndarray
     wm_params: Any
     wm_buffer_inputs: jnp.ndarray
     wm_buffer_disp: jnp.ndarray
     wm_buffer_vel: jnp.ndarray
     wm_buffer_done: jnp.ndarray
     wm_buffer_valid: jnp.ndarray
+    wm_pred_disp_history: jnp.ndarray
+    wm_disp_history: jnp.ndarray
+    wm_disp_hist_idx: jnp.ndarray
+    wm_disp_steps_since_done: jnp.ndarray
 
 
 class WorldModelWrapper(BaseWrapper):
@@ -320,16 +323,16 @@ class WorldModelWrapper(BaseWrapper):
                  model: "WorldModelTXL",
                  wm_obs_ind: jnp.ndarray,
                  eval_mem_len: int,
-                 use_prev_pred_disp: bool,
                  buffer_length: int = 0,
-                 buffer_dtype: Any = jnp.float16):
+                 buffer_dtype: Any = jnp.float16,
+                 disp_window: int = 0):
         super().__init__(env)
         self.model = model
         self.wm_obs_ind = wm_obs_ind
         self.eval_mem_len = int(eval_mem_len)
-        self.use_prev_pred_disp = bool(use_prev_pred_disp)
         self.buffer_length = int(buffer_length)
         self.buffer_dtype = self._resolve_buffer_dtype(buffer_dtype)
+        self.disp_window = int(disp_window or 0)
 
     def _resolve_buffer_dtype(self, buffer_dtype):
         if isinstance(buffer_dtype, str):
@@ -342,11 +345,9 @@ class WorldModelWrapper(BaseWrapper):
                 return jnp.float32
         return buffer_dtype
 
-    def _build_inputs(self, obs, action, prev_pred_disp):
+    def _build_inputs(self, obs, action):
         wm_obs = obs[..., self.wm_obs_ind]
         wm_inputs = jnp.concatenate([wm_obs, action], axis=-1)
-        if self.use_prev_pred_disp:
-            wm_inputs = jnp.concatenate([wm_inputs, prev_pred_disp], axis=-1)
         return wm_inputs
 
     def _reset_cache(self, cache, done):
@@ -377,7 +378,6 @@ class WorldModelWrapper(BaseWrapper):
             ]
         else:
             wm_kv_cache = None
-        wm_prev_pred_disp = jnp.zeros((batch_size, 3), dtype=obs.dtype)
         if self.buffer_length > 0:
             wm_buffer_inputs = jnp.zeros(
                 (self.buffer_length, batch_size, self.model.input_dim),
@@ -393,35 +393,51 @@ class WorldModelWrapper(BaseWrapper):
             wm_buffer_vel = jnp.zeros((0, batch_size, 3), dtype=obs.dtype)
             wm_buffer_done = jnp.zeros((0, batch_size), dtype=bool)
             wm_buffer_valid = jnp.zeros((0, batch_size), dtype=obs.dtype)
+        if self.disp_window > 0:
+            wm_pred_disp_history = jnp.zeros((self.disp_window, batch_size, 3), dtype=obs.dtype)
+            wm_disp_history = jnp.zeros((self.disp_window, batch_size, 3), dtype=obs.dtype)
+            wm_disp_hist_idx = jnp.array(0, dtype=jnp.int32)
+            wm_disp_steps_since_done = jnp.zeros((batch_size,), dtype=jnp.int32)
+        else:
+            wm_pred_disp_history = jnp.zeros((0, batch_size, 3), dtype=obs.dtype)
+            wm_disp_history = jnp.zeros((0, batch_size, 3), dtype=obs.dtype)
+            wm_disp_hist_idx = jnp.array(0, dtype=jnp.int32)
+            wm_disp_steps_since_done = jnp.zeros((batch_size,), dtype=jnp.int32)
         state = WorldModelWrapperState(
             env_state=env_state,
             wm_kv_cache=wm_kv_cache,
-            wm_prev_pred_disp=wm_prev_pred_disp,
             wm_params=None,
             wm_buffer_inputs=wm_buffer_inputs,
             wm_buffer_disp=wm_buffer_disp,
             wm_buffer_vel=wm_buffer_vel,
             wm_buffer_done=wm_buffer_done,
             wm_buffer_valid=wm_buffer_valid,
+            wm_pred_disp_history=wm_pred_disp_history,
+            wm_disp_history=wm_disp_history,
+            wm_disp_hist_idx=wm_disp_hist_idx,
+            wm_disp_steps_since_done=wm_disp_steps_since_done,
         )
         return obs, state
 
     def step(self, state: WorldModelWrapperState, action: Union[int, float]):
         obs = state.observation
-        wm_prev_pred_disp_used = state.wm_prev_pred_disp
         wm_kv_cache = state.wm_kv_cache
         wm_buffer_inputs = state.wm_buffer_inputs
         wm_buffer_disp = state.wm_buffer_disp
         wm_buffer_vel = state.wm_buffer_vel
         wm_buffer_done = state.wm_buffer_done
         wm_buffer_valid = state.wm_buffer_valid
+        wm_pred_disp_history = state.wm_pred_disp_history
+        wm_disp_history = state.wm_disp_history
+        wm_disp_hist_idx = state.wm_disp_hist_idx
+        wm_disp_steps_since_done = state.wm_disp_steps_since_done
 
         batch_size = obs.shape[0]
         pred_disp = jnp.zeros((batch_size, 3), dtype=obs.dtype)
         pred_vel = jnp.zeros((batch_size, 3), dtype=obs.dtype)
 
         if state.wm_params is not None:
-            wm_inputs = self._build_inputs(obs, action, wm_prev_pred_disp_used)
+            wm_inputs = self._build_inputs(obs, action)
             model_dtype = getattr(self.model, "dtype", wm_inputs.dtype)
             wm_inputs = wm_inputs.astype(model_dtype)
             if self.eval_mem_len > 0:
@@ -443,43 +459,53 @@ class WorldModelWrapper(BaseWrapper):
                     method=self.model.__class__.step,
                 )
                 wm_kv_cache = None
+        pred_disp_abs = pred_disp
+        if self.disp_window > 0:
+            prev_pred_disp = wm_pred_disp_history[wm_disp_hist_idx]
+            use_diff = wm_disp_steps_since_done >= self.disp_window
+            pred_disp_abs = jnp.where(use_diff[:, None], prev_pred_disp + pred_disp, pred_disp)
+            wm_pred_disp_history = wm_pred_disp_history.at[wm_disp_hist_idx].set(pred_disp_abs)
 
         def _set_pred_disp(env_state):
             fields = getattr(env_state, "__dataclass_fields__", {})
             if "additional_carry" in fields:
+                prev_disp = env_state.additional_carry.pred_disp
+                new_pred_disp = pred_disp_abs.astype(prev_disp.dtype)
                 return env_state.replace(
-                    additional_carry=env_state.additional_carry.replace(pred_disp=pred_disp.astype(env_state.additional_carry.pred_disp.dtype))
+                    additional_carry=env_state.additional_carry.replace(pred_disp=new_pred_disp)
                 )
             if "env_state" in fields:
                 return env_state.replace(env_state=_set_pred_disp(env_state.env_state))
             return env_state
 
         env_state = _set_pred_disp(state.env_state)
-
         # step env
         next_obs, reward, absorbing, done, info, env_state = self.env.step(env_state, action)
 
-        wm_pred_disp_mse = jnp.mean((pred_disp - info["base_disp"]) ** 2, axis=-1)
-        wm_pred_vel_mse = jnp.mean((pred_vel - info["base_linvel"]) ** 2, axis=-1)
-
-        if self.use_prev_pred_disp:
-            wm_prev_pred_disp_next = pred_disp.astype(wm_prev_pred_disp_used.dtype)
-            wm_prev_pred_disp_next = jnp.where(
-                done[:, None],
-                jnp.zeros_like(wm_prev_pred_disp_next),
-                wm_prev_pred_disp_next,
-            )
+        base_disp = info["base_disp"]
+        if self.disp_window > 0:
+            prev_disp = wm_disp_history[wm_disp_hist_idx]
+            use_diff = wm_disp_steps_since_done >= self.disp_window
+            target_disp = jnp.where(use_diff[:, None], base_disp - prev_disp, base_disp)
+            wm_disp_history = wm_disp_history.at[wm_disp_hist_idx].set(base_disp)
+            wm_disp_hist_idx = (wm_disp_hist_idx + 1) % self.disp_window
+            wm_disp_steps_since_done = jnp.where(done, 0, wm_disp_steps_since_done + 1)
         else:
-            wm_prev_pred_disp_next = wm_prev_pred_disp_used
+            target_disp = base_disp
+            pred_disp_abs = pred_disp
+        wm_pred_disp_mse = jnp.mean((pred_disp - target_disp) ** 2, axis=-1)
+        wm_pred_disp_abs_mse = jnp.mean((pred_disp_abs - base_disp) ** 2, axis=-1)
+        wm_pred_vel_mse = jnp.mean((pred_vel - info["base_linvel"]) ** 2, axis=-1)
 
         wm_kv_cache = self._reset_cache(wm_kv_cache, done)
 
         info = dict(info)
-        info["wm_prev_pred_disp"] = wm_prev_pred_disp_used
         info["wm_pred_disp_mse"] = wm_pred_disp_mse
+        info["wm_pred_disp_abs_mse"] = wm_pred_disp_abs_mse
         info["wm_pred_vel_mse"] = wm_pred_vel_mse
+
         if self.buffer_length > 0:
-            wm_inputs = self._build_inputs(obs, action, wm_prev_pred_disp_used).astype(self.buffer_dtype)
+            wm_inputs = self._build_inputs(obs, action).astype(self.buffer_dtype)
             wm_buffer_inputs = jnp.roll(wm_buffer_inputs, shift=-1, axis=0)
             wm_buffer_disp = jnp.roll(wm_buffer_disp, shift=-1, axis=0)
             wm_buffer_vel = jnp.roll(wm_buffer_vel, shift=-1, axis=0)
@@ -514,13 +540,16 @@ class WorldModelWrapper(BaseWrapper):
         state = WorldModelWrapperState(
             env_state=env_state,
             wm_kv_cache=wm_kv_cache,
-            wm_prev_pred_disp=wm_prev_pred_disp_next,
             wm_params=state.wm_params,
             wm_buffer_inputs=wm_buffer_inputs,
             wm_buffer_disp=wm_buffer_disp,
             wm_buffer_vel=wm_buffer_vel,
             wm_buffer_done=wm_buffer_done,
             wm_buffer_valid=wm_buffer_valid,
+            wm_pred_disp_history=wm_pred_disp_history,
+            wm_disp_history=wm_disp_history,
+            wm_disp_hist_idx=wm_disp_hist_idx,
+            wm_disp_steps_since_done=wm_disp_steps_since_done,
         )
         return next_obs, reward, absorbing, done, info, state
 

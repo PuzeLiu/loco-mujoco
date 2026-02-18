@@ -59,6 +59,35 @@ def _scatter_actions(num_envs: int,
     return full
 
 
+def _compute_trailing_disp(base_disp: jnp.ndarray,
+                           done: jnp.ndarray,
+                           window: int,
+                           assume_reset: bool = False) -> jnp.ndarray:
+    if window <= 0:
+        return base_disp
+    if assume_reset:
+        pad = jnp.zeros((window,) + base_disp.shape[1:], dtype=base_disp.dtype)
+        prev = jnp.concatenate([pad, base_disp[:-window]], axis=0)
+        return base_disp - prev
+    hist = jnp.zeros((window,) + base_disp.shape[1:], dtype=base_disp.dtype)
+    idx = jnp.array(0, dtype=jnp.int32)
+    steps = jnp.zeros(done.shape[1], dtype=jnp.int32)
+
+    def _step(carry, inputs):
+        hist, idx, steps = carry
+        disp_t, done_t = inputs
+        prev_disp = hist[idx]
+        use_diff = steps >= window
+        target_t = jnp.where(use_diff[:, None], disp_t - prev_disp, disp_t)
+        hist = hist.at[idx].set(disp_t)
+        idx = (idx + 1) % window
+        steps = jnp.where(done_t, 0, steps + 1)
+        return (hist, idx, steps), target_t
+
+    (_, _, _), target = jax.lax.scan(_step, (hist, idx, steps), (base_disp, done))
+    return target
+
+
 @dataclass(frozen=True)
 class IPPOAgentConf(AgentConfBase):
     config: DictConfig
@@ -242,8 +271,6 @@ class IPPOJax(JaxRLAlgorithmBase):
         else:
             action_dim = int(env.action_dim)
         input_dim += action_dim
-        if wm_cfg.get("use_prev_pred_disp", True):
-            input_dim += 3
         with open_dict(config.experiment.world_model):
             config.experiment.world_model.obs_ind = obs_ind.tolist()
             config.experiment.world_model.input_dim = input_dim
@@ -468,9 +495,6 @@ class IPPOJax(JaxRLAlgorithmBase):
                     reward=agent_rewards,
                     log_prob=agent_log_probs,
                     obs=last_obs,
-                    wm_prev_pred_disp=info.get("wm_prev_pred_disp"),
-                    wm_pred_disp_mse=info.get("wm_pred_disp_mse"),
-                    wm_pred_vel_mse=info.get("wm_pred_vel_mse"),
                     info=info,
                     traj_state=env_state.additional_carry.traj_state,
                     metrics=logged_metrics,
@@ -507,6 +531,7 @@ class IPPOJax(JaxRLAlgorithmBase):
             if world_model_enabled:
                 # Train world model on pre-step observations + action to match info targets.
                 rng, wm_rng = jax.random.split(rng)
+                disp_window = int(wm_cfg.get("disp_window", 0) or 0)
                 use_wm_buffer = int(wm_cfg.get("buffer_length", 0)) > 0
                 if use_wm_buffer:
                     wm_inputs = env_state.wm_buffer_inputs
@@ -522,13 +547,17 @@ class IPPOJax(JaxRLAlgorithmBase):
                 else:
                     wm_obs = traj_batch.obs[..., wm_obs_ind]
                     wm_inputs = jnp.concatenate([wm_obs, traj_batch.action], axis=-1)
-                    if wm_cfg.get("use_prev_pred_disp", False):
-                        prev_pred_disp = jax.lax.stop_gradient(traj_batch.info["wm_prev_pred_disp"])
-                        wm_inputs = jnp.concatenate([wm_inputs, prev_pred_disp], axis=-1)
                     wm_disp = traj_batch.info["base_disp"]
                     wm_linvel = traj_batch.info["base_linvel"]
                     wm_done = traj_batch.done
                     wm_valid = None
+
+                wm_target_disp = _compute_trailing_disp(
+                    wm_disp,
+                    wm_done,
+                    disp_window,
+                    assume_reset=use_wm_buffer,
+                )
 
                 wm_ts = world_model_state.train_state
                 wm_epochs = int(wm_cfg.get("epochs", 1))
@@ -539,7 +568,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                 def _wm_minibatch_update(wm_ts, batch):
                     mb_idx, mb_rng = batch
                     batch_inputs = jnp.take(wm_inputs, mb_idx, axis=1)
-                    batch_disp = jnp.take(wm_disp, mb_idx, axis=1)
+                    batch_disp = jnp.take(wm_target_disp, mb_idx, axis=1)
                     batch_linvel = jnp.take(wm_linvel, mb_idx, axis=1)
                     batch_done = jnp.take(wm_done, mb_idx, axis=1)
                     batch_valid = None if wm_valid is None else jnp.take(wm_valid, mb_idx, axis=1)
@@ -825,6 +854,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                     "World Model/train_disp_rmse": world_model_metrics["wm_disp_rmse"],
                     "World Model/train_vel_rmse": world_model_metrics["wm_vel_rmse"],
                     "World Model/rollout_disp_rmse": jnp.sqrt(jnp.mean(traj_batch.info["wm_pred_disp_mse"]) + 1e-8),
+                    "World Model/rollout_disp_abs_rmse": jnp.sqrt(jnp.mean(traj_batch.info["wm_pred_disp_abs_mse"]) + 1e-8),
                     "World Model/rollout_vel_rmse": jnp.sqrt(jnp.mean(traj_batch.info["wm_pred_vel_mse"]) + 1e-8),
                 })
             jax.debug.callback(callback, metric, live_info=live_info)
@@ -1081,8 +1111,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                 world_conf.model,
                 world_conf.obs_ind,
                 wm_cfg.get("eval_mem_len", wm_cfg.mem_len),
-                wm_cfg.get("use_prev_pred_disp", False),
-                wm_cfg.get("buffer_length", 0),
-                wm_cfg.get("buffer_dtype", "bfloat16"),
+                buffer_length=wm_cfg.get("buffer_length", 0),
+                buffer_dtype=wm_cfg.get("buffer_dtype", "bfloat16"),
+                disp_window=wm_cfg.get("disp_window", 0) or 0,
             )
         return env
