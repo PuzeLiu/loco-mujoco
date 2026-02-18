@@ -853,8 +853,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                     "World Model/train_loss": world_model_metrics["wm_loss"],
                     "World Model/train_disp_rmse": world_model_metrics["wm_disp_rmse"],
                     "World Model/train_vel_rmse": world_model_metrics["wm_vel_rmse"],
-                    "World Model/rollout_disp_rmse": jnp.sqrt(jnp.mean(traj_batch.info["wm_pred_disp_mse"]) + 1e-8),
-                    "World Model/rollout_disp_abs_rmse": jnp.sqrt(jnp.mean(traj_batch.info["wm_pred_disp_abs_mse"]) + 1e-8),
+                    "World Model/rollout_disp_relative_rmse": jnp.sqrt(jnp.mean(traj_batch.info["wm_pred_disp_mse"]) + 1e-8),
+                    "World Model/rollout_disp_rmse": jnp.sqrt(jnp.mean(traj_batch.info["wm_pred_disp_abs_mse"]) + 1e-8),
                     "World Model/rollout_vel_rmse": jnp.sqrt(jnp.mean(traj_batch.info["wm_pred_vel_mse"]) + 1e-8),
                 })
             jax.debug.callback(callback, metric, live_info=live_info)
