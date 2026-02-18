@@ -306,6 +306,11 @@ class WorldModelWrapperState(BaseWrapperState):
     wm_kv_cache: Any
     wm_prev_pred_disp: jnp.ndarray
     wm_params: Any
+    wm_buffer_inputs: jnp.ndarray
+    wm_buffer_disp: jnp.ndarray
+    wm_buffer_vel: jnp.ndarray
+    wm_buffer_done: jnp.ndarray
+    wm_buffer_valid: jnp.ndarray
 
 
 class WorldModelWrapper(BaseWrapper):
@@ -315,12 +320,27 @@ class WorldModelWrapper(BaseWrapper):
                  model: "WorldModelTXL",
                  wm_obs_ind: jnp.ndarray,
                  eval_mem_len: int,
-                 use_prev_pred_disp: bool):
+                 use_prev_pred_disp: bool,
+                 buffer_length: int = 0,
+                 buffer_dtype: Any = jnp.float16):
         super().__init__(env)
         self.model = model
         self.wm_obs_ind = wm_obs_ind
         self.eval_mem_len = int(eval_mem_len)
         self.use_prev_pred_disp = bool(use_prev_pred_disp)
+        self.buffer_length = int(buffer_length)
+        self.buffer_dtype = self._resolve_buffer_dtype(buffer_dtype)
+
+    def _resolve_buffer_dtype(self, buffer_dtype):
+        if isinstance(buffer_dtype, str):
+            name = buffer_dtype.lower()
+            if name in ("float16", "fp16"):
+                return jnp.float16
+            if name in ("bfloat16", "bf16"):
+                return jnp.bfloat16
+            if name in ("float32", "fp32"):
+                return jnp.float32
+        return buffer_dtype
 
     def _build_inputs(self, obs, action, prev_pred_disp):
         wm_obs = obs[..., self.wm_obs_ind]
@@ -344,12 +364,13 @@ class WorldModelWrapper(BaseWrapper):
     def reset(self, rng_key, env_id=None):
         obs, env_state = self.env.reset(rng_key, env_id=env_id)
         batch_size = obs.shape[0]
+        model_dtype = getattr(self.model, "dtype", jnp.float32)
         if self.eval_mem_len > 0:
             head_dim = self.model.model_dim // self.model.n_heads
             wm_kv_cache = [
                 (
-                    jnp.zeros((batch_size, self.model.n_heads, self.eval_mem_len, head_dim), dtype=jnp.float32),
-                    jnp.zeros((batch_size, self.model.n_heads, self.eval_mem_len, head_dim), dtype=jnp.float32),
+                    jnp.zeros((batch_size, self.model.n_heads, self.eval_mem_len, head_dim), dtype=model_dtype),
+                    jnp.zeros((batch_size, self.model.n_heads, self.eval_mem_len, head_dim), dtype=model_dtype),
                     jnp.zeros((batch_size,), dtype=jnp.int32),
                 )
                 for _ in range(self.model.n_layers)
@@ -357,11 +378,31 @@ class WorldModelWrapper(BaseWrapper):
         else:
             wm_kv_cache = None
         wm_prev_pred_disp = jnp.zeros((batch_size, 3), dtype=obs.dtype)
+        if self.buffer_length > 0:
+            wm_buffer_inputs = jnp.zeros(
+                (self.buffer_length, batch_size, self.model.input_dim),
+                dtype=self.buffer_dtype,
+            )
+            wm_buffer_disp = jnp.zeros((self.buffer_length, batch_size, 3), dtype=self.buffer_dtype)
+            wm_buffer_vel = jnp.zeros((self.buffer_length, batch_size, 3), dtype=self.buffer_dtype)
+            wm_buffer_done = jnp.zeros((self.buffer_length, batch_size), dtype=bool)
+            wm_buffer_valid = jnp.zeros((self.buffer_length, batch_size), dtype=self.buffer_dtype)
+        else:
+            wm_buffer_inputs = jnp.zeros((0, batch_size, self.model.input_dim), dtype=obs.dtype)
+            wm_buffer_disp = jnp.zeros((0, batch_size, 3), dtype=obs.dtype)
+            wm_buffer_vel = jnp.zeros((0, batch_size, 3), dtype=obs.dtype)
+            wm_buffer_done = jnp.zeros((0, batch_size), dtype=bool)
+            wm_buffer_valid = jnp.zeros((0, batch_size), dtype=obs.dtype)
         state = WorldModelWrapperState(
             env_state=env_state,
             wm_kv_cache=wm_kv_cache,
             wm_prev_pred_disp=wm_prev_pred_disp,
             wm_params=None,
+            wm_buffer_inputs=wm_buffer_inputs,
+            wm_buffer_disp=wm_buffer_disp,
+            wm_buffer_vel=wm_buffer_vel,
+            wm_buffer_done=wm_buffer_done,
+            wm_buffer_valid=wm_buffer_valid,
         )
         return obs, state
 
@@ -369,6 +410,11 @@ class WorldModelWrapper(BaseWrapper):
         obs = state.observation
         wm_prev_pred_disp_used = state.wm_prev_pred_disp
         wm_kv_cache = state.wm_kv_cache
+        wm_buffer_inputs = state.wm_buffer_inputs
+        wm_buffer_disp = state.wm_buffer_disp
+        wm_buffer_vel = state.wm_buffer_vel
+        wm_buffer_done = state.wm_buffer_done
+        wm_buffer_valid = state.wm_buffer_valid
 
         batch_size = obs.shape[0]
         pred_disp = jnp.zeros((batch_size, 3), dtype=obs.dtype)
@@ -376,6 +422,8 @@ class WorldModelWrapper(BaseWrapper):
 
         if state.wm_params is not None:
             wm_inputs = self._build_inputs(obs, action, wm_prev_pred_disp_used)
+            model_dtype = getattr(self.model, "dtype", wm_inputs.dtype)
+            wm_inputs = wm_inputs.astype(model_dtype)
             if self.eval_mem_len > 0:
                 (pred_disp, pred_vel), wm_kv_cache = self.model.apply(
                     {"params": state.wm_params},
@@ -400,7 +448,7 @@ class WorldModelWrapper(BaseWrapper):
             fields = getattr(env_state, "__dataclass_fields__", {})
             if "additional_carry" in fields:
                 return env_state.replace(
-                    additional_carry=env_state.additional_carry.replace(pred_disp=pred_disp)
+                    additional_carry=env_state.additional_carry.replace(pred_disp=pred_disp.astype(env_state.additional_carry.pred_disp.dtype))
                 )
             if "env_state" in fields:
                 return env_state.replace(env_state=_set_pred_disp(env_state.env_state))
@@ -415,7 +463,7 @@ class WorldModelWrapper(BaseWrapper):
         wm_pred_vel_mse = jnp.mean((pred_vel - info["base_linvel"]) ** 2, axis=-1)
 
         if self.use_prev_pred_disp:
-            wm_prev_pred_disp_next = pred_disp
+            wm_prev_pred_disp_next = pred_disp.astype(wm_prev_pred_disp_used.dtype)
             wm_prev_pred_disp_next = jnp.where(
                 done[:, None],
                 jnp.zeros_like(wm_prev_pred_disp_next),
@@ -430,12 +478,49 @@ class WorldModelWrapper(BaseWrapper):
         info["wm_prev_pred_disp"] = wm_prev_pred_disp_used
         info["wm_pred_disp_mse"] = wm_pred_disp_mse
         info["wm_pred_vel_mse"] = wm_pred_vel_mse
+        if self.buffer_length > 0:
+            wm_inputs = self._build_inputs(obs, action, wm_prev_pred_disp_used).astype(self.buffer_dtype)
+            wm_buffer_inputs = jnp.roll(wm_buffer_inputs, shift=-1, axis=0)
+            wm_buffer_disp = jnp.roll(wm_buffer_disp, shift=-1, axis=0)
+            wm_buffer_vel = jnp.roll(wm_buffer_vel, shift=-1, axis=0)
+            wm_buffer_done = jnp.roll(wm_buffer_done, shift=-1, axis=0)
+            wm_buffer_valid = jnp.roll(wm_buffer_valid, shift=-1, axis=0)
+
+            wm_buffer_inputs = wm_buffer_inputs.at[-1].set(wm_inputs)
+            wm_buffer_disp = wm_buffer_disp.at[-1].set(info["base_disp"].astype(self.buffer_dtype))
+            wm_buffer_vel = wm_buffer_vel.at[-1].set(info["base_linvel"].astype(self.buffer_dtype))
+            wm_buffer_done = wm_buffer_done.at[-1].set(done)
+            wm_buffer_valid = wm_buffer_valid.at[-1].set(jnp.ones_like(done, dtype=wm_buffer_valid.dtype))
+
+            done_mask = done.astype(bool)[None, :]
+            wm_buffer_inputs = jnp.where(
+                done_mask[:, :, None],
+                jnp.zeros_like(wm_buffer_inputs),
+                wm_buffer_inputs,
+            )
+            wm_buffer_disp = jnp.where(
+                done_mask[:, :, None],
+                jnp.zeros_like(wm_buffer_disp),
+                wm_buffer_disp,
+            )
+            wm_buffer_vel = jnp.where(
+                done_mask[:, :, None],
+                jnp.zeros_like(wm_buffer_vel),
+                wm_buffer_vel,
+            )
+            wm_buffer_done = jnp.where(done_mask, jnp.zeros_like(wm_buffer_done), wm_buffer_done)
+            wm_buffer_valid = jnp.where(done_mask, jnp.zeros_like(wm_buffer_valid), wm_buffer_valid)
 
         state = WorldModelWrapperState(
             env_state=env_state,
             wm_kv_cache=wm_kv_cache,
             wm_prev_pred_disp=wm_prev_pred_disp_next,
             wm_params=state.wm_params,
+            wm_buffer_inputs=wm_buffer_inputs,
+            wm_buffer_disp=wm_buffer_disp,
+            wm_buffer_vel=wm_buffer_vel,
+            wm_buffer_done=wm_buffer_done,
+            wm_buffer_valid=wm_buffer_valid,
         )
         return next_obs, reward, absorbing, done, info, state
 

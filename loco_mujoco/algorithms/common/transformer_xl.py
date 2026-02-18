@@ -1,5 +1,5 @@
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Any
 
 import jax
 import jax.numpy as jnp
@@ -21,11 +21,11 @@ def _merge_heads(x: jnp.ndarray) -> jnp.ndarray:
     return x.reshape(t, b, h * d)
 
 
-def init_mems(n_layers: int, mem_len: int, batch_size: int, model_dim: int) -> List[jnp.ndarray]:
+def init_mems(n_layers: int, mem_len: int, batch_size: int, model_dim: int, dtype: Any = jnp.float32) -> List[jnp.ndarray]:
     """Initialize Transformer-XL memories to zeros."""
     if mem_len <= 0:
-        return [jnp.zeros((0, batch_size, model_dim)) for _ in range(n_layers)]
-    return [jnp.zeros((mem_len, batch_size, model_dim)) for _ in range(n_layers)]
+        return [jnp.zeros((0, batch_size, model_dim), dtype=dtype) for _ in range(n_layers)]
+    return [jnp.zeros((mem_len, batch_size, model_dim), dtype=dtype) for _ in range(n_layers)]
 
 
 def build_attn_mask(seq_len: int,
@@ -70,12 +70,14 @@ class MultiHeadSelfAttentionXL(nn.Module):
     model_dim: int
     n_heads: int
     dropout: float = 0.0
+    dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
 
     def setup(self):
-        self.q_proj = nn.Dense(self.model_dim, use_bias=False)
-        self.k_proj = nn.Dense(self.model_dim, use_bias=False)
-        self.v_proj = nn.Dense(self.model_dim, use_bias=False)
-        self.o_proj = nn.Dense(self.model_dim, use_bias=False)
+        self.q_proj = nn.Dense(self.model_dim, use_bias=False, dtype=self.dtype, param_dtype=self.param_dtype)
+        self.k_proj = nn.Dense(self.model_dim, use_bias=False, dtype=self.dtype, param_dtype=self.param_dtype)
+        self.v_proj = nn.Dense(self.model_dim, use_bias=False, dtype=self.dtype, param_dtype=self.param_dtype)
+        self.o_proj = nn.Dense(self.model_dim, use_bias=False, dtype=self.dtype, param_dtype=self.param_dtype)
         self.attn_dropout = nn.Dropout(rate=self.dropout)
 
     def __call__(self,
@@ -99,8 +101,12 @@ class MultiHeadSelfAttentionXL(nn.Module):
         k = _split_heads(self.k_proj(cat), self.n_heads)
         v = _split_heads(self.v_proj(cat), self.n_heads)
 
-        scale = 1.0 / math.sqrt(q.shape[-1])
-        attn_scores = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
+        acc_dtype = jnp.float32
+        q_f = q.astype(acc_dtype)
+        k_f = k.astype(acc_dtype)
+        v_f = v.astype(acc_dtype)
+        scale = jnp.array(1.0 / math.sqrt(q.shape[-1]), dtype=acc_dtype)
+        attn_scores = jnp.einsum("bhqd,bhkd->bhqk", q_f, k_f) * scale
 
         if attn_mask is not None:
             # attn_mask: (B, T, K) -> (B, 1, T, K)
@@ -110,8 +116,9 @@ class MultiHeadSelfAttentionXL(nn.Module):
         attn = jax.nn.softmax(attn_scores, axis=-1)
         attn = self.attn_dropout(attn, deterministic=not train)
 
-        out = jnp.einsum("bhqk,bhkd->bhqd", attn, v)
+        out = jnp.einsum("bhqk,bhkd->bhqd", attn, v_f)
         out = _merge_heads(out)
+        out = out.astype(self.dtype)
         return self.o_proj(out)
 
     def step(self,
@@ -141,12 +148,16 @@ class MultiHeadSelfAttentionXL(nn.Module):
             k = k.reshape(b, self.n_heads, 1, head_dim)
             v = v.reshape(b, self.n_heads, 1, head_dim)
 
-            scale = 1.0 / math.sqrt(head_dim)
-            attn_scores = jnp.einsum("bhd,bhkd->bhk", q, k) * scale
+            acc_dtype = jnp.float32
+            q_f = q.astype(acc_dtype)
+            k_f = k.astype(acc_dtype)
+            v_f = v.astype(acc_dtype)
+            scale = jnp.array(1.0 / math.sqrt(head_dim), dtype=acc_dtype)
+            attn_scores = jnp.einsum("bhd,bhkd->bhk", q_f, k_f) * scale
             attn = jax.nn.softmax(attn_scores, axis=-1)
-            out = jnp.einsum("bhk,bhkd->bhd", attn, v)
+            out = jnp.einsum("bhk,bhkd->bhd", attn, v_f)
             out = out.reshape(b, self.model_dim)
-            out = self.o_proj(out)
+            out = self.o_proj(out.astype(self.dtype))
             return out, None
 
         q = self.q_proj(x_t)  # (B, D)
@@ -185,12 +196,17 @@ class MultiHeadSelfAttentionXL(nn.Module):
             _update_single, in_axes=(0, 0, 0, 0, 0)
         )(k_cache, v_cache, k, v, cache_len)
 
-        scale = 1.0 / math.sqrt(head_dim)
+        acc_dtype = jnp.float32
+        scale = jnp.array(1.0 / math.sqrt(head_dim), dtype=acc_dtype)
 
         def _attend_single(q_b, k_b, v_b, cl):
+            q_b = q_b.astype(acc_dtype)
+            k_b = k_b.astype(acc_dtype)
+            v_b = v_b.astype(acc_dtype)
+
             def _body(i, state):
                 max_logit, sum_exp, out = state
-                logit = jnp.einsum("hd,hd->h", q_b, k_b[:, i, :]) * scale
+                logit = jnp.einsum("hd,hd->h", q_b, k_b[:, i, :]).astype(acc_dtype) * scale
 
                 def _include(s):
                     m, s_exp, o = s
@@ -202,9 +218,9 @@ class MultiHeadSelfAttentionXL(nn.Module):
 
                 return jax.lax.cond(i < cl, _include, lambda s: s, state)
 
-            init_max = jnp.full((self.n_heads,), -jnp.inf)
-            init_sum = jnp.zeros((self.n_heads,))
-            init_out = jnp.zeros((self.n_heads, head_dim))
+            init_max = jnp.full((self.n_heads,), -jnp.inf, dtype=acc_dtype)
+            init_sum = jnp.zeros((self.n_heads,), dtype=acc_dtype)
+            init_out = jnp.zeros((self.n_heads, head_dim), dtype=acc_dtype)
             max_logit, sum_exp, out = jax.lax.fori_loop(
                 0, effective_mem_len, _body, (init_max, init_sum, init_out)
             )
@@ -213,7 +229,7 @@ class MultiHeadSelfAttentionXL(nn.Module):
 
         out = jax.vmap(_attend_single, in_axes=(0, 0, 0, 0))(q, k_cache, v_cache, cache_len)
         out = out.reshape(b, self.model_dim)
-        out = self.o_proj(out)
+        out = self.o_proj(out.astype(self.dtype))
         return out, (k_cache, v_cache, cache_len)
 
 
@@ -222,13 +238,21 @@ class TransformerXLLayer(nn.Module):
     n_heads: int
     ff_dim: int
     dropout: float = 0.0
+    dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
 
     def setup(self):
-        self.ln1 = nn.LayerNorm()
-        self.attn = MultiHeadSelfAttentionXL(self.model_dim, self.n_heads, self.dropout)
-        self.ln2 = nn.LayerNorm()
-        self.ffn1 = nn.Dense(self.ff_dim)
-        self.ffn2 = nn.Dense(self.model_dim)
+        self.ln1 = nn.LayerNorm(dtype=jnp.float32, param_dtype=self.param_dtype)
+        self.attn = MultiHeadSelfAttentionXL(
+            self.model_dim,
+            self.n_heads,
+            self.dropout,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
+        self.ln2 = nn.LayerNorm(dtype=jnp.float32, param_dtype=self.param_dtype)
+        self.ffn1 = nn.Dense(self.ff_dim, dtype=self.dtype, param_dtype=self.param_dtype)
+        self.ffn2 = nn.Dense(self.model_dim, dtype=self.dtype, param_dtype=self.param_dtype)
         self.dropout_layer = nn.Dropout(rate=self.dropout)
 
     def __call__(self,
@@ -236,12 +260,12 @@ class TransformerXLLayer(nn.Module):
                  mem: Optional[jnp.ndarray],
                  attn_mask: Optional[jnp.ndarray],
                  train: bool) -> jnp.ndarray:
-        h = self.ln1(x)
+        h = self.ln1(x.astype(jnp.float32)).astype(self.dtype)
         h = self.attn(h, mem, attn_mask, train)
         h = self.dropout_layer(h, deterministic=not train)
         x = x + h
 
-        h = self.ln2(x)
+        h = self.ln2(x.astype(jnp.float32)).astype(self.dtype)
         h = self.ffn1(h)
         h = jax.nn.gelu(h)
         h = self.dropout_layer(h, deterministic=not train)
@@ -254,10 +278,10 @@ class TransformerXLLayer(nn.Module):
              cache: Optional[Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]],
              mem_len: Optional[int],
              train: bool) -> Tuple[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
-        h = self.ln1(x_t)
+        h = self.ln1(x_t.astype(jnp.float32)).astype(self.dtype)
         h, cache = self.attn.step(h, cache, mem_len, train)
         x_t = x_t + h
-        h2 = self.ln2(x_t)
+        h2 = self.ln2(x_t.astype(jnp.float32)).astype(self.dtype)
         h2 = self.ffn1(h2)
         h2 = jax.nn.gelu(h2)
         h2 = self.ffn2(h2)
@@ -279,10 +303,19 @@ class TransformerXL(nn.Module):
     ff_dim: int
     dropout: float = 0.0
     mem_len: int = 0
+    dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
 
     def setup(self):
         self.layers = [
-            TransformerXLLayer(self.model_dim, self.n_heads, self.ff_dim, self.dropout)
+            TransformerXLLayer(
+                self.model_dim,
+                self.n_heads,
+                self.ff_dim,
+                self.dropout,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+            )
             for _ in range(self.n_layers)
         ]
 
@@ -303,7 +336,7 @@ class TransformerXL(nn.Module):
                     cat = h
                 new_mems.append(cat[-self.mem_len:])
             else:
-                new_mems.append(jnp.zeros((0, h.shape[1], h.shape[2])))
+                new_mems.append(jnp.zeros((0, h.shape[1], h.shape[2]), dtype=h.dtype))
         return h, new_mems
 
     def step(self,
