@@ -324,7 +324,7 @@ class WorldModelWrapper(BaseWrapper):
                  wm_obs_ind: jnp.ndarray,
                  eval_mem_len: int,
                  buffer_length: int = 0,
-                 buffer_dtype: Any = jnp.float16,
+                 buffer_dtype: Any = jnp.float32,
                  disp_window: int = 0):
         super().__init__(env)
         self.model = model
