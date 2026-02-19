@@ -131,6 +131,7 @@ def world_model_loss(model: WorldModelTXL,
                      valid_mask: Optional[jnp.ndarray],
                      seg_len: int,
                      mem_len: int,
+                     disp_window: int,
                      aux_vel_weight: float,
                      rng: jax.random.PRNGKey) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     """
@@ -139,6 +140,7 @@ def world_model_loss(model: WorldModelTXL,
     The sequence is optionally segmented with Transformer-XL recurrence.
     rng is used for dropout when train=True.
     valid_mask can be used to ignore padded/invalid timesteps (shape [T, B]).
+    disp_window computes per-episode trailing displacement targets inside the loss.
     """
     t, b = inputs.shape[0], inputs.shape[1]
 
@@ -149,6 +151,16 @@ def world_model_loss(model: WorldModelTXL,
     target_disp, _ = _pad_to_multiple(target_disp, seg_len, pad_value=0.0)
     target_vel, _ = _pad_to_multiple(target_vel, seg_len, pad_value=0.0)
     episode_ids, _ = _pad_to_multiple(episode_ids, seg_len, pad_value=episode_ids[-1, 0])
+
+    if disp_window > 0:
+        t_pad = target_disp.shape[0]
+        if disp_window < t_pad:
+            pad_disp = jnp.zeros((disp_window,) + target_disp.shape[1:], dtype=target_disp.dtype)
+            pad_ep = jnp.full((disp_window,) + episode_ids.shape[1:], -1, dtype=episode_ids.dtype)
+            prev_disp = jnp.concatenate([pad_disp, target_disp[:-disp_window]], axis=0)[-t_pad:]
+            prev_ep = jnp.concatenate([pad_ep, episode_ids[:-disp_window]], axis=0)[-t_pad:]
+            same_ep = episode_ids == prev_ep
+            target_disp = jnp.where(same_ep[..., None], target_disp - prev_disp, target_disp)
 
     if valid_mask is None:
         valid = jnp.ones((t, b), dtype=inputs.dtype)

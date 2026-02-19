@@ -518,25 +518,6 @@ class WorldModelWrapper(BaseWrapper):
             wm_buffer_done = wm_buffer_done.at[-1].set(done)
             wm_buffer_valid = wm_buffer_valid.at[-1].set(jnp.ones_like(done, dtype=wm_buffer_valid.dtype))
 
-            done_mask = done.astype(bool)[None, :]
-            wm_buffer_inputs = jnp.where(
-                done_mask[:, :, None],
-                jnp.zeros_like(wm_buffer_inputs),
-                wm_buffer_inputs,
-            )
-            wm_buffer_disp = jnp.where(
-                done_mask[:, :, None],
-                jnp.zeros_like(wm_buffer_disp),
-                wm_buffer_disp,
-            )
-            wm_buffer_vel = jnp.where(
-                done_mask[:, :, None],
-                jnp.zeros_like(wm_buffer_vel),
-                wm_buffer_vel,
-            )
-            wm_buffer_done = jnp.where(done_mask, jnp.zeros_like(wm_buffer_done), wm_buffer_done)
-            wm_buffer_valid = jnp.where(done_mask, jnp.zeros_like(wm_buffer_valid), wm_buffer_valid)
-
         state = WorldModelWrapperState(
             env_state=env_state,
             wm_kv_cache=wm_kv_cache,
