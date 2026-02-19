@@ -21,6 +21,33 @@ def _merge_heads(x: jnp.ndarray) -> jnp.ndarray:
     return x.reshape(t, b, h * d)
 
 
+def _rel_positional_encoding(length: int, dim: int, dtype: Any, reverse: bool = True) -> jnp.ndarray:
+    """Sinusoidal relative positional encoding."""
+    if length <= 0:
+        return jnp.zeros((0, dim), dtype=dtype)
+    inv_freq = 1.0 / (10000 ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
+    if reverse:
+        pos_seq = jnp.arange(length - 1, -1, -1.0, dtype=jnp.float32)
+    else:
+        pos_seq = jnp.arange(length, dtype=jnp.float32)
+    sinusoid_inp = jnp.einsum("i,j->ij", pos_seq, inv_freq)
+    pos_emb = jnp.concatenate([jnp.sin(sinusoid_inp), jnp.cos(sinusoid_inp)], axis=-1)
+    if pos_emb.shape[1] < dim:
+        pad = jnp.zeros((length, dim - pos_emb.shape[1]), dtype=pos_emb.dtype)
+        pos_emb = jnp.concatenate([pos_emb, pad], axis=-1)
+    return pos_emb.astype(dtype)
+
+
+def _rel_shift(x: jnp.ndarray) -> jnp.ndarray:
+    """Perform relative shift to align attention scores."""
+    b, h, t, k = x.shape
+    zero_pad = jnp.zeros((b, h, t, 1), dtype=x.dtype)
+    x_padded = jnp.concatenate([zero_pad, x], axis=3)  # (b, h, t, k+1)
+    x_padded = x_padded.reshape(b, h, k + 1, t)
+    x = x_padded[:, :, 1:, :].reshape(b, h, t, k)
+    return x
+
+
 def init_mems(n_layers: int, mem_len: int, batch_size: int, model_dim: int, dtype: Any = jnp.float32) -> List[jnp.ndarray]:
     """Initialize Transformer-XL memories to zeros."""
     if mem_len <= 0:
@@ -76,9 +103,15 @@ class MultiHeadSelfAttentionXL(nn.Module):
     def setup(self):
         self.q_proj = nn.Dense(self.model_dim, use_bias=False, dtype=self.dtype, param_dtype=self.param_dtype)
         self.k_proj = nn.Dense(self.model_dim, use_bias=False, dtype=self.dtype, param_dtype=self.param_dtype)
+        self.r_proj = nn.Dense(self.model_dim, use_bias=False, dtype=self.dtype, param_dtype=self.param_dtype)
         self.v_proj = nn.Dense(self.model_dim, use_bias=False, dtype=self.dtype, param_dtype=self.param_dtype)
         self.o_proj = nn.Dense(self.model_dim, use_bias=False, dtype=self.dtype, param_dtype=self.param_dtype)
         self.attn_dropout = nn.Dropout(rate=self.dropout)
+        head_dim = self.model_dim // self.n_heads
+        u_init = nn.initializers.normal(stddev=0.02)
+        v_init = nn.initializers.normal(stddev=0.02)
+        self.u = self.param("u", u_init, (self.n_heads, head_dim))
+        self.v = self.param("v", v_init, (self.n_heads, head_dim))
 
     def __call__(self,
                  x: jnp.ndarray,
@@ -96,6 +129,7 @@ class MultiHeadSelfAttentionXL(nn.Module):
             cat = jnp.concatenate([mem, x], axis=0)
         else:
             cat = x
+        k_len = cat.shape[0]
 
         q = _split_heads(self.q_proj(x), self.n_heads)
         k = _split_heads(self.k_proj(cat), self.n_heads)
@@ -106,7 +140,18 @@ class MultiHeadSelfAttentionXL(nn.Module):
         k_f = k.astype(acc_dtype)
         v_f = v.astype(acc_dtype)
         scale = jnp.array(1.0 / math.sqrt(q.shape[-1]), dtype=acc_dtype)
-        attn_scores = jnp.einsum("bhqd,bhkd->bhqk", q_f, k_f) * scale
+        r = _rel_positional_encoding(k_len, self.model_dim, dtype=self.dtype, reverse=True)
+        r = self.r_proj(r)
+        head_dim = self.model_dim // self.n_heads
+        r = r.reshape(k_len, self.n_heads, head_dim)
+        r = jnp.transpose(r, (1, 0, 2))  # (H, K, Hd)
+
+        u = self.u.astype(acc_dtype)
+        v_bias = self.v.astype(acc_dtype)
+        ac = jnp.einsum("bhqd,bhkd->bhqk", q_f + u[None, :, None, :], k_f)
+        bd = jnp.einsum("bhqd,hkd->bhqk", q_f + v_bias[None, :, None, :], r.astype(acc_dtype))
+        bd = _rel_shift(bd)
+        attn_scores = (ac + bd) * scale
 
         if attn_mask is not None:
             # attn_mask: (B, T, K) -> (B, 1, T, K)
@@ -199,6 +244,13 @@ class MultiHeadSelfAttentionXL(nn.Module):
         acc_dtype = jnp.float32
         scale = jnp.array(1.0 / math.sqrt(head_dim), dtype=acc_dtype)
 
+        r = _rel_positional_encoding(effective_mem_len, self.model_dim, dtype=self.dtype, reverse=False)
+        r = self.r_proj(r)
+        r = r.reshape(effective_mem_len, self.n_heads, head_dim)
+        r = jnp.transpose(r, (1, 0, 2))  # (H, L, Hd)
+        u = self.u.astype(acc_dtype)
+        v_bias = self.v.astype(acc_dtype)
+
         def _attend_single(q_b, k_b, v_b, cl):
             q_b = q_b.astype(acc_dtype)
             k_b = k_b.astype(acc_dtype)
@@ -206,10 +258,14 @@ class MultiHeadSelfAttentionXL(nn.Module):
 
             def _body(i, state):
                 max_logit, sum_exp, out = state
-                logit = jnp.einsum("hd,hd->h", q_b, k_b[:, i, :]).astype(acc_dtype) * scale
-
                 def _include(s):
                     m, s_exp, o = s
+                    rel_idx = cl - 1 - i
+                    r_i = r[:, rel_idx, :].astype(acc_dtype)
+                    logit = (
+                        jnp.einsum("hd,hd->h", q_b + u, k_b[:, i, :]).astype(acc_dtype)
+                        + jnp.einsum("hd,hd->h", q_b + v_bias, r_i).astype(acc_dtype)
+                    ) * scale
                     new_m = jnp.maximum(m, logit)
                     exp_logit = jnp.exp(logit - new_m)
                     s_exp = s_exp * jnp.exp(m - new_m) + exp_logit
