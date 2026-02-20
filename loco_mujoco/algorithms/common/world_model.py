@@ -4,25 +4,7 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 
-from loco_mujoco.algorithms.common.transformer_xl import TransformerXL, init_mems, build_attn_mask
-
-
-def _pad_to_multiple(x: jnp.ndarray, multiple: int, pad_value: float = 0.0) -> Tuple[jnp.ndarray, int]:
-    """Pad the time dimension to a multiple of `multiple`."""
-    t = x.shape[0]
-    pad_len = (multiple - (t % multiple)) % multiple
-    if pad_len == 0:
-        return x, 0
-    pad_shape = (pad_len,) + x.shape[1:]
-    pad = jnp.full(pad_shape, pad_value, dtype=x.dtype)
-    return jnp.concatenate([x, pad], axis=0), pad_len
-
-
-def _segment(x: jnp.ndarray, seg_len: int) -> jnp.ndarray:
-    """Reshape [T, ...] -> [N, seg_len, ...], assuming T is multiple of seg_len."""
-    t = x.shape[0]
-    n_seg = t // seg_len
-    return x.reshape((n_seg, seg_len) + x.shape[1:])
+from loco_mujoco.algorithms.common.mamba import Mamba
 
 
 def _compute_episode_ids(done: jnp.ndarray) -> jnp.ndarray:
@@ -37,18 +19,21 @@ def _compute_episode_ids(done: jnp.ndarray) -> jnp.ndarray:
     return jnp.cumsum(start, axis=0).astype(jnp.int32)
 
 
-def _update_mem_episode_ids(mem_episode_ids: jnp.ndarray,
-                            episode_ids_seg: jnp.ndarray,
-                            mem_len: int) -> jnp.ndarray:
-    if mem_len <= 0:
-        return mem_episode_ids
-    cat = jnp.concatenate([mem_episode_ids, episode_ids_seg], axis=0)
-    return cat[-mem_len:]
+def _compute_reset_mask(done: jnp.ndarray) -> jnp.ndarray:
+    """Reset mask is True at the first step of each episode."""
+    b = done.shape[1]
+    return jnp.concatenate([jnp.ones((1, b), dtype=bool), done[:-1]], axis=0)
 
 
-class WorldModelTXL(nn.Module):
+def _state_dtype(dtype: Any) -> Any:
+    if dtype in (jnp.float16, jnp.bfloat16):
+        return jnp.float32
+    return dtype
+
+
+class WorldModel(nn.Module):
     """
-    Transformer-XL world model that predicts base displacement (and velocity).
+    Mamba world model that predicts base displacement (and velocity).
 
     Inputs are sequences of state-action features. Outputs are per-timestep predictions.
     """
@@ -59,20 +44,47 @@ class WorldModelTXL(nn.Module):
     n_heads: int
     ff_dim: int
     dropout: float = 0.0
-    mem_len: int = 0
+    mamba_expand: Optional[int] = None
+    mamba_d_state: Optional[int] = None
+    mamba_d_conv: Optional[int] = None
+    mamba_dt_rank: int = 1
+    mamba_dt_min: float = 1e-4
+    mamba_dt_max: float = 1.0
     dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
 
+    def _mamba_dims(self) -> Tuple[int, int, int]:
+        if self.mamba_expand is None:
+            expand = 1
+            if self.ff_dim is not None and self.model_dim > 0:
+                expand = max(1, min(2, self.ff_dim // self.model_dim))
+        else:
+            expand = max(1, int(self.mamba_expand))
+        d_inner = self.model_dim * expand
+        if self.mamba_d_state is None:
+            d_state = max(8, int(self.n_heads))
+        else:
+            d_state = max(1, int(self.mamba_d_state))
+        if self.mamba_d_conv is None:
+            d_conv = 4
+        else:
+            d_conv = max(1, int(self.mamba_d_conv))
+        return d_inner, d_state, d_conv
+
     def setup(self):
         self.in_proj = nn.Dense(self.model_dim, dtype=self.dtype, param_dtype=self.param_dtype)
-        self.in_ln = nn.LayerNorm(dtype=self.dtype, param_dtype=self.param_dtype)
-        self.txl = TransformerXL(
+        self.in_ln = nn.LayerNorm(dtype=jnp.float32, param_dtype=self.param_dtype)
+        d_inner, d_state, d_conv = self._mamba_dims()
+        self.mamba = Mamba(
             model_dim=self.model_dim,
             n_layers=self.n_layers,
-            n_heads=self.n_heads,
-            ff_dim=self.ff_dim,
+            d_inner=d_inner,
+            d_state=d_state,
+            d_conv=d_conv,
+            dt_rank=self.mamba_dt_rank,
+            dt_min=self.mamba_dt_min,
+            dt_max=self.mamba_dt_max,
             dropout=self.dropout,
-            mem_len=self.mem_len,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
@@ -82,79 +94,80 @@ class WorldModelTXL(nn.Module):
 
     def __call__(self,
                  x: jnp.ndarray,
-                 mems: Optional[List[jnp.ndarray]],
-                 attn_mask: Optional[jnp.ndarray],
-                 train: bool) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], List[jnp.ndarray]]:
+                 states: Optional[List[Tuple[jnp.ndarray, jnp.ndarray]]],
+                 reset_mask: Optional[jnp.ndarray],
+                 train: bool) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], List[Tuple[jnp.ndarray, jnp.ndarray]]]:
         """
         Args:
             x: (T, B, input_dim)
-            mems: list of (mem_len, B, model_dim) per layer
-            attn_mask: (B, T, mem_len+T) bool mask
+            states: list of (conv_state, ssm_state) per layer
+            reset_mask: (T, B) bool mask for episode resets
         """
         x = x.astype(self.dtype)
         h = self.in_proj(x)
-        h = self.in_ln(h)
+        h = self.in_ln(h.astype(jnp.float32)).astype(self.dtype)
         h = self.dropout_layer(h, deterministic=not train)
-        h, new_mems = self.txl(h, mems, attn_mask, train)
+        h, new_states = self.mamba(h, states, reset_mask, train)
         pred_disp = self.out_disp(h)
         pred_vel = self.out_vel(h)
-        return (pred_disp, pred_vel), new_mems
+        return (pred_disp, pred_vel), new_states
 
     def step(self,
              x_t: jnp.ndarray,
-             cache: Optional[List[Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]],
-             train: bool = False,
-             mem_len: Optional[int] = None) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], List[Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]]:
+             cache: Optional[List[Tuple[jnp.ndarray, jnp.ndarray]]],
+             train: bool = False) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], List[Tuple[jnp.ndarray, jnp.ndarray]]]:
         """
-        Single-step prediction with KV-cache for fast inference.
+        Single-step prediction with cached Mamba state for fast inference.
 
         Args:
             x_t: (B, input_dim)
-            cache: list of (k_cache, v_cache, cache_len) per layer
-            mem_len: optional override for cache length
+            cache: list of (conv_state, ssm_state) per layer
         """
         x_t = x_t.astype(self.dtype)
         h = self.in_proj(x_t)
-        h = self.in_ln(h)
-        h, new_cache = self.txl.step(h, cache, train, mem_len=mem_len)
+        h = self.in_ln(h.astype(jnp.float32)).astype(self.dtype)
+        h, new_cache = self.mamba.step(h, cache, train)
         pred_disp = self.out_disp(h)
         pred_vel = self.out_vel(h)
         return (pred_disp, pred_vel), new_cache
 
+    def init_state(self, batch_size: int) -> List[Tuple[jnp.ndarray, jnp.ndarray]]:
+        d_inner, d_state, d_conv = self._mamba_dims()
+        conv_len = max(d_conv - 1, 0)
+        conv_state = jnp.zeros((batch_size, conv_len, d_inner), dtype=self.dtype)
+        ssm_state = jnp.zeros((batch_size, d_inner, d_state), dtype=_state_dtype(self.dtype))
+        return [(conv_state, ssm_state) for _ in range(self.n_layers)]
 
-def world_model_loss(model: WorldModelTXL,
+    def init_cache(self, batch_size: int) -> List[Tuple[jnp.ndarray, jnp.ndarray]]:
+        return self.init_state(batch_size)
+
+
+def world_model_loss(model: WorldModel,
                      params: Any,
                      inputs: jnp.ndarray,
                      target_disp: jnp.ndarray,
                      target_vel: jnp.ndarray,
                      done: jnp.ndarray,
                      valid_mask: Optional[jnp.ndarray],
-                     seg_len: int,
-                     mem_len: int,
                      disp_window: int,
                      aux_vel_weight: float,
                      rng: jax.random.PRNGKey) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     """
-    Compute loss for the Transformer-XL world model.
+    Compute loss for the Mamba world model.
 
-    The sequence is optionally segmented with Transformer-XL recurrence.
+    The input sequence is assumed to be a fixed-length segment.
     rng is used for dropout when train=True.
     valid_mask can be used to ignore padded/invalid timesteps (shape [T, B]).
     disp_window computes per-episode trailing displacement targets inside the loss.
     """
     t, b = inputs.shape[0], inputs.shape[1]
 
-    # episode ids for masking attention across episode boundaries
     episode_ids = _compute_episode_ids(done)
-
-    inputs, pad_len = _pad_to_multiple(inputs, seg_len, pad_value=0.0)
-    target_disp, _ = _pad_to_multiple(target_disp, seg_len, pad_value=0.0)
-    target_vel, _ = _pad_to_multiple(target_vel, seg_len, pad_value=0.0)
-    episode_ids, _ = _pad_to_multiple(episode_ids, seg_len, pad_value=episode_ids[-1, 0])
+    reset_mask = _compute_reset_mask(done)
 
     if disp_window > 0:
-        t_pad = target_disp.shape[0]
-        if disp_window < t_pad:
+        if disp_window < t:
+            t_pad = target_disp.shape[0]
             pad_disp = jnp.zeros((disp_window,) + target_disp.shape[1:], dtype=target_disp.dtype)
             pad_ep = jnp.full((disp_window,) + episode_ids.shape[1:], -1, dtype=episode_ids.dtype)
             prev_disp = jnp.concatenate([pad_disp, target_disp[:-disp_window]], axis=0)[-t_pad:]
@@ -166,58 +179,30 @@ def world_model_loss(model: WorldModelTXL,
         valid = jnp.ones((t, b), dtype=inputs.dtype)
     else:
         valid = valid_mask.astype(inputs.dtype)
-    if pad_len > 0:
-        valid = jnp.concatenate([valid, jnp.zeros((pad_len, b), dtype=inputs.dtype)], axis=0)
-    seg_inputs = _segment(inputs, seg_len)
-    seg_disp = _segment(target_disp, seg_len)
-    seg_vel = _segment(target_vel, seg_len)
-    seg_ep = _segment(episode_ids, seg_len)
-    seg_valid = _segment(valid, seg_len)
-
-    model_dtype = getattr(model, "dtype", jnp.float32)
-    mems = init_mems(model.n_layers, mem_len, b, model.model_dim, dtype=model_dtype)
-    mem_episode_ids = jnp.zeros((mem_len, b), dtype=jnp.int32) if mem_len > 0 else jnp.zeros((0, b), dtype=jnp.int32)
-
-    def _segment_step(carry, seg):
-        mems, mem_ep, rng = carry
-        rng, subkey = jax.random.split(rng)
-        x_seg, y_disp_seg, y_vel_seg, ep_seg, valid_seg = seg
-        x_seg = x_seg.astype(model_dtype)
-
-        attn_mask = build_attn_mask(seg_len, mem_len, ep_seg, mem_ep)
-        (pred_disp, pred_vel), new_mems = model.apply(
-            {"params": params},
-            x_seg,
-            mems=mems,
-            attn_mask=attn_mask,
-            train=True,
-            rngs={"dropout": subkey},
-        )
-
-        pred_disp_f = pred_disp.astype(jnp.float32)
-        pred_vel_f = pred_vel.astype(jnp.float32)
-        y_disp_f = y_disp_seg.astype(jnp.float32)
-        y_vel_f = y_vel_seg.astype(jnp.float32)
-        valid_f = valid_seg.astype(jnp.float32)
-
-        disp_err = jnp.mean((pred_disp_f - y_disp_f) ** 2, axis=-1)
-        vel_err = jnp.mean((pred_vel_f - y_vel_f) ** 2, axis=-1)
-
-        disp_loss = jnp.sum(disp_err * valid_f)
-        vel_loss = jnp.sum(vel_err * valid_f)
-        count = jnp.sum(valid_f)
-
-        new_mem_ep = _update_mem_episode_ids(mem_ep, ep_seg, mem_len)
-        return (new_mems, new_mem_ep, rng), (disp_loss, vel_loss, count)
-
-    (_, _, _), (disp_loss, vel_loss, count) = jax.lax.scan(
-        _segment_step,
-        (mems, mem_episode_ids, rng),
-        (seg_inputs, seg_disp, seg_vel, seg_ep, seg_valid),
+    (pred_disp, pred_vel), _ = model.apply(
+        {"params": params},
+        inputs,
+        states=model.init_state(b),
+        reset_mask=reset_mask,
+        train=True,
+        rngs={"dropout": rng},
     )
 
-    disp_loss = jnp.sum(disp_loss) / (jnp.sum(count) + 1e-8)
-    vel_loss = jnp.sum(vel_loss) / (jnp.sum(count) + 1e-8)
+    pred_disp_f = pred_disp.astype(jnp.float32)
+    pred_vel_f = pred_vel.astype(jnp.float32)
+    y_disp_f = target_disp.astype(jnp.float32)
+    y_vel_f = target_vel.astype(jnp.float32)
+    valid_f = valid.astype(jnp.float32)
+
+    disp_err = jnp.mean((pred_disp_f - y_disp_f) ** 2, axis=-1)
+    vel_err = jnp.mean((pred_vel_f - y_vel_f) ** 2, axis=-1)
+
+    disp_loss = jnp.sum(disp_err * valid_f)
+    vel_loss = jnp.sum(vel_err * valid_f)
+    count = jnp.sum(valid_f)
+
+    disp_loss = disp_loss / (count + 1e-8)
+    vel_loss = vel_loss / (count + 1e-8)
     total_loss = disp_loss + aux_vel_weight * vel_loss
 
     metrics = {

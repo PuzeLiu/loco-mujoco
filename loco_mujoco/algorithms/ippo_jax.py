@@ -21,7 +21,7 @@ from loco_mujoco.core.wrappers import (RichLogWrapper, NStepWrapper, RichLogEnvS
                                        NormalizeVecRewardDict, SummaryRichMetrics, WorldModelWrapper)
 from loco_mujoco.core.wrappers.mjx import BaseWrapper
 from loco_mujoco.utils import MetricsHandler, ValidationSummary
-from loco_mujoco.algorithms.common.world_model import WorldModelTXL, world_model_loss
+from loco_mujoco.algorithms.common.world_model import WorldModel, world_model_loss
 from loco_mujoco.algorithms.world_model_agent import IPPOWorldConf, IPPOWorldState
 
 
@@ -247,17 +247,30 @@ class IPPOJax(JaxRLAlgorithmBase):
             config.experiment.world_model.input_dim = input_dim
             config.experiment.world_model.action_dim = action_dim
 
-        train_mem_len = wm_cfg.get("train_mem_len", wm_cfg.mem_len)
         wm_dtype = _resolve_dtype(wm_cfg.get("dtype", "bfloat16"))
         wm_param_dtype = _resolve_dtype(wm_cfg.get("param_dtype", wm_dtype))
-        model = WorldModelTXL(
+        mamba_dt_rank = wm_cfg.get("mamba_dt_rank", 1)
+        if mamba_dt_rank is None:
+            mamba_dt_rank = 1
+        mamba_dt_min = wm_cfg.get("mamba_dt_min", 1e-4)
+        if mamba_dt_min is None:
+            mamba_dt_min = 1e-4
+        mamba_dt_max = wm_cfg.get("mamba_dt_max", 1.0)
+        if mamba_dt_max is None:
+            mamba_dt_max = 1.0
+        model = WorldModel(
             input_dim=input_dim,
             model_dim=wm_cfg.model_dim,
             n_layers=wm_cfg.n_layers,
             n_heads=wm_cfg.n_heads,
             ff_dim=wm_cfg.ff_dim,
             dropout=wm_cfg.dropout,
-            mem_len=train_mem_len,
+            mamba_expand=wm_cfg.get("mamba_expand", None),
+            mamba_d_state=wm_cfg.get("mamba_d_state", None),
+            mamba_d_conv=wm_cfg.get("mamba_d_conv", None),
+            mamba_dt_rank=int(mamba_dt_rank),
+            mamba_dt_min=float(mamba_dt_min),
+            mamba_dt_max=float(mamba_dt_max),
             dtype=wm_dtype,
             param_dtype=wm_param_dtype,
         )
@@ -527,6 +540,36 @@ class IPPOJax(JaxRLAlgorithmBase):
                 wm_minibatch_size = int(wm_cfg.get("minibatch_size", wm_inputs.shape[1]))
                 wm_batch_size = wm_inputs.shape[1] if wm_minibatch_size >= wm_inputs.shape[1] else wm_minibatch_size
                 wm_num_minibatches = 1 if wm_batch_size == wm_inputs.shape[1] else wm_inputs.shape[1] // wm_batch_size
+                seg_len = int(wm_cfg.seg_len)
+
+                def _pad_time(x, pad_len, pad_value):
+                    if pad_len <= 0:
+                        return x
+                    pad_shape = (pad_len,) + x.shape[1:]
+                    pad = jnp.full(pad_shape, pad_value, dtype=x.dtype)
+                    return jnp.concatenate([x, pad], axis=0)
+
+                def _sample_segment(inputs, disp, vel, done, valid, rng):
+                    t = inputs.shape[0]
+                    b = inputs.shape[1]
+                    if valid is None:
+                        valid = jnp.ones((t, b), dtype=inputs.dtype)
+                    if t < seg_len:
+                        pad_len = seg_len - t
+                        inputs = _pad_time(inputs, pad_len, 0.0)
+                        disp = _pad_time(disp, pad_len, 0.0)
+                        vel = _pad_time(vel, pad_len, 0.0)
+                        done = _pad_time(done, pad_len, True)
+                        valid = _pad_time(valid, pad_len, 0.0)
+                        t = seg_len
+                    max_start = t - seg_len + 1
+                    start = jax.random.randint(rng, (), 0, max_start)
+
+                    def _slice(x):
+                        start_idx = (start, 0) + (0,) * (x.ndim - 2)
+                        return jax.lax.dynamic_slice(x, start_idx, (seg_len,) + x.shape[1:])
+
+                    return _slice(inputs), _slice(disp), _slice(vel), _slice(done), _slice(valid)
 
                 def _wm_minibatch_update(wm_ts, batch):
                     mb_idx, mb_rng = batch
@@ -535,6 +578,15 @@ class IPPOJax(JaxRLAlgorithmBase):
                     batch_linvel = jnp.take(wm_linvel, mb_idx, axis=1)
                     batch_done = jnp.take(wm_done, mb_idx, axis=1)
                     batch_valid = None if wm_valid is None else jnp.take(wm_valid, mb_idx, axis=1)
+                    sample_rng, loss_rng = jax.random.split(mb_rng)
+                    batch_inputs, batch_disp, batch_linvel, batch_done, batch_valid = _sample_segment(
+                        batch_inputs,
+                        batch_disp,
+                        batch_linvel,
+                        batch_done,
+                        batch_valid,
+                        sample_rng,
+                    )
 
                     def _wm_loss_fn(params):
                         return world_model_loss(
@@ -545,11 +597,9 @@ class IPPOJax(JaxRLAlgorithmBase):
                             batch_linvel,
                             batch_done,
                             batch_valid,
-                            wm_cfg.seg_len,
-                            wm_cfg.get("train_mem_len", wm_cfg.mem_len),
                             int(wm_cfg.get("disp_window", 0) or 0),
                             wm_cfg.aux_vel_weight,
-                            mb_rng,
+                            loss_rng,
                         )
 
                     (_, wm_metrics), wm_grads = jax.value_and_grad(
@@ -1074,7 +1124,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                 env,
                 world_conf.model,
                 world_conf.obs_ind,
-                wm_cfg.get("eval_mem_len", wm_cfg.mem_len),
+                wm_cfg.get("eval_mem_len", 0),
                 buffer_length=wm_cfg.get("buffer_length", 0),
                 buffer_dtype=wm_cfg.get("buffer_dtype", "bfloat16"),
                 disp_window=wm_cfg.get("disp_window", 0) or 0,

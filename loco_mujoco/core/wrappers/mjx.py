@@ -12,7 +12,7 @@ from loco_mujoco.core.mujoco_mjx import Mjx, MjxState
 from loco_mujoco.core.utils.env import Box
 
 if TYPE_CHECKING:
-    from loco_mujoco.algorithms.common.world_model import WorldModelTXL
+    from loco_mujoco.algorithms.common.world_model import WorldModel
 
 
 class LocoMjxWrapper:
@@ -320,7 +320,7 @@ class WorldModelWrapper(BaseWrapper):
 
     def __init__(self,
                  env,
-                 model: "WorldModelTXL",
+                 model: "WorldModel",
                  wm_obs_ind: jnp.ndarray,
                  eval_mem_len: int,
                  buffer_length: int = 0,
@@ -353,31 +353,19 @@ class WorldModelWrapper(BaseWrapper):
     def _reset_cache(self, cache, done):
         if cache is None:
             return None
-        done_mask = done[:, None, None, None]
+        done_mask_conv = done[:, None, None]
+        done_mask_ssm = done[:, None, None]
         new_cache = []
-        for k_cache, v_cache, cache_len in cache:
-            k_cache = jnp.where(done_mask, jnp.zeros_like(k_cache), k_cache)
-            v_cache = jnp.where(done_mask, jnp.zeros_like(v_cache), v_cache)
-            cache_len = jnp.where(done, jnp.zeros_like(cache_len), cache_len)
-            new_cache.append((k_cache, v_cache, cache_len))
+        for conv_state, ssm_state in cache:
+            conv_state = jnp.where(done_mask_conv, jnp.zeros_like(conv_state), conv_state)
+            ssm_state = jnp.where(done_mask_ssm, jnp.zeros_like(ssm_state), ssm_state)
+            new_cache.append((conv_state, ssm_state))
         return new_cache
 
     def reset(self, rng_key, env_id=None):
         obs, env_state = self.env.reset(rng_key, env_id=env_id)
         batch_size = obs.shape[0]
-        model_dtype = getattr(self.model, "dtype", jnp.float32)
-        if self.eval_mem_len > 0:
-            head_dim = self.model.model_dim // self.model.n_heads
-            wm_kv_cache = [
-                (
-                    jnp.zeros((batch_size, self.model.n_heads, self.eval_mem_len, head_dim), dtype=model_dtype),
-                    jnp.zeros((batch_size, self.model.n_heads, self.eval_mem_len, head_dim), dtype=model_dtype),
-                    jnp.zeros((batch_size,), dtype=jnp.int32),
-                )
-                for _ in range(self.model.n_layers)
-            ]
-        else:
-            wm_kv_cache = None
+        wm_kv_cache = self.model.init_cache(batch_size)
         if self.buffer_length > 0:
             wm_buffer_inputs = jnp.zeros(
                 (self.buffer_length, batch_size, self.model.input_dim),
@@ -440,25 +428,13 @@ class WorldModelWrapper(BaseWrapper):
             wm_inputs = self._build_inputs(obs, action)
             model_dtype = getattr(self.model, "dtype", wm_inputs.dtype)
             wm_inputs = wm_inputs.astype(model_dtype)
-            if self.eval_mem_len > 0:
-                (pred_disp, pred_vel), wm_kv_cache = self.model.apply(
-                    {"params": state.wm_params},
-                    wm_inputs,
-                    cache=wm_kv_cache,
-                    train=False,
-                    mem_len=self.eval_mem_len,
-                    method=self.model.__class__.step,
-                )
-            else:
-                (pred_disp, pred_vel), _ = self.model.apply(
-                    {"params": state.wm_params},
-                    wm_inputs,
-                    cache=None,
-                    train=False,
-                    mem_len=0,
-                    method=self.model.__class__.step,
-                )
-                wm_kv_cache = None
+            (pred_disp, pred_vel), wm_kv_cache = self.model.apply(
+                {"params": state.wm_params},
+                wm_inputs,
+                cache=wm_kv_cache,
+                train=False,
+                method=self.model.__class__.step,
+            )
         pred_disp_abs = pred_disp
         if self.disp_window > 0:
             prev_pred_disp = wm_pred_disp_history[wm_disp_hist_idx]

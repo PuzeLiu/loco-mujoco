@@ -13,7 +13,7 @@ from flax import struct
 from omegaconf import DictConfig, OmegaConf
 
 from loco_mujoco.algorithms.common.dataclasses import TrainState
-from loco_mujoco.algorithms.common.world_model import WorldModelTXL
+from loco_mujoco.algorithms.common.world_model import WorldModel
 
 
 def _resolve_dtype(dtype):
@@ -41,7 +41,7 @@ def _get_world_model_optimizer(config: DictConfig):
 @dataclass(frozen=True)
 class IPPOWorldConf:
     config: DictConfig
-    model: WorldModelTXL
+    model: WorldModel
     tx: Any
     obs_ind: jnp.ndarray
     obs_group: Optional[str] = None
@@ -61,14 +61,28 @@ class IPPOWorldConf:
         wm_cfg = config.experiment.world_model
         wm_dtype = _resolve_dtype(wm_cfg.get("dtype", "float32"))
         wm_param_dtype = _resolve_dtype(wm_cfg.get("param_dtype", wm_dtype))
-        model = WorldModelTXL(
+        mamba_dt_rank = wm_cfg.get("mamba_dt_rank", 1)
+        if mamba_dt_rank is None:
+            mamba_dt_rank = 1
+        mamba_dt_min = wm_cfg.get("mamba_dt_min", 1e-4)
+        if mamba_dt_min is None:
+            mamba_dt_min = 1e-4
+        mamba_dt_max = wm_cfg.get("mamba_dt_max", 1.0)
+        if mamba_dt_max is None:
+            mamba_dt_max = 1.0
+        model = WorldModel(
             input_dim=wm_cfg.input_dim,
             model_dim=wm_cfg.model_dim,
             n_layers=wm_cfg.n_layers,
             n_heads=wm_cfg.n_heads,
             ff_dim=wm_cfg.ff_dim,
             dropout=wm_cfg.dropout,
-            mem_len=wm_cfg.mem_len,
+            mamba_expand=wm_cfg.get("mamba_expand", None),
+            mamba_d_state=wm_cfg.get("mamba_d_state", None),
+            mamba_d_conv=wm_cfg.get("mamba_d_conv", None),
+            mamba_dt_rank=int(mamba_dt_rank),
+            mamba_dt_min=float(mamba_dt_min),
+            mamba_dt_max=float(mamba_dt_max),
             dtype=wm_dtype,
             param_dtype=wm_param_dtype,
         )
