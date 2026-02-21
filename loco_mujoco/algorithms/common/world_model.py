@@ -19,14 +19,6 @@ def _state_dtype(dtype: Any) -> Any:
     return dtype
 
 
-def _huber_loss(x: jnp.ndarray, delta: float) -> jnp.ndarray:
-    delta = jnp.asarray(delta, dtype=x.dtype)
-    abs_x = jnp.abs(x)
-    quadratic = jnp.minimum(abs_x, delta)
-    linear = abs_x - quadratic
-    return 0.5 * quadratic ** 2 + delta * linear
-
-
 class WorldModel(nn.Module):
     """
     Mamba world model that predicts base displacement (and velocity).
@@ -147,8 +139,7 @@ def world_model_loss(model: WorldModel,
                      done: jnp.ndarray,
                      valid_mask: Optional[jnp.ndarray],
                      aux_vel_weight: float,
-                     rng: jax.random.PRNGKey,
-                     huber_delta: float = 1.0) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
+                     rng: jax.random.PRNGKey) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     """
     Compute loss for the Mamba world model.
 
@@ -217,32 +208,23 @@ def world_model_loss(model: WorldModel,
     y_vel_f = target_vel.astype(jnp.float32)
     valid_f = valid.astype(jnp.float32)
 
-    disp_res = pred_disp_f - y_disp_f
-    vel_res = pred_vel_f - y_vel_f
-    disp_huber_err = jnp.mean(_huber_loss(disp_res, huber_delta), axis=-1)
-    vel_huber_err = jnp.mean(_huber_loss(vel_res, huber_delta), axis=-1)
-    disp_mse_err = jnp.mean(disp_res ** 2, axis=-1)
-    vel_mse_err = jnp.mean(vel_res ** 2, axis=-1)
+    disp_err = jnp.mean((pred_disp_f - y_disp_f) ** 2, axis=-1)
+    vel_err = jnp.mean((pred_vel_f - y_vel_f) ** 2, axis=-1)
 
-    disp_loss = jnp.sum(disp_huber_err * valid_f)
-    vel_loss = jnp.sum(vel_huber_err * valid_f)
+    disp_loss = jnp.sum(disp_err * valid_f)
+    vel_loss = jnp.sum(vel_err * valid_f)
     count = jnp.sum(valid_f)
 
     disp_loss = disp_loss / (count + 1e-8)
     vel_loss = vel_loss / (count + 1e-8)
     total_loss = disp_loss + aux_vel_weight * vel_loss
 
-    disp_mse = jnp.sum(disp_mse_err * valid_f) / (count + 1e-8)
-    vel_mse = jnp.sum(vel_mse_err * valid_f) / (count + 1e-8)
-
     metrics = {
-        "wm_disp_mse": disp_mse,
-        "wm_vel_mse": vel_mse,
-        "wm_disp_huber": disp_loss,
-        "wm_vel_huber": vel_loss,
+        "wm_disp_mse": disp_loss,
+        "wm_vel_mse": vel_loss,
         "wm_loss": total_loss,
-        "wm_disp_rmse": jnp.sqrt(disp_mse + 1e-8),
-        "wm_vel_rmse": jnp.sqrt(vel_mse + 1e-8),
+        "wm_disp_rmse": jnp.sqrt(disp_loss + 1e-8),
+        "wm_vel_rmse": jnp.sqrt(vel_loss + 1e-8),
     }
     return total_loss, metrics
 
