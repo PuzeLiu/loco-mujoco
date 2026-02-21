@@ -520,6 +520,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                     wm_inputs = env_state.wm_buffer_inputs
                     wm_disp = env_state.wm_buffer_disp
                     wm_linvel = env_state.wm_buffer_vel
+                    wm_rot = env_state.wm_buffer_rot
                     wm_done = env_state.wm_buffer_done
                     wm_valid = env_state.wm_buffer_valid
                     wm_done = jnp.where(
@@ -532,6 +533,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                     wm_inputs = jnp.concatenate([wm_obs, traj_batch.action], axis=-1)
                     wm_disp = traj_batch.info["base_disp"]
                     wm_linvel = traj_batch.info["base_linvel"]
+                    wm_rot = traj_batch.info["base_rot"]
                     wm_done = traj_batch.done
                     wm_valid = None
 
@@ -549,7 +551,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                     pad = jnp.full(pad_shape, pad_value, dtype=x.dtype)
                     return jnp.concatenate([x, pad], axis=0)
 
-                def _sample_segment(inputs, disp, vel, done, valid, rng):
+                def _sample_segment(inputs, disp, vel, rot, done, valid, rng):
                     t = inputs.shape[0]
                     b = inputs.shape[1]
                     if valid is None:
@@ -559,6 +561,12 @@ class IPPOJax(JaxRLAlgorithmBase):
                         inputs = _pad_time(inputs, pad_len, 0.0)
                         disp = _pad_time(disp, pad_len, 0.0)
                         vel = _pad_time(vel, pad_len, 0.0)
+                        if rot is not None:
+                            pad_rot = jnp.broadcast_to(
+                                jnp.eye(3, dtype=rot.dtype),
+                                (pad_len, rot.shape[1], 3, 3),
+                            )
+                            rot = jnp.concatenate([rot, pad_rot], axis=0)
                         done = _pad_time(done, pad_len, True)
                         valid = _pad_time(valid, pad_len, 0.0)
                         t = seg_len
@@ -569,20 +577,23 @@ class IPPOJax(JaxRLAlgorithmBase):
                         start_idx = (start, 0) + (0,) * (x.ndim - 2)
                         return jax.lax.dynamic_slice(x, start_idx, (seg_len,) + x.shape[1:])
 
-                    return _slice(inputs), _slice(disp), _slice(vel), _slice(done), _slice(valid)
+                    rot_slice = None if rot is None else _slice(rot)
+                    return _slice(inputs), _slice(disp), _slice(vel), rot_slice, _slice(done), _slice(valid)
 
                 def _wm_minibatch_update(wm_ts, batch):
                     mb_idx, mb_rng = batch
                     batch_inputs = jnp.take(wm_inputs, mb_idx, axis=1)
                     batch_disp = jnp.take(wm_disp, mb_idx, axis=1)
                     batch_linvel = jnp.take(wm_linvel, mb_idx, axis=1)
+                    batch_rot = None if wm_rot is None else jnp.take(wm_rot, mb_idx, axis=1)
                     batch_done = jnp.take(wm_done, mb_idx, axis=1)
                     batch_valid = None if wm_valid is None else jnp.take(wm_valid, mb_idx, axis=1)
                     sample_rng, loss_rng = jax.random.split(mb_rng)
-                    batch_inputs, batch_disp, batch_linvel, batch_done, batch_valid = _sample_segment(
+                    batch_inputs, batch_disp, batch_linvel, batch_rot, batch_done, batch_valid = _sample_segment(
                         batch_inputs,
                         batch_disp,
                         batch_linvel,
+                        batch_rot,
                         batch_done,
                         batch_valid,
                         sample_rng,
@@ -595,9 +606,9 @@ class IPPOJax(JaxRLAlgorithmBase):
                             batch_inputs,
                             batch_disp,
                             batch_linvel,
+                            batch_rot,
                             batch_done,
                             batch_valid,
-                            int(wm_cfg.get("disp_window", 0) or 0),
                             wm_cfg.aux_vel_weight,
                             loss_rng,
                         )
@@ -863,12 +874,19 @@ class IPPOJax(JaxRLAlgorithmBase):
                 if config.get("adaptive_lr", False) else config.lr,
             }
             if world_model_metrics is not None:
+                wm_abs_count = jnp.sum(
+                    traj_batch.info.get(
+                        "wm_pred_disp_abs_count",
+                        jnp.zeros_like(traj_batch.info["wm_pred_disp_abs_dist"]),
+                    )
+                )
+                wm_abs_dist = jnp.sum(traj_batch.info["wm_pred_disp_abs_dist"]) / (wm_abs_count + 1e-8)
                 live_info.update({
                     "World Model/train_loss": world_model_metrics["wm_loss"],
                     "World Model/train_disp_rmse": world_model_metrics["wm_disp_rmse"],
                     "World Model/train_vel_rmse": world_model_metrics["wm_vel_rmse"],
-                    "World Model/rollout_disp_relative_rmse": jnp.sqrt(jnp.mean(traj_batch.info["wm_pred_disp_mse"]) + 1e-8),
-                    "World Model/rollout_disp_rmse": jnp.sqrt(jnp.mean(traj_batch.info["wm_pred_disp_abs_mse"]) + 1e-8),
+                    "World Model/rollout_disp_relative_distance": jnp.mean(traj_batch.info["wm_pred_disp_dist"]),
+                    "World Model/rollout_disp_distance": wm_abs_dist,
                     "World Model/rollout_vel_rmse": jnp.sqrt(jnp.mean(traj_batch.info["wm_pred_vel_mse"]) + 1e-8),
                 })
             jax.debug.callback(callback, metric, live_info=live_info)
@@ -1127,6 +1145,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                 wm_cfg.get("eval_mem_len", 0),
                 buffer_length=wm_cfg.get("buffer_length", 0),
                 buffer_dtype=wm_cfg.get("buffer_dtype", "bfloat16"),
-                disp_window=wm_cfg.get("disp_window", 0) or 0,
+                seg_len=wm_cfg.get("seg_len", 1),
+                inference_mode=wm_cfg.get("inference_mode", "segment"),
             )
         return env

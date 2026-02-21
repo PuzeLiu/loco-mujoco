@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-from functools import partial
 from typing import Tuple
 
 import jax
@@ -30,7 +29,7 @@ def _make_fake_data(
     obs_dim: int,
     action_dim: int,
     key: jax.random.PRNGKey,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     key, k_phase, k_freq, k_noise, k_action, k_done = jax.random.split(key, 6)
     time = jnp.linspace(0.0, 4.0 * jnp.pi, t)
     phase = jax.random.uniform(k_phase, (b, 3), minval=0.0, maxval=2.0 * jnp.pi)
@@ -38,6 +37,19 @@ def _make_fake_data(
     base_vel = jnp.sin(time[:, None, None] * freq[None, :, :] + phase[None, :, :])
     base_vel = base_vel + 0.05 * jax.random.normal(k_noise, base_vel.shape)
     base_disp = jnp.cumsum(base_vel, axis=0) * 0.05
+    yaw = 0.2 * jnp.sin(time)[:, None] + 0.1 * jax.random.normal(k_noise, (t, b))
+    cy = jnp.cos(yaw)
+    sy = jnp.sin(yaw)
+    zeros = jnp.zeros_like(cy)
+    ones = jnp.ones_like(cy)
+    base_rot = jnp.stack(
+        [
+            jnp.stack([cy, -sy, zeros], axis=-1),
+            jnp.stack([sy, cy, zeros], axis=-1),
+            jnp.stack([zeros, zeros, ones], axis=-1),
+        ],
+        axis=-2,
+    )
 
     obs = jnp.zeros((t, b, obs_dim), dtype=jnp.float32)
     if obs_dim >= 3:
@@ -52,13 +64,42 @@ def _make_fake_data(
     inputs = jnp.concatenate([obs, action], axis=-1)
 
     done = _make_done_signal(t, b, min_len=max(8, t // 8), max_len=max(12, t // 3), key=k_done)
-    return inputs, base_disp, base_vel, done
+    return inputs, base_disp, base_vel, base_rot, done
 
 
 def _reset_mask(done: jnp.ndarray) -> jnp.ndarray:
     b = done.shape[1]
     return jnp.concatenate([jnp.ones((1, b), dtype=bool), done[:-1]], axis=0)
 
+
+def _to_first_frame(
+    target_disp: jnp.ndarray,
+    target_rot: jnp.ndarray,
+    target_vel: jnp.ndarray,
+    done: jnp.ndarray,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    reset_mask = _reset_mask(done)
+
+    def _step(carry, inputs):
+        ref_disp, ref_rot = carry
+        disp_t, rot_t, vel_t, reset_t = inputs
+        reset = reset_t[:, None]
+        ref_disp = jnp.where(reset, disp_t, ref_disp)
+        ref_rot = jnp.where(reset[:, None, None], rot_t, ref_rot)
+        rel_world = disp_t - ref_disp
+        ref_rot_t = jnp.transpose(ref_rot, (0, 2, 1))
+        rel_local = jnp.einsum("bij,bj->bi", ref_rot_t, rel_world)
+        vel_local = jnp.einsum("bij,bj->bi", ref_rot_t, vel_t)
+        return (ref_disp, ref_rot), (rel_local, vel_local)
+
+    init_disp = target_disp[0]
+    init_rot = target_rot[0]
+    (_, _), (disp_local, vel_local) = jax.lax.scan(
+        _step,
+        (init_disp, init_rot),
+        (target_disp, target_rot, target_vel, reset_mask),
+    )
+    return disp_local, vel_local
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="World model fake-data test.")
@@ -71,17 +112,17 @@ def main() -> None:
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--ff-dim", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--disp-window", type=int, default=0)
     parser.add_argument("--aux-vel-weight", type=float, default=0.1)
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=str, default="wm_fake_test.png")
     parser.add_argument("--show", action="store_true")
+    parser.add_argument("--no-jit", action="store_true")
     args = parser.parse_args()
 
     key = jax.random.PRNGKey(args.seed)
-    inputs, target_disp, target_vel, done = _make_fake_data(
+    inputs, target_disp, target_vel, target_rot, done = _make_fake_data(
         args.seg_len,
         args.batch,
         args.obs_dim,
@@ -112,35 +153,37 @@ def main() -> None:
     tx = optax.adam(args.lr)
     opt_state = tx.init(params)
 
-    def loss_fn(params, rng, inputs, target_disp, target_vel, done, disp_window, aux_vel_weight):
+    def loss_fn(params, rng, inputs, target_disp, target_vel, target_rot, done, aux_vel_weight):
         return world_model_loss(
             model,
             params,
             inputs,
             target_disp,
             target_vel,
+            target_rot,
             done,
             None,
-            disp_window,
             aux_vel_weight,
             rng,
         )
 
-    @partial(jax.jit, static_argnames=("disp_window", "aux_vel_weight"))
-    def train_step(params, opt_state, rng, inputs, target_disp, target_vel, done, disp_window, aux_vel_weight):
+    def train_step(params, opt_state, rng, inputs, target_disp, target_vel, target_rot, done, aux_vel_weight):
         (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(
             params,
             rng,
             inputs,
             target_disp,
             target_vel,
+            target_rot,
             done,
-            disp_window,
             aux_vel_weight,
         )
         updates, opt_state = tx.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
         return params, opt_state, loss, metrics
+
+    if not args.no_jit:
+        train_step = jax.jit(train_step, static_argnames=("aux_vel_weight",))
 
     losses = []
     metrics = None
@@ -153,8 +196,8 @@ def main() -> None:
             inputs,
             target_disp,
             target_vel,
+            target_rot,
             done,
-            args.disp_window,
             args.aux_vel_weight,
         )
         losses.append(float(loss))
@@ -169,8 +212,14 @@ def main() -> None:
         rngs={"dropout": eval_key},
     )
 
-    disp_mse = jnp.mean((pred_disp - target_disp) ** 2)
-    vel_mse = jnp.mean((pred_vel - target_vel) ** 2)
+    target_disp_local, target_vel_local = _to_first_frame(
+        target_disp,
+        target_rot,
+        target_vel,
+        done,
+    )
+    disp_mse = jnp.mean((pred_disp - target_disp_local) ** 2)
+    vel_mse = jnp.mean((pred_vel - target_vel_local) ** 2)
     print(f"Final loss: {losses[-1]:.6f}")
     print(f"Disp MSE: {float(disp_mse):.6f} | Vel MSE: {float(vel_mse):.6f}")
     if metrics is not None:
@@ -182,10 +231,10 @@ def main() -> None:
     b0 = 0
     fig, axes = plt.subplots(3, 2, figsize=(12, 8), sharex=True)
     for i in range(3):
-        axes[i, 0].plot(t, np.array(target_disp[:, b0, i]), label="target")
+        axes[i, 0].plot(t, np.array(target_disp_local[:, b0, i]), label="target")
         axes[i, 0].plot(t, np.array(pred_disp[:, b0, i]), label="pred", alpha=0.8)
         axes[i, 0].set_ylabel(f"disp[{i}]")
-        axes[i, 1].plot(t, np.array(target_vel[:, b0, i]), label="target")
+        axes[i, 1].plot(t, np.array(target_vel_local[:, b0, i]), label="target")
         axes[i, 1].plot(t, np.array(pred_vel[:, b0, i]), label="pred", alpha=0.8)
         axes[i, 1].set_ylabel(f"vel[{i}]")
     axes[0, 0].legend()
