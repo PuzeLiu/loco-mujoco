@@ -21,7 +21,7 @@ from loco_mujoco.core.wrappers import (RichLogWrapper, NStepWrapper, RichLogEnvS
                                        NormalizeVecRewardDict, SummaryRichMetrics, WorldModelWrapper)
 from loco_mujoco.core.wrappers.mjx import BaseWrapper
 from loco_mujoco.utils import MetricsHandler, ValidationSummary
-from loco_mujoco.algorithms.common.world_model import WorldModel, world_model_loss
+from loco_mujoco.algorithms.common.world_model import WorldModel, world_model_loss, init_target_norm_stats
 from loco_mujoco.algorithms.world_model_agent import IPPOWorldConf, IPPOWorldState
 
 
@@ -351,6 +351,7 @@ class IPPOJax(JaxRLAlgorithmBase):
         world_model_enabled = world_conf is not None
         wm_obs_ind = world_conf.obs_ind if world_model_enabled else None
         wm_cfg = config.world_model if world_model_enabled else None
+        target_norm_enabled = bool(wm_cfg.get("target_norm", True)) if world_model_enabled else False
 
         stand_cfg = agent_conf.config.env.get("stand_phase", None)
         stand_phase_enabled = False
@@ -407,7 +408,10 @@ class IPPOJax(JaxRLAlgorithmBase):
                 adaptive_lr_state=None,
                 tx=world_conf.tx,
             )
-            world_model_state = IPPOWorldState(train_state=wm_ts)
+            world_model_state = IPPOWorldState(
+                train_state=wm_ts,
+                target_norm_stats=init_target_norm_stats(dim=6, dtype=jnp.float32),
+            )
 
         # INIT ENV (only if no previous env_state is provided)
         if env_state is None:
@@ -419,7 +423,13 @@ class IPPOJax(JaxRLAlgorithmBase):
 
         train_state_buffer = TrainStateBuffer.create(next(iter(train_states.values())), config.validation.num)
         if world_model_enabled:
-            env_state = env_state.replace(wm_params=world_model_state.train_state.params)
+            wm_target_mean = world_model_state.target_norm_stats["mean"]
+            wm_target_std = jnp.sqrt(world_model_state.target_norm_stats["var"] + 1e-6)
+            env_state = env_state.replace(
+                wm_params=world_model_state.train_state.params,
+                wm_target_norm_mean=wm_target_mean,
+                wm_target_norm_std=wm_target_std,
+            )
 
         # TRAIN LOOP
         def _update_step(runner_state, unused):
@@ -538,6 +548,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                     wm_valid = None
 
                 wm_ts = world_model_state.train_state
+                wm_target_norm_stats = world_model_state.target_norm_stats
                 wm_epochs = int(wm_cfg.get("epochs", 1))
                 wm_minibatch_size = int(wm_cfg.get("minibatch_size", wm_inputs.shape[1]))
                 wm_batch_size = wm_inputs.shape[1] if wm_minibatch_size >= wm_inputs.shape[1] else wm_minibatch_size
@@ -580,7 +591,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                     rot_slice = None if rot is None else _slice(rot)
                     return _slice(inputs), _slice(disp), _slice(vel), rot_slice, _slice(done), _slice(valid)
 
-                def _wm_minibatch_update(wm_ts, batch):
+                def _wm_minibatch_update(carry, batch):
+                    wm_ts, wm_target_norm_stats = carry
                     mb_idx, mb_rng = batch
                     batch_inputs = jnp.take(wm_inputs, mb_idx, axis=1)
                     batch_disp = jnp.take(wm_disp, mb_idx, axis=1)
@@ -600,7 +612,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                     )
 
                     def _wm_loss_fn(params):
-                        return world_model_loss(
+                        loss, wm_metrics, new_target_norm_stats = world_model_loss(
                             world_conf.model,
                             params,
                             batch_inputs,
@@ -611,38 +623,49 @@ class IPPOJax(JaxRLAlgorithmBase):
                             batch_valid,
                             wm_cfg.aux_vel_weight,
                             loss_rng,
+                            normalize_targets=target_norm_enabled,
+                            target_norm_stats=wm_target_norm_stats,
                         )
+                        return loss, (wm_metrics, new_target_norm_stats)
 
-                    (_, wm_metrics), wm_grads = jax.value_and_grad(
+                    (_, (wm_metrics, new_target_norm_stats)), wm_grads = jax.value_and_grad(
                         _wm_loss_fn, has_aux=True
                     )(wm_ts.params)
+                    wm_target_norm_stats = new_target_norm_stats
                     wm_ts = wm_ts.apply_gradients(grads=wm_grads)
-                    return wm_ts, wm_metrics
+                    return (wm_ts, wm_target_norm_stats), wm_metrics
 
                 def _wm_epoch_update(carry, _):
-                    wm_ts, rng = carry
+                    wm_ts, wm_target_norm_stats, rng = carry
                     rng, perm_key, mb_key = jax.random.split(rng, 3)
                     perm = jax.random.permutation(perm_key, wm_inputs.shape[1])
                     perm = perm[: wm_num_minibatches * wm_batch_size]
                     perm = perm.reshape((wm_num_minibatches, wm_batch_size))
                     mb_keys = jax.random.split(mb_key, wm_num_minibatches)
-                    wm_ts, mb_metrics = jax.lax.scan(
+                    (wm_ts, wm_target_norm_stats), mb_metrics = jax.lax.scan(
                         _wm_minibatch_update,
-                        wm_ts,
+                        (wm_ts, wm_target_norm_stats),
                         (perm, mb_keys),
                     )
                     mb_metrics = jax.tree.map(lambda x: jnp.mean(x, axis=0), mb_metrics)
-                    return (wm_ts, rng), mb_metrics
+                    return (wm_ts, wm_target_norm_stats, rng), mb_metrics
 
-                (wm_ts, wm_rng), epoch_metrics = jax.lax.scan(
+                (wm_ts, wm_target_norm_stats, wm_rng), epoch_metrics = jax.lax.scan(
                     _wm_epoch_update,
-                    (wm_ts, wm_rng),
+                    (wm_ts, wm_target_norm_stats, wm_rng),
                     None,
                     wm_epochs,
                 )
                 world_model_metrics = jax.tree.map(lambda x: jnp.mean(x, axis=0), epoch_metrics)
-                world_model_state = world_model_state.replace(train_state=wm_ts)
-                env_state = env_state.replace(wm_params=wm_ts.params)
+                world_model_state = world_model_state.replace(
+                    train_state=wm_ts,
+                    target_norm_stats=wm_target_norm_stats,
+                )
+                env_state = env_state.replace(
+                    wm_params=wm_ts.params,
+                    wm_target_norm_mean=wm_target_norm_stats["mean"],
+                    wm_target_norm_std=jnp.sqrt(wm_target_norm_stats["var"] + 1e-6),
+                )
 
             # CALCULATE ADVANTAGE
             # bootstrap values per agent

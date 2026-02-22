@@ -317,6 +317,8 @@ class WorldModelWrapperState(BaseWrapperState):
     wm_seg_ref_disp: jnp.ndarray
     wm_seg_ref_rot: jnp.ndarray
     wm_last_pred_disp: jnp.ndarray
+    wm_target_norm_mean: jnp.ndarray
+    wm_target_norm_std: jnp.ndarray
 
 
 class WorldModelWrapper(BaseWrapper):
@@ -415,6 +417,8 @@ class WorldModelWrapper(BaseWrapper):
         wm_seg_ref_disp = base_disp0
         wm_seg_ref_rot = base_rot0
         wm_last_pred_disp = base_disp0
+        wm_target_norm_mean = jnp.zeros((6,), dtype=jnp.float32)
+        wm_target_norm_std = jnp.ones((6,), dtype=jnp.float32)
         state = WorldModelWrapperState(
             env_state=env_state,
             wm_kv_cache=wm_kv_cache,
@@ -431,6 +435,8 @@ class WorldModelWrapper(BaseWrapper):
             wm_seg_ref_disp=wm_seg_ref_disp,
             wm_seg_ref_rot=wm_seg_ref_rot,
             wm_last_pred_disp=wm_last_pred_disp,
+            wm_target_norm_mean=wm_target_norm_mean,
+            wm_target_norm_std=wm_target_norm_std,
         )
         return obs, state
 
@@ -449,6 +455,8 @@ class WorldModelWrapper(BaseWrapper):
         wm_seg_ref_disp = state.wm_seg_ref_disp
         wm_seg_ref_rot = state.wm_seg_ref_rot
         wm_last_pred_disp = state.wm_last_pred_disp
+        wm_target_norm_mean = state.wm_target_norm_mean
+        wm_target_norm_std = state.wm_target_norm_std
 
         batch_size = obs.shape[0]
         pred_disp = jnp.zeros((batch_size, 3), dtype=obs.dtype)
@@ -469,8 +477,12 @@ class WorldModelWrapper(BaseWrapper):
                 train=False,
                 method=self.model.__class__.step,
             )
-            pred_disp_local = pred_disp
-            pred_vel_local = pred_vel
+            disp_mean = wm_target_norm_mean[:3].astype(pred_disp.dtype).reshape((1, 3))
+            vel_mean = wm_target_norm_mean[3:6].astype(pred_vel.dtype).reshape((1, 3))
+            disp_std = wm_target_norm_std[:3].astype(pred_disp.dtype).reshape((1, 3))
+            vel_std = wm_target_norm_std[3:6].astype(pred_vel.dtype).reshape((1, 3))
+            pred_disp_local = pred_disp * disp_std + disp_mean
+            pred_vel_local = pred_vel * vel_std + vel_mean
 
         def _set_pred_disp(env_state):
             fields = getattr(env_state, "__dataclass_fields__", {})
@@ -560,6 +572,8 @@ class WorldModelWrapper(BaseWrapper):
             wm_seg_ref_disp=wm_seg_ref_disp,
             wm_seg_ref_rot=wm_seg_ref_rot,
             wm_last_pred_disp=wm_last_pred_disp,
+            wm_target_norm_mean=wm_target_norm_mean,
+            wm_target_norm_std=wm_target_norm_std,
         )
         return next_obs, reward, absorbing, done, info, state
 

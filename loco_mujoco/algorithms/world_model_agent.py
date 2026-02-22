@@ -13,7 +13,7 @@ from flax import struct
 from omegaconf import DictConfig, OmegaConf
 
 from loco_mujoco.algorithms.common.dataclasses import TrainState
-from loco_mujoco.algorithms.common.world_model import WorldModel
+from loco_mujoco.algorithms.common.world_model import WorldModel, init_target_norm_stats
 
 
 def _resolve_dtype(dtype):
@@ -96,9 +96,13 @@ class IPPOWorldConf:
 @struct.dataclass
 class IPPOWorldState:
     train_state: TrainState
+    target_norm_stats: dict = struct.field(pytree_node=True, default_factory=lambda: init_target_norm_stats(dim=6, dtype=jnp.float32))
 
     def serialize(self) -> dict:
-        return {"train_state": flax.serialization.to_state_dict(self.train_state)}
+        return {
+            "train_state": flax.serialization.to_state_dict(self.train_state),
+            "target_norm_stats": flax.serialization.to_state_dict(self.target_norm_stats),
+        }
 
     @classmethod
     def from_dict(cls, d: dict, conf: IPPOWorldConf) -> "IPPOWorldState":
@@ -107,7 +111,12 @@ class IPPOWorldState:
             tx=conf.tx,
             **d["train_state"],
         )
-        return cls(train_state=ts)
+        if "target_norm_stats" in d:
+            stats_template = init_target_norm_stats(dim=6, dtype=jnp.float32)
+            target_norm_stats = flax.serialization.from_state_dict(stats_template, d["target_norm_stats"])
+        else:
+            target_norm_stats = init_target_norm_stats(dim=6, dtype=jnp.float32)
+        return cls(train_state=ts, target_norm_stats=target_norm_stats)
 
 
 def save_world_model(path: str | Path,

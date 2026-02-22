@@ -154,7 +154,7 @@ def main() -> None:
     opt_state = tx.init(params)
 
     def loss_fn(params, rng, inputs, target_disp, target_vel, target_rot, done, aux_vel_weight):
-        return world_model_loss(
+        loss, metrics, _ = world_model_loss(
             model,
             params,
             inputs,
@@ -166,6 +166,7 @@ def main() -> None:
             aux_vel_weight,
             rng,
         )
+        return loss, metrics
 
     def train_step(params, opt_state, rng, inputs, target_disp, target_vel, target_rot, done, aux_vel_weight):
         (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(
