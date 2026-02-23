@@ -14,20 +14,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from loco_mujoco.algorithms.common.dataclasses import TrainState
 from loco_mujoco.algorithms.common.world_model import WorldModel, init_target_norm_stats
-
-
-def _resolve_dtype(dtype):
-    if dtype is None:
-        return jnp.float32
-    if isinstance(dtype, str):
-        name = dtype.lower()
-        if name in ("bf16", "bfloat16"):
-            return jnp.bfloat16
-        if name in ("fp16", "float16"):
-            return jnp.float16
-        if name in ("fp32", "float32"):
-            return jnp.float32
-    return dtype
+from loco_mujoco.core.utils.backend import resolve_dtype
 
 
 def _get_world_model_optimizer(config: DictConfig):
@@ -59,8 +46,7 @@ class IPPOWorldConf:
     def from_dict(cls, d: dict) -> "IPPOWorldConf":
         config = OmegaConf.create(d["config"])
         wm_cfg = config.experiment.world_model
-        wm_dtype = _resolve_dtype(wm_cfg.get("dtype", "float32"))
-        wm_param_dtype = _resolve_dtype(wm_cfg.get("param_dtype", wm_dtype))
+        wm_dtype = resolve_dtype(wm_cfg.get("dtype", "float32"))
         mamba_dt_rank = wm_cfg.get("mamba_dt_rank", 1)
         if mamba_dt_rank is None:
             mamba_dt_rank = 1
@@ -84,7 +70,6 @@ class IPPOWorldConf:
             mamba_dt_min=float(mamba_dt_min),
             mamba_dt_max=float(mamba_dt_max),
             dtype=wm_dtype,
-            param_dtype=wm_param_dtype,
         )
         model = flax.serialization.from_state_dict(model, d["model"])
         obs_ind = jnp.array(d.get("obs_ind", wm_cfg.get("obs_ind", [])), dtype=jnp.int32)

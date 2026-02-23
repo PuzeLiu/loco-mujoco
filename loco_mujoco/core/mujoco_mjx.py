@@ -102,6 +102,8 @@ class Mjx(Mujoco):
         absorbing = jnp.array(False, dtype=bool)
         done = jnp.array(False, dtype=bool)
         info = self._mjx_reset_info_dictionary(obs, data, subkey)
+        # replace base rot in info
+        info["base_rot"] = carry.base_site_rot0
         carry = carry.replace(final_info=info)
 
         return MjxState(data=data, observation=obs, reward=reward, absorbing=absorbing, done=done,

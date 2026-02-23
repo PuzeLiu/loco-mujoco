@@ -21,22 +21,9 @@ from loco_mujoco.core.wrappers import (RichLogWrapper, NStepWrapper, RichLogEnvS
                                        NormalizeVecRewardDict, SummaryRichMetrics, WorldModelWrapper)
 from loco_mujoco.core.wrappers.mjx import BaseWrapper
 from loco_mujoco.utils import MetricsHandler, ValidationSummary
+from loco_mujoco.core.utils.backend import resolve_dtype
 from loco_mujoco.algorithms.common.world_model import WorldModel, world_model_loss, init_target_norm_stats
 from loco_mujoco.algorithms.world_model_agent import IPPOWorldConf, IPPOWorldState
-
-
-def _resolve_dtype(dtype):
-    if dtype is None:
-        return jnp.float32
-    if isinstance(dtype, str):
-        name = dtype.lower()
-        if name in ("bf16", "bfloat16"):
-            return jnp.bfloat16
-        if name in ("fp16", "float16"):
-            return jnp.float16
-        if name in ("fp32", "float32"):
-            return jnp.float32
-    return dtype
 
 
 def _scatter_actions(num_envs: int,
@@ -221,43 +208,20 @@ class IPPOJax(JaxRLAlgorithmBase):
         if wm_cfg is None or not wm_cfg.get("enabled", False):
             return None
 
+        assert wm_cfg.get("obs_group", None) is not None, "World model obs_group or obs_ind must be configured."
         obs_group = wm_cfg.get("obs_group", None)
-        obs_ind = None
-        if obs_group is not None:
-            obs_ind = env.obs_container.get_obs_ind_by_group(obs_group)
-            if obs_ind.size == 0:
-                raise ValueError(f"World model obs_group '{obs_group}' produced empty indices.")
-        else:
-            obs_cfg = wm_cfg.get("obs_ind", None)
-            if obs_cfg is not None and len(obs_cfg) > 0:
-                obs_ind = jnp.array(obs_cfg, dtype=jnp.int32)
-
-        if obs_ind is None:
-            raise ValueError("World model obs_group/obs_ind not configured.")
-
+        obs_ind = env.obs_container.get_obs_ind_by_group(obs_group)
+        if obs_ind.size == 0:
+            raise ValueError(f"World model obs_group '{obs_group}' produced empty indices.")
         obs_ind = jnp.array(obs_ind, dtype=jnp.int32)
         input_dim = int(obs_ind.shape[0])
-        if hasattr(env, "info") and hasattr(env.info, "action_space"):
-            action_dim = int(env.info.action_space.shape[0])
-        else:
-            action_dim = int(env.action_dim)
+        action_dim = int(env.info.action_space.shape[0])
         input_dim += action_dim
         with open_dict(config.experiment.world_model):
             config.experiment.world_model.obs_ind = obs_ind.tolist()
             config.experiment.world_model.input_dim = input_dim
             config.experiment.world_model.action_dim = action_dim
 
-        wm_dtype = _resolve_dtype(wm_cfg.get("dtype", "bfloat16"))
-        wm_param_dtype = _resolve_dtype(wm_cfg.get("param_dtype", wm_dtype))
-        mamba_dt_rank = wm_cfg.get("mamba_dt_rank", 1)
-        if mamba_dt_rank is None:
-            mamba_dt_rank = 1
-        mamba_dt_min = wm_cfg.get("mamba_dt_min", 1e-4)
-        if mamba_dt_min is None:
-            mamba_dt_min = 1e-4
-        mamba_dt_max = wm_cfg.get("mamba_dt_max", 1.0)
-        if mamba_dt_max is None:
-            mamba_dt_max = 1.0
         model = WorldModel(
             input_dim=input_dim,
             model_dim=wm_cfg.model_dim,
@@ -268,11 +232,10 @@ class IPPOJax(JaxRLAlgorithmBase):
             mamba_expand=wm_cfg.get("mamba_expand", None),
             mamba_d_state=wm_cfg.get("mamba_d_state", None),
             mamba_d_conv=wm_cfg.get("mamba_d_conv", None),
-            mamba_dt_rank=int(mamba_dt_rank),
-            mamba_dt_min=float(mamba_dt_min),
-            mamba_dt_max=float(mamba_dt_max),
-            dtype=wm_dtype,
-            param_dtype=wm_param_dtype,
+            mamba_dt_rank=int(wm_cfg.mamba_dt_rank),
+            mamba_dt_min=float(wm_cfg.mamba_dt_min),
+            mamba_dt_max=float(wm_cfg.mamba_dt_max),
+            dtype=resolve_dtype(wm_cfg.get("dtype", "float32")),
         )
         tx = cls._get_world_model_optimizer(config)
         return IPPOWorldConf(
@@ -525,27 +488,17 @@ class IPPOJax(JaxRLAlgorithmBase):
             if world_model_enabled:
                 # Train world model on pre-step observations + action to match info targets.
                 rng, wm_rng = jax.random.split(rng)
-                use_wm_buffer = int(wm_cfg.get("buffer_length", 0)) > 0
-                if use_wm_buffer:
-                    wm_inputs = env_state.wm_buffer_inputs
-                    wm_disp = env_state.wm_buffer_disp
-                    wm_linvel = env_state.wm_buffer_vel
-                    wm_rot = env_state.wm_buffer_rot
-                    wm_done = env_state.wm_buffer_done
-                    wm_valid = env_state.wm_buffer_valid
-                    wm_done = jnp.where(
-                        wm_valid > 0,
-                        wm_done,
-                        jnp.ones_like(wm_done, dtype=bool),
-                    )
-                else:
-                    wm_obs = traj_batch.obs[..., wm_obs_ind]
-                    wm_inputs = jnp.concatenate([wm_obs, traj_batch.action], axis=-1)
-                    wm_disp = traj_batch.info["base_disp"]
-                    wm_linvel = traj_batch.info["base_linvel"]
-                    wm_rot = traj_batch.info["base_rot"]
-                    wm_done = traj_batch.done
-                    wm_valid = None
+                wm_inputs = env_state.wm_buffer_inputs
+                wm_disp = env_state.wm_buffer_disp
+                wm_linvel = env_state.wm_buffer_vel
+                wm_rot = env_state.wm_buffer_rot
+                wm_done = env_state.wm_buffer_done
+                wm_valid = env_state.wm_buffer_valid
+                wm_done = jnp.where(
+                    wm_valid > 0,
+                    wm_done,
+                    jnp.ones_like(wm_done, dtype=bool),
+                )
 
                 wm_ts = world_model_state.train_state
                 wm_target_norm_stats = world_model_state.target_norm_stats
@@ -554,33 +507,13 @@ class IPPOJax(JaxRLAlgorithmBase):
                 wm_batch_size = wm_inputs.shape[1] if wm_minibatch_size >= wm_inputs.shape[1] else wm_minibatch_size
                 wm_num_minibatches = 1 if wm_batch_size == wm_inputs.shape[1] else wm_inputs.shape[1] // wm_batch_size
                 seg_len = int(wm_cfg.seg_len)
-
-                def _pad_time(x, pad_len, pad_value):
-                    if pad_len <= 0:
-                        return x
-                    pad_shape = (pad_len,) + x.shape[1:]
-                    pad = jnp.full(pad_shape, pad_value, dtype=x.dtype)
-                    return jnp.concatenate([x, pad], axis=0)
+                assert wm_inputs.shape[0] >= seg_len, "World model input sequence length must be greater than or equal to segment length."
 
                 def _sample_segment(inputs, disp, vel, rot, done, valid, rng):
                     t = inputs.shape[0]
                     b = inputs.shape[1]
                     if valid is None:
                         valid = jnp.ones((t, b), dtype=inputs.dtype)
-                    if t < seg_len:
-                        pad_len = seg_len - t
-                        inputs = _pad_time(inputs, pad_len, 0.0)
-                        disp = _pad_time(disp, pad_len, 0.0)
-                        vel = _pad_time(vel, pad_len, 0.0)
-                        if rot is not None:
-                            pad_rot = jnp.broadcast_to(
-                                jnp.eye(3, dtype=rot.dtype),
-                                (pad_len, rot.shape[1], 3, 3),
-                            )
-                            rot = jnp.concatenate([rot, pad_rot], axis=0)
-                        done = _pad_time(done, pad_len, True)
-                        valid = _pad_time(valid, pad_len, 0.0)
-                        t = seg_len
                     max_start = t - seg_len + 1
                     start = jax.random.randint(rng, (), 0, max_start)
 
@@ -906,6 +839,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                 wm_abs_dist = jnp.sum(traj_batch.info["wm_pred_disp_abs_dist"]) / (wm_abs_count + 1e-8)
                 live_info.update({
                     "World Model/train_loss": world_model_metrics["wm_loss"],
+                    "World Model/train_delta_consistency_loss": world_model_metrics["wm_delta_consistency_loss"],
                     "World Model/train_disp_rmse": world_model_metrics["wm_disp_rmse"],
                     "World Model/train_vel_rmse": world_model_metrics["wm_vel_rmse"],
                     "World Model/rollout_disp_relative_distance": jnp.mean(traj_batch.info["wm_pred_disp_dist"]),
@@ -929,78 +863,10 @@ class IPPOJax(JaxRLAlgorithmBase):
         world_state = runner_state[1]
         env_state_out = runner_state[2]
 
-        # Single evaluation after training completes
-        if mh is not None:
-            final_train_states = runner_state[0]
-            final_rng = runner_state[5]
-            
-            def _final_eval_env(runner_state, unused):
-                train_states, env_state, last_obs, train_state_buffer, rng = runner_state
-
-                # SELECT ACTION
-                rng, _rng = jax.random.split(rng)
-                agent_actions = {}
-                new_train_states = dict(train_states)
-
-                keys = jax.random.split(_rng, len(agent_names) + 1)
-                rng_next = keys[0]
-                agent_keys = keys[1:]
-
-                for name, k in zip(agent_names, agent_keys):
-                    ts = new_train_states[name]
-                    net = agent_conf.networks[name]
-
-                    y, updates = net.apply(
-                        {"params": ts.params, "run_stats": ts.run_stats},
-                        last_obs,
-                        mutable=["run_stats"],
-                    )
-                    pi, _ = y
-                    ts = ts.replace(run_stats=updates["run_stats"])
-                    a = pi.sample(seed=k)
-
-                    agent_actions[name] = a
-                    new_train_states[name] = ts
-
-                action = _scatter_actions(
-                    config.validation.num_envs,
-                    env.info.action_space.shape[0],
-                    agent_actions,
-                    agent_action_idx
-                )
-                # STEP ENV
-                obsv, reward, absorbing, done, info, env_state = env.step(env_state, action)
-
-                # GET METRICS
-                log_env_state = env_state.find(RichLogEnvState)
-                logged_metrics = log_env_state.metrics
-
-                transition = MetricHandlerTransition(env_state, logged_metrics)
-
-                runner_state = (new_train_states, env_state, obsv, train_state_buffer, rng_next)
-                return runner_state, transition
-
-            eval_rng = final_rng
-            reset_rng = jax.random.split(eval_rng, config.validation.num_envs)
-            obsv, eval_env_state = env.reset(reset_rng, env_id=jnp.arange(config.validation.num_envs))
-            train_state_buffer = TrainStateBuffer.create(next(iter(final_train_states.values())), config.validation.num)
-            runner_state_eval = (final_train_states, eval_env_state, obsv, train_state_buffer, eval_rng)
-
-            # do evaluation runs
-            _, traj_batch_eval = jax.lax.scan(
-                _final_eval_env, runner_state_eval, None, config.validation.num_steps
-            )
-
-            env_states = traj_batch_eval.env_state
-            validation_metrics = mh(env_states)
-        else:
-            validation_metrics = ValidationSummary()
-
         return {"agent_state": agent_state,
                 "world_state": world_state,
                 "env_state": env_state_out,
                 "training_metrics": metric,
-                "validation_metrics": validation_metrics,
                 "global_timesteps": global_timesteps}
 
     @classmethod
@@ -1165,10 +1031,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                 env,
                 world_conf.model,
                 world_conf.obs_ind,
-                wm_cfg.get("eval_mem_len", 0),
                 buffer_length=wm_cfg.get("buffer_length", 0),
                 buffer_dtype=wm_cfg.get("buffer_dtype", "bfloat16"),
                 seg_len=wm_cfg.get("seg_len", 1),
-                inference_mode=wm_cfg.get("inference_mode", "segment"),
             )
         return env

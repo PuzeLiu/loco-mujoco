@@ -8,8 +8,9 @@ import jax
 import jax.numpy as jnp
 from flax import struct
 
-from loco_mujoco.core.mujoco_mjx import Mjx, MjxState
+from loco_mujoco.core.mujoco_mjx import MjxState, Mjx
 from loco_mujoco.core.utils.env import Box
+from loco_mujoco.core.utils.backend import resolve_dtype
 
 if TYPE_CHECKING:
     from loco_mujoco.algorithms.common.world_model import WorldModel
@@ -327,33 +328,16 @@ class WorldModelWrapper(BaseWrapper):
                  env,
                  model: "WorldModel",
                  wm_obs_ind: jnp.ndarray,
-                 eval_mem_len: int,
-                 buffer_length: int = 0,
+                 buffer_length: int,
                  buffer_dtype: Any = jnp.float32,
-                 seg_len: int = 1,
-                 inference_mode: str = "segment"):
+                 seg_len: int = 1):
         super().__init__(env)
         self.model = model
         self.wm_obs_ind = wm_obs_ind
-        self.eval_mem_len = int(eval_mem_len)
         self.buffer_length = int(buffer_length)
-        self.buffer_dtype = self._resolve_buffer_dtype(buffer_dtype)
+        self.buffer_dtype = resolve_dtype(buffer_dtype)
         self.seg_len = max(1, int(seg_len))
-        self.inference_mode = "segment"
-        requested_mode = str(inference_mode or "segment")
-        if requested_mode != "segment":
-            raise ValueError("Only segment world model inference mode is supported.")
-
-    def _resolve_buffer_dtype(self, buffer_dtype):
-        if isinstance(buffer_dtype, str):
-            name = buffer_dtype.lower()
-            if name in ("float16", "fp16"):
-                return jnp.float16
-            if name in ("bfloat16", "bf16"):
-                return jnp.bfloat16
-            if name in ("float32", "fp32"):
-                return jnp.float32
-        return buffer_dtype
+        assert self.buffer_length > 0, "Buffer length must be greater than 0."
 
     def _build_inputs(self, obs, action):
         wm_obs = obs[..., self.wm_obs_ind]
@@ -389,28 +373,18 @@ class WorldModelWrapper(BaseWrapper):
         batch_size = obs.shape[0]
         info = getattr(env_state, "info", {})
         base_disp0 = info.get("base_disp", jnp.zeros((batch_size, 3), dtype=obs.dtype))
-        base_rot0 = info.get(
-            "base_rot",
-            jnp.broadcast_to(jnp.eye(3, dtype=obs.dtype), (batch_size, 3, 3)),
-        )
+        base_rot0 = info.get("base_rot", jnp.broadcast_to(jnp.eye(3, dtype=obs.dtype), (batch_size, 3, 3)))
         wm_kv_cache = self.model.init_cache(batch_size)
-        if self.buffer_length > 0:
-            wm_buffer_inputs = jnp.zeros(
-                (self.buffer_length, batch_size, self.model.input_dim),
-                dtype=self.buffer_dtype,
-            )
-            wm_buffer_disp = jnp.zeros((self.buffer_length, batch_size, 3), dtype=self.buffer_dtype)
-            wm_buffer_rot = jnp.zeros((self.buffer_length, batch_size, 3, 3), dtype=self.buffer_dtype)
-            wm_buffer_vel = jnp.zeros((self.buffer_length, batch_size, 3), dtype=self.buffer_dtype)
-            wm_buffer_done = jnp.zeros((self.buffer_length, batch_size), dtype=bool)
-            wm_buffer_valid = jnp.zeros((self.buffer_length, batch_size), dtype=self.buffer_dtype)
-        else:
-            wm_buffer_inputs = jnp.zeros((0, batch_size, self.model.input_dim), dtype=obs.dtype)
-            wm_buffer_disp = jnp.zeros((0, batch_size, 3), dtype=obs.dtype)
-            wm_buffer_rot = jnp.zeros((0, batch_size, 3, 3), dtype=obs.dtype)
-            wm_buffer_vel = jnp.zeros((0, batch_size, 3), dtype=obs.dtype)
-            wm_buffer_done = jnp.zeros((0, batch_size), dtype=bool)
-            wm_buffer_valid = jnp.zeros((0, batch_size), dtype=obs.dtype)
+        wm_buffer_inputs = jnp.zeros(
+            (self.buffer_length, batch_size, self.model.input_dim),
+            dtype=self.buffer_dtype,
+        )
+        wm_buffer_disp = jnp.zeros((self.buffer_length, batch_size, 3), dtype=self.buffer_dtype)
+        wm_buffer_rot = jnp.zeros((self.buffer_length, batch_size, 3, 3), dtype=self.buffer_dtype)
+        wm_buffer_vel = jnp.zeros((self.buffer_length, batch_size, 3), dtype=self.buffer_dtype)
+        wm_buffer_done = jnp.zeros((self.buffer_length, batch_size), dtype=bool)
+        wm_buffer_valid = jnp.zeros((self.buffer_length, batch_size), dtype=self.buffer_dtype)
+
         wm_disp_steps_since_done = jnp.zeros((batch_size,), dtype=jnp.int32)
         wm_base_rot0 = base_rot0
         wm_seg_steps = jnp.zeros((batch_size,), dtype=jnp.int32)
@@ -537,21 +511,20 @@ class WorldModelWrapper(BaseWrapper):
         info["wm_pred_disp_abs_count"] = wm_pred_disp_abs_count
         info["wm_pred_vel_mse"] = wm_pred_vel_mse
 
-        if self.buffer_length > 0:
-            wm_inputs = self._build_inputs(obs, action).astype(self.buffer_dtype)
-            wm_buffer_inputs = jnp.roll(wm_buffer_inputs, shift=-1, axis=0)
-            wm_buffer_disp = jnp.roll(wm_buffer_disp, shift=-1, axis=0)
-            wm_buffer_rot = jnp.roll(wm_buffer_rot, shift=-1, axis=0)
-            wm_buffer_vel = jnp.roll(wm_buffer_vel, shift=-1, axis=0)
-            wm_buffer_done = jnp.roll(wm_buffer_done, shift=-1, axis=0)
-            wm_buffer_valid = jnp.roll(wm_buffer_valid, shift=-1, axis=0)
+        wm_inputs = self._build_inputs(obs, action).astype(self.buffer_dtype)
+        wm_buffer_inputs = jnp.roll(wm_buffer_inputs, shift=-1, axis=0)
+        wm_buffer_disp = jnp.roll(wm_buffer_disp, shift=-1, axis=0)
+        wm_buffer_rot = jnp.roll(wm_buffer_rot, shift=-1, axis=0)
+        wm_buffer_vel = jnp.roll(wm_buffer_vel, shift=-1, axis=0)
+        wm_buffer_done = jnp.roll(wm_buffer_done, shift=-1, axis=0)
+        wm_buffer_valid = jnp.roll(wm_buffer_valid, shift=-1, axis=0)
 
-            wm_buffer_inputs = wm_buffer_inputs.at[-1].set(wm_inputs)
-            wm_buffer_disp = wm_buffer_disp.at[-1].set(info["base_disp"].astype(self.buffer_dtype))
-            wm_buffer_rot = wm_buffer_rot.at[-1].set(info["base_rot"].astype(self.buffer_dtype))
-            wm_buffer_vel = wm_buffer_vel.at[-1].set(info["base_linvel"].astype(self.buffer_dtype))
-            wm_buffer_done = wm_buffer_done.at[-1].set(done)
-            wm_buffer_valid = wm_buffer_valid.at[-1].set(jnp.ones_like(done, dtype=wm_buffer_valid.dtype))
+        wm_buffer_inputs = wm_buffer_inputs.at[-1].set(wm_inputs)
+        wm_buffer_disp = wm_buffer_disp.at[-1].set(info["base_disp"].astype(self.buffer_dtype))
+        wm_buffer_rot = wm_buffer_rot.at[-1].set(info["base_rot"].astype(self.buffer_dtype))
+        wm_buffer_vel = wm_buffer_vel.at[-1].set(info["base_linvel"].astype(self.buffer_dtype))
+        wm_buffer_done = wm_buffer_done.at[-1].set(done)
+        wm_buffer_valid = wm_buffer_valid.at[-1].set(jnp.ones_like(done, dtype=wm_buffer_valid.dtype))
 
         env_state = _set_pred_disp(env_state)
 

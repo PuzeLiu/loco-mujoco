@@ -175,7 +175,9 @@ def world_model_loss(model: WorldModel,
                      *,
                      normalize_targets: bool = False,
                      target_norm_stats: Optional[Dict[str, jnp.ndarray]] = None,
-                     target_norm_eps: float = 1e-6):
+                     target_norm_eps: float = 1e-6,
+                     delta_consistency_weight: float = 0.1,
+                     delta_consistency_lags: Tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64),):
     """
     Compute loss for the Mamba world model.
 
@@ -298,7 +300,64 @@ def world_model_loss(model: WorldModel,
     disp_loss_raw = jnp.sum(disp_err_raw * valid_f) / (count + 1e-8)
     vel_loss_raw = jnp.sum(vel_err_raw * valid_f) / (count + 1e-8)
 
-    total_loss = disp_loss + aux_vel_weight * vel_loss
+    # =========================
+    # NEW: delta-sum consistency loss (multi-lag)
+    # Enforce (pred_disp[t] - pred_disp[t-k]) ~ (target_disp[t] - target_disp[t-k])
+    # while ignoring pairs that cross resets and padded timesteps.
+    # =========================
+    def _no_reset_cross_mask(reset_mask_bool: jnp.ndarray, k: int) -> jnp.ndarray:
+        """
+        reset_mask_bool: (T,B) boolean; True indicates reset at that timestep.
+        Returns mask (T,B) where True means the interval (t-k+1..t) has NO resets.
+        For t < k, mask is False (invalid).
+        """
+        r = reset_mask_bool.astype(jnp.int32)  # (T,B)
+        c = jnp.cumsum(r, axis=0)              # (T,B)
+        # sum of resets in (t-k+1..t) = c[t] - c[t-k]
+        c_shift = jnp.concatenate([jnp.zeros((k, b), dtype=c.dtype), c[:-k]], axis=0)
+        window_sum = c - c_shift               # (T,B)
+        ok = window_sum == 0
+        # first k steps don't have a full window
+        ok = ok.at[:k].set(False)
+        return ok
+
+    reset_bool = reset_mask.astype(bool)  # (T,B)
+
+    delta_consistency_loss = jnp.array(0.0, dtype=jnp.float32)
+    delta_terms = 0.0
+
+    for k in delta_consistency_lags:
+        # skip lags longer than segment
+        if k <= 0 or k >= t:
+            continue
+
+        # (T,B,3) deltas, but only valid for t>=k
+        pred_delta = pred_disp_f - jnp.concatenate([pred_disp_f[:k], pred_disp_f[:-k]], axis=0)
+        targ_delta = y_disp_f    - jnp.concatenate([y_disp_f[:k],    y_disp_f[:-k]],    axis=0)
+
+        # masks: valid at both endpoints + no reset crossing inside window
+        ok_no_reset = _no_reset_cross_mask(reset_bool, k).astype(jnp.float32)  # (T,B)
+        ok_valid = (valid_f *
+                    jnp.concatenate([jnp.zeros((k, b), dtype=valid_f.dtype), valid_f[:-k]], axis=0))
+        w = ok_valid * ok_no_reset  # (T,B)
+
+        # per-step mse on delta (T,B)
+        delta_err = jnp.mean((pred_delta - targ_delta) ** 2, axis=-1)
+
+        denom = jnp.sum(w) + 1e-8
+        delta_k_loss = jnp.sum(delta_err * w) / denom
+
+        delta_consistency_loss = delta_consistency_loss + delta_k_loss
+        delta_terms = delta_terms + 1.0
+
+    # average across lags actually used
+    delta_consistency_loss = delta_consistency_loss / (delta_terms + 1e-8)
+
+    # =========================
+    # Total loss
+    # =========================
+    total_loss = disp_loss + aux_vel_weight * vel_loss + delta_consistency_weight * delta_consistency_loss
+    # total_loss = disp_loss + aux_vel_weight * vel_loss
 
     metrics = {
         "wm_disp_mse": disp_loss_raw,
@@ -306,6 +365,7 @@ def world_model_loss(model: WorldModel,
         "wm_loss": total_loss,
         "wm_disp_rmse": jnp.sqrt(disp_loss_raw + 1e-8),
         "wm_vel_rmse": jnp.sqrt(vel_loss_raw + 1e-8),
+        "wm_delta_consistency_loss": delta_consistency_loss,
     }
     if normalize_targets:
         metrics["wm_disp_mse_norm"] = disp_loss
