@@ -21,7 +21,6 @@ from loco_mujoco.core.wrappers import (RichLogWrapper, NStepWrapper, RichLogEnvS
                                        NormalizeVecRewardDict, SummaryRichMetrics, WorldModelWrapper)
 from loco_mujoco.core.wrappers.mjx import BaseWrapper
 from loco_mujoco.utils import MetricsHandler, ValidationSummary
-from loco_mujoco.core.utils.backend import resolve_dtype
 from loco_mujoco.algorithms.common.world_model import WorldModel, world_model_loss, init_target_norm_stats
 from loco_mujoco.algorithms.world_model_agent import IPPOWorldConf, IPPOWorldState
 
@@ -235,7 +234,6 @@ class IPPOJax(JaxRLAlgorithmBase):
             mamba_dt_rank=int(wm_cfg.mamba_dt_rank),
             mamba_dt_min=float(wm_cfg.mamba_dt_min),
             mamba_dt_max=float(wm_cfg.mamba_dt_max),
-            dtype=resolve_dtype(wm_cfg.get("dtype", "float32")),
         )
         tx = cls._get_world_model_optimizer(config)
         return IPPOWorldConf(
@@ -362,7 +360,7 @@ class IPPOJax(JaxRLAlgorithmBase):
 
         if world_model_enabled and world_model_state is None:
             rng, subkey = jax.random.split(rng)
-            dummy_x = jnp.zeros((1, 1, wm_cfg.input_dim), dtype=world_conf.model.dtype)
+            dummy_x = jnp.zeros((1, 1, wm_cfg.input_dim), dtype=jnp.float32)
             params = world_conf.model.init(subkey, dummy_x, mems=None, attn_mask=None, train=False)
             wm_ts = TrainState.create(
                 apply_fn=world_conf.model.apply,

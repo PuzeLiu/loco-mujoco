@@ -1,4 +1,4 @@
-from typing import Any, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -15,12 +15,6 @@ def mamba_dims(model_dim: int, ff_dim: int, n_heads: int) -> Tuple[int, int, int
     return d_inner, d_state, d_conv
 
 
-def _state_dtype(dtype: Any) -> Any:
-    if dtype in (jnp.float16, jnp.bfloat16):
-        return jnp.float32
-    return dtype
-
-
 def _init_a_log(key, shape, dtype=jnp.float32):
     d_inner, d_state = shape
     vals = jnp.log(jnp.arange(1, d_state + 1, dtype=dtype))
@@ -33,23 +27,20 @@ class MambaLayer(nn.Module):
     d_state: int
     d_conv: int
     dropout: float = 0.0
-    dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
     dt_rank: int = 1
     dt_min: float = 1e-4
     dt_max: float = 1.0
 
     def setup(self):
-        self.norm = nn.LayerNorm(dtype=jnp.float32, param_dtype=self.param_dtype)
-        self.in_proj = nn.Dense(self.d_inner * 2, use_bias=False, dtype=self.dtype, param_dtype=self.param_dtype)
+        self.norm = nn.LayerNorm(dtype=jnp.float32)
+        self.in_proj = nn.Dense(self.d_inner * 2, use_bias=False, dtype=jnp.float32)
         self.x_proj = nn.Dense(
             self.dt_rank + 2 * self.d_state,
             use_bias=False,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
+            dtype=jnp.float32,
         )
-        self.dt_proj = nn.Dense(self.d_inner, use_bias=True, dtype=self.dtype, param_dtype=self.param_dtype)
-        self.out_proj = nn.Dense(self.model_dim, dtype=self.dtype, param_dtype=self.param_dtype)
+        self.dt_proj = nn.Dense(self.d_inner, use_bias=True, dtype=jnp.float32)
+        self.out_proj = nn.Dense(self.model_dim, dtype=jnp.float32)
         self.dropout_layer = nn.Dropout(rate=self.dropout)
 
         conv_init = nn.initializers.normal(stddev=0.02)
@@ -58,13 +49,10 @@ class MambaLayer(nn.Module):
         self.A_log = self.param("A_log", _init_a_log, (self.d_inner, self.d_state))
         self.D = self.param("D", nn.initializers.ones, (self.d_inner,))
 
-    def _init_state(self, batch_size: int, x_dtype: Any) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    def _init_state(self, batch_size: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
         conv_len = max(self.d_conv - 1, 0)
-        conv_state = jnp.zeros((batch_size, conv_len, self.d_inner), dtype=x_dtype)
-        ssm_state = jnp.zeros(
-            (batch_size, self.d_inner, self.d_state),
-            dtype=_state_dtype(self.dtype),
-        )
+        conv_state = jnp.zeros((batch_size, conv_len, self.d_inner), dtype=jnp.float32)
+        ssm_state = jnp.zeros((batch_size, self.d_inner, self.d_state), dtype=jnp.float32)
         return conv_state, ssm_state
 
     def _conv_step(self, x_t: jnp.ndarray, conv_state: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
@@ -102,7 +90,7 @@ class MambaLayer(nn.Module):
         y_t = jnp.sum(ssm_f * c_f[:, None, :], axis=-1) + d_f[None, :] * u_f
 
         ssm_state = ssm_f.astype(ssm_state.dtype)
-        return y_t.astype(self.dtype), ssm_state
+        return y_t, ssm_state
 
     def _clamp_dt(self, dt: jnp.ndarray) -> jnp.ndarray:
         return jnp.clip(dt, a_min=self.dt_min, a_max=self.dt_max)
@@ -115,15 +103,15 @@ class MambaLayer(nn.Module):
         train: bool,
     ) -> Tuple[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
         t, b = x.shape[0], x.shape[1]
-        h = self.norm(x.astype(jnp.float32)).astype(self.dtype)
+        h = self.norm(x.astype(jnp.float32))
         xz = self.in_proj(h)
         x_in, z = jnp.split(xz, 2, axis=-1)
         # Prime parameter creation outside scan to avoid tracer leaks.
-        _ = self.x_proj(jnp.zeros((1, self.d_inner), dtype=self.dtype))
-        _ = self.dt_proj(jnp.zeros((1, self.dt_rank), dtype=self.dtype))
+        _ = self.x_proj(jnp.zeros((1, self.d_inner), dtype=jnp.float32))
+        _ = self.dt_proj(jnp.zeros((1, self.dt_rank), dtype=jnp.float32))
 
         if state is None:
-            conv_state, ssm_state = self._init_state(b, x_in.dtype)
+            conv_state, ssm_state = self._init_state(b)
         else:
             conv_state, ssm_state = state
 
@@ -174,12 +162,12 @@ class MambaLayer(nn.Module):
         train: bool,
     ) -> Tuple[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
         b = x_t.shape[0]
-        h = self.norm(x_t.astype(jnp.float32)).astype(self.dtype)
+        h = self.norm(x_t.astype(jnp.float32))
         xz = self.in_proj(h)
         x_in, z = jnp.split(xz, 2, axis=-1)
 
         if state is None:
-            conv_state, ssm_state = self._init_state(b, x_in.dtype)
+            conv_state, ssm_state = self._init_state(b)
         else:
             conv_state, ssm_state = state
 
@@ -215,8 +203,6 @@ class Mamba(nn.Module):
     dt_min: float = 1e-4
     dt_max: float = 1.0
     dropout: float = 0.0
-    dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
 
     def setup(self):
         self.layers = [
@@ -229,8 +215,6 @@ class Mamba(nn.Module):
                 dt_min=self.dt_min,
                 dt_max=self.dt_max,
                 dropout=self.dropout,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
             )
             for _ in range(self.n_layers)
         ]

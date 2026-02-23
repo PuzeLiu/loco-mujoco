@@ -13,12 +13,6 @@ def _compute_reset_mask(done: jnp.ndarray) -> jnp.ndarray:
     return jnp.concatenate([jnp.ones((1, b), dtype=bool), done[:-1]], axis=0)
 
 
-def _state_dtype(dtype: Any) -> Any:
-    if dtype in (jnp.float16, jnp.bfloat16):
-        return jnp.float32
-    return dtype
-
-
 def init_target_norm_stats(dim: int = 6, dtype=jnp.float32) -> Dict[str, jnp.ndarray]:
     return {
         "mean": jnp.zeros((dim,), dtype=dtype),
@@ -70,8 +64,6 @@ class WorldModel(nn.Module):
     mamba_dt_rank: int = 1
     mamba_dt_min: float = 1e-4
     mamba_dt_max: float = 1.0
-    dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
 
     def _mamba_dims(self) -> Tuple[int, int, int]:
         if self.mamba_expand is None:
@@ -92,8 +84,8 @@ class WorldModel(nn.Module):
         return d_inner, d_state, d_conv
 
     def setup(self):
-        self.in_proj = nn.Dense(self.model_dim, dtype=self.dtype, param_dtype=self.param_dtype)
-        self.in_ln = nn.LayerNorm(dtype=jnp.float32, param_dtype=self.param_dtype)
+        self.in_proj = nn.Dense(self.model_dim, dtype=jnp.float32, param_dtype=jnp.float32)
+        self.in_ln = nn.LayerNorm(dtype=jnp.float32, param_dtype=jnp.float32)
         d_inner, d_state, d_conv = self._mamba_dims()
         self.mamba = Mamba(
             model_dim=self.model_dim,
@@ -105,11 +97,9 @@ class WorldModel(nn.Module):
             dt_min=self.mamba_dt_min,
             dt_max=self.mamba_dt_max,
             dropout=self.dropout,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
         )
-        self.out_disp = nn.Dense(3, dtype=self.dtype, param_dtype=self.param_dtype)
-        self.out_vel = nn.Dense(3, dtype=self.dtype, param_dtype=self.param_dtype)
+        self.out_disp = nn.Dense(3, dtype=jnp.float32, param_dtype=jnp.float32)
+        self.out_vel = nn.Dense(3, dtype=jnp.float32, param_dtype=jnp.float32)
         self.dropout_layer = nn.Dropout(rate=self.dropout)
 
     def __call__(self,
@@ -123,9 +113,9 @@ class WorldModel(nn.Module):
             states: list of (conv_state, ssm_state) per layer
             reset_mask: (T, B) bool mask for episode resets
         """
-        x = x.astype(self.dtype)
+        x = x.astype(jnp.float32)
         h = self.in_proj(x)
-        h = self.in_ln(h.astype(jnp.float32)).astype(self.dtype)
+        h = self.in_ln(h)
         h = self.dropout_layer(h, deterministic=not train)
         h, new_states = self.mamba(h, states, reset_mask, train)
         pred_disp = self.out_disp(h)
@@ -143,9 +133,9 @@ class WorldModel(nn.Module):
             x_t: (B, input_dim)
             cache: list of (conv_state, ssm_state) per layer
         """
-        x_t = x_t.astype(self.dtype)
+        x_t = x_t.astype(jnp.float32)
         h = self.in_proj(x_t)
-        h = self.in_ln(h.astype(jnp.float32)).astype(self.dtype)
+        h = self.in_ln(h)
         h, new_cache = self.mamba.step(h, cache, train)
         pred_disp = self.out_disp(h)
         pred_vel = self.out_vel(h)
@@ -154,8 +144,8 @@ class WorldModel(nn.Module):
     def init_state(self, batch_size: int) -> List[Tuple[jnp.ndarray, jnp.ndarray]]:
         d_inner, d_state, d_conv = self._mamba_dims()
         conv_len = max(d_conv - 1, 0)
-        conv_state = jnp.zeros((batch_size, conv_len, d_inner), dtype=self.dtype)
-        ssm_state = jnp.zeros((batch_size, d_inner, d_state), dtype=_state_dtype(self.dtype))
+        conv_state = jnp.zeros((batch_size, conv_len, d_inner), dtype=jnp.float32)
+        ssm_state = jnp.zeros((batch_size, d_inner, d_state), dtype=jnp.float32)
         return [(conv_state, ssm_state) for _ in range(self.n_layers)]
 
     def init_cache(self, batch_size: int) -> List[Tuple[jnp.ndarray, jnp.ndarray]]:
