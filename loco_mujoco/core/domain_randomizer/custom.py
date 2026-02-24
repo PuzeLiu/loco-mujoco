@@ -257,9 +257,9 @@ class CustomRandomizer(DomainRandomizer):
             body_mass = model.body_mass.at[root_body_id].set(model.body_mass[root_body_id] * sampled_base_mass_multiplier)
             body_mass = body_mass.at[root_body_id].set(body_mass[root_body_id] + domrand_state.base_mass_to_add)
             body_mass = body_mass.at[other_body_masks].set(body_mass[other_body_masks] * sampled_other_bodies_mass_multipliers)
-            dof_frictionloss = model.dof_frictionloss.at[6:].set(domrand_state.joint_friction_loss)
-            dof_damping = model.dof_damping.at[6:].set(domrand_state.joint_damping)
-            dof_armature = model.dof_armature.at[6:].set(domrand_state.joint_armature)
+            dof_frictionloss = model.dof_frictionloss.at[env.qvel_joint_adr].set(domrand_state.joint_friction_loss[env.qvel_joint_adr])
+            dof_damping = model.dof_damping.at[env.qvel_joint_adr].set(domrand_state.joint_damping[env.qvel_joint_adr])
+            dof_armature = model.dof_armature.at[env.agent_info["agent_lower_body"]["joints_dofadr"]].set(domrand_state.joint_armature[env.agent_info["agent_lower_body"]["joints_dofadr"]])
             if self.rand_conf["randomize_gravity"]:
                 model = self._set_attribute_in_model(model, "opt.gravity", domrand_state.gravity, backend)
         else:
@@ -756,7 +756,7 @@ class CustomRandomizer(DomainRandomizer):
         assert_backend_is_supported(backend)
 
         friction_min, friction_max = self.rand_conf["joint_friction_loss_range"]
-        n_dofs = model.nv - 6 #exclude freejoint 6 degrees of freedom
+        n_dofs = model.nv #exclude freejoint 6 degrees of freedom
 
         if backend == jnp:
             key = carry.key
@@ -793,7 +793,7 @@ class CustomRandomizer(DomainRandomizer):
         assert_backend_is_supported(backend)
 
         damping_min, damping_max = self.rand_conf["joint_damping_range"]
-        n_dofs = model.nv - 6 #exclude freejoint 6 degrees of freedom
+        n_dofs = model.nv #exclude freejoint 6 degrees of freedom
 
         if backend == jnp:
             key = carry.key
@@ -831,7 +831,7 @@ class CustomRandomizer(DomainRandomizer):
         assert_backend_is_supported(backend)
 
         armature_min, armature_max = self.rand_conf["joint_armature_range"]
-        n_dofs = model.nv - 6 #exclude freejoint 6 degrees of freedom
+        n_dofs = model.nv #exclude freejoint 6 degrees of freedom
 
         if backend == jnp:
             key = carry.key
