@@ -76,7 +76,6 @@ class AdditionalCarry:
     base_site_rot0: Union[np.ndarray, jax.Array]
     pred_disp: Union[np.ndarray, jax.Array]
     delta_action: Union[np.ndarray, jax.Array, None]
-    history: Union[np.ndarray, jax.Array]
     pattern_state: PatternState
     reach_goal_state: bool
     curriculum: CurriculumState
@@ -165,9 +164,6 @@ class Mujoco:
         self._additional_carry = None
         self._cur_step_in_episode = 0
         self.action_dim = len(actuation_spec)
-
-        if not hasattr(self, "history_length"):
-            self.history_length = 0
 
         # setup goal
         spec, self._goal = self._setup_goal(spec, goal_type, goal_params)
@@ -907,7 +903,6 @@ class Mujoco:
             control_func_state=self._control_func.init_state(self, _k6, model, data, backend),
             terminal_state_handler_state=self._terminal_state_handler.init_state(self, _k7, model, data, backend),
             user_scene=MjvScene.init_for_all_stateful_objects(backend),
-            history=backend.zeros((self.history_length, self.info.observation_space.shape[0])),
             pattern_state=PatternState(
                 cur_pattern=0,
                 reward_pattern=0,

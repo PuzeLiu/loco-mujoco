@@ -216,11 +216,6 @@ class Mjx(Mujoco):
         carry = carry.replace(total_timestep=total_timestep)
         carry = carry.replace(final_info=cur_info)
 
-        # update history
-        if self.history_length > 0:
-            history = jnp.roll(carry.history, shift=-1, axis=0)
-            history = history.at[-1].set(cur_obs)
-            carry = carry.replace(history=history)
         carry = carry.replace(cur_step_in_episode=carry.cur_step_in_episode + 1)
         # create state
         state = state.replace(data=data, observation=cur_obs, reward=reward,
