@@ -158,13 +158,9 @@ class IPPOJax(JaxRLAlgorithmBase):
             config.experiment.validation.num = int(
                 config.experiment.num_updates // config.experiment.validation_interval)
 
-        # INIT NETWORK
-        hidden_layers = config.experiment.hidden_layers \
-            if isinstance(config.experiment.hidden_layers, (list, ListConfig)) \
-            else ast.literal_eval(config.experiment.hidden_layers)
-
         networks = {}
         txs = {}
+        max_len_obs_history = max(agent_cfg.get("len_obs_history", 1) for agent_cfg in config.env.agent.values())
 
         # config.agent is a DictConfig: {agent_name: {...}}
         for agent_name, agent_cfg in config.env.agent.items():
@@ -178,18 +174,24 @@ class IPPOJax(JaxRLAlgorithmBase):
             else:
                 critic_obs_ind = jnp.arange(env.mdp_info.observation_space.shape[0])
 
-            if hasattr(config.experiment, "len_obs_history") and config.experiment.len_obs_history > 1:
+            if max_len_obs_history > 1:
                 obs_len = env.info.observation_space.shape[0]
-                actor_obs_ind = jnp.concatenate([actor_obs_ind + i * obs_len
-                                                 for i in range(config.experiment.len_obs_history)])
-                critic_obs_ind = jnp.concatenate([critic_obs_ind + i * obs_len
-                                                  for i in range(config.experiment.len_obs_history)])
-
+                len_obs_history = agent_cfg.get("len_obs_history", 1)
+                history_offset = max_len_obs_history - len_obs_history
+                actor_obs_ind = jnp.concatenate([actor_obs_ind + (history_offset + i) * obs_len
+                                                 for i in range(len_obs_history)])
+                critic_obs_ind = jnp.concatenate([critic_obs_ind + (history_offset + i) * obs_len
+                                                  for i in range(len_obs_history)])
             action_dim = len(agent_cfg.action_idx)
+
+            # INIT NETWORK
+            hidden_layers = agent_cfg.hidden_layers \
+                if isinstance(agent_cfg.hidden_layers, (list, ListConfig)) \
+                else ast.literal_eval(agent_cfg.hidden_layers)
 
             networks[agent_name] = ActorCritic(
                 action_dim,
-                activation=config.experiment.activation,
+                activation=agent_cfg.activation,
                 init_std=config.experiment.init_std,
                 learnable_std=config.experiment.learnable_std,
                 hidden_layer_dims=hidden_layers,
