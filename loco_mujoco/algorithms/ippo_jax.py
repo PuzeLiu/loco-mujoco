@@ -380,7 +380,23 @@ class IPPOJax(JaxRLAlgorithmBase):
             reset_rng = jax.random.split(_rng, config.num_envs)
             obsv, env_state = env.reset(reset_rng, env_id=jnp.arange(config.num_envs))
         else:
-            obsv = env_state.observation
+            if getattr(config, "len_obs_history", 1) > 1:
+                obs_buf = None
+                try:
+                    obs_buf = env.find_attr(env_state, "observation_buffer")
+                except AttributeError:
+                    obs_buf = None
+                if obs_buf is not None:
+                    if obs_buf.ndim == 2:
+                        obsv = jnp.reshape(obs_buf, (-1,))
+                    elif obs_buf.ndim >= 3:
+                        obsv = jnp.reshape(obs_buf, (obs_buf.shape[0], -1))
+                    else:
+                        obsv = jnp.reshape(obs_buf, (-1,))
+                else:
+                    obsv = env_state.observation
+            else:
+                obsv = env_state.observation
 
         train_state_buffer = TrainStateBuffer.create(next(iter(train_states.values())), config.validation.num)
         if world_model_enabled:
