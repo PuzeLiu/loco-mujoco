@@ -19,6 +19,7 @@ from loco_mujoco.algorithms import (JaxRLAlgorithmBase, AgentConfBase, AgentStat
 # from loco_mujoco.core.wrappers import LogWrapper, NStepWrapper, LogEnvState, VecEnv, NormalizeVecReward, SummaryMetrics
 from loco_mujoco.core.wrappers import (RichLogWrapper, NStepWrapper, RichLogEnvState, VecEnv,
                                        NormalizeVecRewardDict, SummaryRichMetrics, WorldModelWrapper)
+from loco_mujoco.core.wrappers.mjx import NormalizeVecRewEnvDictState, NormalizeVecRewEnvState
 from loco_mujoco.core.wrappers.mjx import BaseWrapper
 from loco_mujoco.utils import MetricsHandler, ValidationSummary
 from loco_mujoco.algorithms.common.world_model import WorldModel, world_model_loss, init_target_norm_stats
@@ -108,13 +109,72 @@ class IPPOJax(JaxRLAlgorithmBase):
                   agent_conf: IPPOAgentConf,
                   agent_state: IPPOAgentState,
                   world_conf: IPPOWorldConf | None = None,
-                  world_state: IPPOWorldState | None = None):
+                  world_state: IPPOWorldState | None = None,
+                  env_state=None):
         serialized = super().serialize(agent_conf, agent_state)
         if world_conf is not None:
             serialized["world_model_conf"] = world_conf.serialize()
         if world_state is not None:
             serialized["world_model_state"] = world_state.serialize()
+        if env_state is not None:
+            norm_state = cls._extract_normalize_reward_state(env_state)
+            if norm_state is not None:
+                serialized["env_state"] = {"normalize_vec_reward": norm_state}
         return serialized
+
+    @classmethod
+    def _extract_normalize_reward_state(cls, env_state):
+        if env_state is None:
+            return None
+
+        def _find(state):
+            if isinstance(state, NormalizeVecRewEnvDictState):
+                return {
+                    "type": "dict",
+                    "mean": state.mean,
+                    "var": state.var,
+                    "count": state.count,
+                    "return_val": state.return_val,
+                }
+            if isinstance(state, NormalizeVecRewEnvState):
+                return {
+                    "type": "scalar",
+                    "mean": state.mean,
+                    "var": state.var,
+                    "count": state.count,
+                    "return_val": state.return_val,
+                }
+            if hasattr(state, "env_state") and state.env_state is not None:
+                return _find(state.env_state)
+            return None
+
+        return _find(env_state)
+
+    @classmethod
+    def _apply_normalize_reward_state(cls, env_state, norm_state):
+        if env_state is None or norm_state is None:
+            return env_state
+
+        def _apply(state):
+            if isinstance(state, NormalizeVecRewEnvDictState) and norm_state.get("type") == "dict":
+                return state.replace(
+                    mean=norm_state["mean"],
+                    var=norm_state["var"],
+                    count=norm_state["count"],
+                    return_val=norm_state["return_val"],
+                )
+            if isinstance(state, NormalizeVecRewEnvState) and norm_state.get("type") == "scalar":
+                return state.replace(
+                    mean=norm_state["mean"],
+                    var=norm_state["var"],
+                    count=norm_state["count"],
+                    return_val=norm_state["return_val"],
+                )
+            if hasattr(state, "env_state") and state.env_state is not None:
+                return state.replace(env_state=_apply(state.env_state))
+            return state
+
+        return _apply(env_state)
 
     @classmethod
     def save_agent(cls,
@@ -122,12 +182,13 @@ class IPPOJax(JaxRLAlgorithmBase):
                    agent_conf: IPPOAgentConf,
                    agent_state: IPPOAgentState,
                    world_conf: IPPOWorldConf | None = None,
-                   world_state: IPPOWorldState | None = None):
+                   world_state: IPPOWorldState | None = None,
+                   env_state=None):
         """Save agent + optional world model to a single file."""
         path = Path(path)
         path = path / (cls.__name__ + "_saved")
         path = path.with_suffix(cls._saved_agent_suffix)
-        serialized_state = cls.serialize(agent_conf, agent_state, world_conf, world_state)
+        serialized_state = cls.serialize(agent_conf, agent_state, world_conf, world_state, env_state=env_state)
         with open(path, 'wb') as file:
             pickle.dump(serialized_state, file)
         print(f"\nSaved agent to: {path}\n")
@@ -144,6 +205,8 @@ class IPPOJax(JaxRLAlgorithmBase):
             world_conf = IPPOWorldConf.from_dict(d["world_model_conf"])
         if "world_model_state" in d:
             world_state = IPPOWorldState.from_dict(d["world_model_state"], world_conf)
+        if "env_state" in d:
+            return agent_conf, agent_state, world_conf, world_state, d["env_state"]
         return agent_conf, agent_state, world_conf, world_state
 
     @classmethod
@@ -184,17 +247,12 @@ class IPPOJax(JaxRLAlgorithmBase):
                                                   for i in range(len_obs_history)])
             action_dim = len(agent_cfg.action_idx)
 
-            # INIT NETWORK
-            hidden_layers = agent_cfg.hidden_layers \
-                if isinstance(agent_cfg.hidden_layers, (list, ListConfig)) \
-                else ast.literal_eval(agent_cfg.hidden_layers)
-
             networks[agent_name] = ActorCritic(
                 action_dim,
                 activation=agent_cfg.activation,
                 init_std=config.experiment.init_std,
                 learnable_std=config.experiment.learnable_std,
-                hidden_layer_dims=hidden_layers,
+                hidden_layer_dims=agent_cfg.hidden_layers,
                 actor_obs_ind=actor_obs_ind,
                 critic_obs_ind=critic_obs_ind,
                 # random=agent_cfg.get("random_action", False)
@@ -311,6 +369,7 @@ class IPPOJax(JaxRLAlgorithmBase):
             env = cls._wrap_env(env, config, world_conf=world_conf)
 
         agent_names = tuple(agent_conf.networks.keys())
+        freeze_policy = bool(config.get("freeze_policy", False))
         world_model_enabled = world_conf is not None
         wm_obs_ind = world_conf.obs_ind if world_model_enabled else None
         wm_cfg = config.world_model if world_model_enabled else None
@@ -440,8 +499,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                         mutable=["run_stats"],
                     )
                     pi, value = y
-
-                    ts = ts.replace(run_stats=updates["run_stats"])
+                    if not freeze_policy:
+                        ts = ts.replace(run_stats=updates["run_stats"])
                     a = pi.sample(seed=k)
                     lp = pi.log_prob(a)
 
@@ -616,175 +675,176 @@ class IPPOJax(JaxRLAlgorithmBase):
                     wm_target_norm_std=jnp.sqrt(wm_target_norm_stats["var"] + 1e-6),
                 )
 
-            # CALCULATE ADVANTAGE
-            # bootstrap values per agent
-            last_vals = {}
-            for name in agent_names:
-                ts = train_states[name]
-                net = agent_conf.networks[name]
-                y, _ = net.apply({"params": ts.params, "run_stats": ts.run_stats}, last_obs, mutable=["run_stats"])
-                _, last_val = y
-                last_vals[name] = last_val
+            if not freeze_policy:
+                # CALCULATE ADVANTAGE
+                # bootstrap values per agent
+                last_vals = {}
+                for name in agent_names:
+                    ts = train_states[name]
+                    net = agent_conf.networks[name]
+                    y, _ = net.apply({"params": ts.params, "run_stats": ts.run_stats}, last_obs, mutable=["run_stats"])
+                    _, last_val = y
+                    last_vals[name] = last_val
 
-            def _calculate_gae(traj_batch: IPPOTransition, last_vals: Dict[str, jnp.ndarray]):
-                def _get_advantages(gae_and_next_value, transition):
-                    gae, next_value = gae_and_next_value
-                    done = transition.done
+                def _calculate_gae(traj_batch: IPPOTransition, last_vals: Dict[str, jnp.ndarray]):
+                    def _get_advantages(gae_and_next_value, transition):
+                        gae, next_value = gae_and_next_value
+                        done = transition.done
 
-                    new_gae = {}
-                    adv_out = {}
+                        new_gae = {}
+                        adv_out = {}
 
-                    for name in agent_names:
-                        value = transition.value[name]
-                        reward = transition.reward[name]
-                        nv = next_value[name]
-                        g = gae[name]
-                        absorbing_key = agent_conf.config.env.agent[name].absorbing_key
-                        absorbing = transition.absorbing_dict[absorbing_key]
+                        for name in agent_names:
+                            value = transition.value[name]
+                            reward = transition.reward[name]
+                            nv = next_value[name]
+                            g = gae[name]
+                            absorbing_key = agent_conf.config.env.agent[name].absorbing_key
+                            absorbing = transition.absorbing_dict[absorbing_key]
 
-                        delta = reward + config.gamma * nv * (1.0 - absorbing) - value
-                        g = delta + config.gamma * config.gae_lambda * (1.0 - done) * g
+                            delta = reward + config.gamma * nv * (1.0 - absorbing) - value
+                            g = delta + config.gamma * config.gae_lambda * (1.0 - done) * g
 
-                        new_gae[name] = g
-                        adv_out[name] = g
+                            new_gae[name] = g
+                            adv_out[name] = g
 
-                    return (new_gae, transition.value), adv_out
+                        return (new_gae, transition.value), adv_out
 
-                init_gae = {name: jnp.zeros_like(last_vals[name]) for name in agent_names}
-                init_next = last_vals
+                    init_gae = {name: jnp.zeros_like(last_vals[name]) for name in agent_names}
+                    init_next = last_vals
 
-                (_, _), advantages = jax.lax.scan(
-                    _get_advantages,
-                    (init_gae, init_next),
-                    traj_batch,
-                    reverse=True,
-                    unroll=16
-                )
+                    (_, _), advantages = jax.lax.scan(
+                        _get_advantages,
+                        (init_gae, init_next),
+                        traj_batch,
+                        reverse=True,
+                        unroll=16
+                    )
 
-                # targets = advantages + values (per-agent)
-                targets = {name: advantages[name] + traj_batch.value[name] for name in agent_names}
-                return advantages, targets
+                    # targets = advantages + values (per-agent)
+                    targets = {name: advantages[name] + traj_batch.value[name] for name in agent_names}
+                    return advantages, targets
 
-            advantages, targets = _calculate_gae(traj_batch, last_vals)
+                advantages, targets = _calculate_gae(traj_batch, last_vals)
 
-            # UPDATE ACTOR & CRITIC NETWORK
-            def _update_epoch(update_state, unused):
-                train_states, traj_batch, advantages, targets, rng = update_state
-                rng, _rng = jax.random.split(rng)
+                # UPDATE ACTOR & CRITIC NETWORK
+                def _update_epoch(update_state, unused):
+                    train_states, traj_batch, advantages, targets, rng = update_state
+                    rng, _rng = jax.random.split(rng)
 
-                batch_size = config.minibatch_size * config.num_minibatches
-                assert batch_size == config.num_steps * config.num_envs
+                    batch_size = config.minibatch_size * config.num_minibatches
+                    assert batch_size == config.num_steps * config.num_envs
 
-                permutation = jax.random.permutation(_rng, batch_size)
+                    permutation = jax.random.permutation(_rng, batch_size)
 
-                # Build pytree batch
-                batch = (traj_batch, advantages, targets)
-                batch = jax.tree.map(lambda x: x.reshape((batch_size,) + x.shape[2:]), batch)
-                shuffled_batch = jax.tree.map(lambda x: jnp.take(x, permutation, axis=0), batch)
-                minibatches = jax.tree.map(
-                    lambda x: jnp.reshape(x, [config.num_minibatches, -1] + list(x.shape[1:])),
-                    shuffled_batch
-                )
-                def _update_minibatch(train_states, batch_info):
-                    traj_mb, adv_mb, tgt_mb = batch_info
-                    new_train_states = dict(train_states)
+                    # Build pytree batch
+                    batch = (traj_batch, advantages, targets)
+                    batch = jax.tree.map(lambda x: x.reshape((batch_size,) + x.shape[2:]), batch)
+                    shuffled_batch = jax.tree.map(lambda x: jnp.take(x, permutation, axis=0), batch)
+                    minibatches = jax.tree.map(
+                        lambda x: jnp.reshape(x, [config.num_minibatches, -1] + list(x.shape[1:])),
+                        shuffled_batch
+                    )
+                    def _update_minibatch(train_states, batch_info):
+                        traj_mb, adv_mb, tgt_mb = batch_info
+                        new_train_states = dict(train_states)
 
-                    # aggregate logs (optional)
-                    loss_logs = {}
+                        # aggregate logs (optional)
+                        loss_logs = {}
 
-                    for name in agent_names:
-                        ts = new_train_states[name]
-                        net = agent_conf.networks[name]
+                        for name in agent_names:
+                            ts = new_train_states[name]
+                            net = agent_conf.networks[name]
 
-                        mask = jnp.ones(traj_mb.done.shape, dtype=jnp.float32)
-                        if stand_phase_enabled and name not in stand_phase_active_agents:
-                            mask = 1.0 - traj_mb.info["no_ball"]
-                            mask = mask.astype(jnp.float32)
-                        mask_denom = jnp.sum(mask) + 1e-8
+                            mask = jnp.ones(traj_mb.done.shape, dtype=jnp.float32)
+                            if stand_phase_enabled and name not in stand_phase_active_agents:
+                                mask = 1.0 - traj_mb.info["no_ball"]
+                                mask = mask.astype(jnp.float32)
+                            mask_denom = jnp.sum(mask) + 1e-8
 
-                        def _loss_fn(params):
-                            # RERUN NETWORK
-                            y, _ = net.apply({"params": params, "run_stats": ts.run_stats},
-                                                traj_mb.obs, mutable=["run_stats"])
-                            pi, value = y
-                            # recompute logprob on stored per-agent actions
-                            a = traj_mb.action_dict[name]
-                            log_prob = pi.log_prob(a)
+                            def _loss_fn(params):
+                                # RERUN NETWORK
+                                y, _ = net.apply({"params": params, "run_stats": ts.run_stats},
+                                                    traj_mb.obs, mutable=["run_stats"])
+                                pi, value = y
+                                # recompute logprob on stored per-agent actions
+                                a = traj_mb.action_dict[name]
+                                log_prob = pi.log_prob(a)
 
-                            # value loss (clipped)
-                            old_v = traj_mb.value[name]
-                            v_clipped = old_v + (value - old_v).clip(-config.clip_eps, config.clip_eps)
-                            v_loss1 = jnp.square(value - tgt_mb[name])
-                            v_loss2 = jnp.square(v_clipped - tgt_mb[name])
-                            value_loss = 0.5 * jnp.maximum(v_loss1, v_loss2)
-                            value_loss = (value_loss * mask).sum() / mask_denom
+                                # value loss (clipped)
+                                old_v = traj_mb.value[name]
+                                v_clipped = old_v + (value - old_v).clip(-config.clip_eps, config.clip_eps)
+                                v_loss1 = jnp.square(value - tgt_mb[name])
+                                v_loss2 = jnp.square(v_clipped - tgt_mb[name])
+                                value_loss = 0.5 * jnp.maximum(v_loss1, v_loss2)
+                                value_loss = (value_loss * mask).sum() / mask_denom
 
-                            # actor loss (PPO clip)
-                            ratio = jnp.exp(log_prob - traj_mb.log_prob[name])
-                            gae = adv_mb[name]
-                            gae_mean = (gae * mask).sum() / mask_denom
-                            gae_var = ((gae - gae_mean) ** 2 * mask).sum() / mask_denom
-                            gae = (gae - gae_mean) / (jnp.sqrt(gae_var) + 1e-8)
+                                # actor loss (PPO clip)
+                                ratio = jnp.exp(log_prob - traj_mb.log_prob[name])
+                                gae = adv_mb[name]
+                                gae_mean = (gae * mask).sum() / mask_denom
+                                gae_var = ((gae - gae_mean) ** 2 * mask).sum() / mask_denom
+                                gae = (gae - gae_mean) / (jnp.sqrt(gae_var) + 1e-8)
 
-                            loss1 = ratio * gae
-                            loss2 = jnp.clip(ratio, 1.0 - config.clip_eps, 1.0 + config.clip_eps) * gae
-                            loss_actor = -(jnp.minimum(loss1, loss2) * mask).sum() / mask_denom
+                                loss1 = ratio * gae
+                                loss2 = jnp.clip(ratio, 1.0 - config.clip_eps, 1.0 + config.clip_eps) * gae
+                                loss_actor = -(jnp.minimum(loss1, loss2) * mask).sum() / mask_denom
 
-                            entropy = (pi.entropy() * mask).sum() / mask_denom
+                                entropy = (pi.entropy() * mask).sum() / mask_denom
 
-                            total_loss = loss_actor + config.vf_coef * value_loss - config.ent_coef * entropy
-                            return total_loss, (value_loss, loss_actor, entropy, ratio)
+                                total_loss = loss_actor + config.vf_coef * value_loss - config.ent_coef * entropy
+                                return total_loss, (value_loss, loss_actor, entropy, ratio)
 
-                        grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-                        (total_loss, (value_loss, loss_actor, entropy, ratio)), grads = grad_fn(ts.params)\
-                        
-                        # apply grads
-                        ts = ts.apply_gradients(grads=grads)
+                            grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
+                            (total_loss, (value_loss, loss_actor, entropy, ratio)), grads = grad_fn(ts.params)\
+                            
+                            # apply grads
+                            ts = ts.apply_gradients(grads=grads)
 
-                    # adaptive lr (per-agent, same logic)
-                        if config.get("adaptive_lr", False):
-                            current_lr = ts.adaptive_lr_state.learning_rate
-                            eps = 1e-7
-                            approx_kl = ((ratio - 1.0 + eps) - jnp.log(ratio + eps))
-                            approx_kl = (approx_kl * mask).sum() / mask_denom
+                        # adaptive lr (per-agent, same logic)
+                            if config.get("adaptive_lr", False):
+                                current_lr = ts.adaptive_lr_state.learning_rate
+                                eps = 1e-7
+                                approx_kl = ((ratio - 1.0 + eps) - jnp.log(ratio + eps))
+                                approx_kl = (approx_kl * mask).sum() / mask_denom
 
-                            next_lr = jax.lax.cond(
-                                approx_kl > config.kl_target * config.kl_margin,
-                                lambda lr: lr / config.kl_lr_scale,
-                                lambda lr: lr,
-                                current_lr,
-                            )
-                            next_lr = jax.lax.cond(
-                                approx_kl < config.kl_target / config.kl_margin,
-                                lambda lr: lr * config.kl_lr_scale,
-                                lambda lr: lr,
-                                next_lr,
-                            )
-                            next_lr = jnp.clip(next_lr, config.lr_min, config.lr_max)
+                                next_lr = jax.lax.cond(
+                                    approx_kl > config.kl_target * config.kl_margin,
+                                    lambda lr: lr / config.kl_lr_scale,
+                                    lambda lr: lr,
+                                    current_lr,
+                                )
+                                next_lr = jax.lax.cond(
+                                    approx_kl < config.kl_target / config.kl_margin,
+                                    lambda lr: lr * config.kl_lr_scale,
+                                    lambda lr: lr,
+                                    next_lr,
+                                )
+                                next_lr = jnp.clip(next_lr, config.lr_min, config.lr_max)
 
-                            # update injected hyperparams (same hack, per-agent)
-                            old_h = ts.opt_state[1].hyperparams
-                            new_h = {**old_h, "learning_rate": next_lr}
-                            new_inject = ts.opt_state[1]._replace(hyperparams=new_h)
-                            new_opt_state = tuple(ts.opt_state[i] if i != 1 else new_inject
-                                                  for i in range(len(ts.opt_state)))
-                            ts = ts.replace(opt_state=new_opt_state,
-                                            adaptive_lr_state=AdaptiveLRState(learning_rate=next_lr))
+                                # update injected hyperparams (same hack, per-agent)
+                                old_h = ts.opt_state[1].hyperparams
+                                new_h = {**old_h, "learning_rate": next_lr}
+                                new_inject = ts.opt_state[1]._replace(hyperparams=new_h)
+                                new_opt_state = tuple(ts.opt_state[i] if i != 1 else new_inject
+                                                      for i in range(len(ts.opt_state)))
+                                ts = ts.replace(opt_state=new_opt_state,
+                                                adaptive_lr_state=AdaptiveLRState(learning_rate=next_lr))
 
-                        new_train_states[name] = ts
-                        loss_logs[name] = (total_loss, value_loss, loss_actor, entropy)
+                            new_train_states[name] = ts
+                            loss_logs[name] = (total_loss, value_loss, loss_actor, entropy)
 
-                    return new_train_states, loss_logs
+                        return new_train_states, loss_logs
 
-                train_states, loss_logs = jax.lax.scan(_update_minibatch, train_states, minibatches)
+                    train_states, loss_logs = jax.lax.scan(_update_minibatch, train_states, minibatches)
+                    update_state = (train_states, traj_batch, advantages, targets, rng)
+                    return update_state, loss_logs
+
                 update_state = (train_states, traj_batch, advantages, targets, rng)
-                return update_state, loss_logs
+                update_state, loss_info = jax.lax.scan(_update_epoch, update_state, None, config.update_epochs)
 
-            update_state = (train_states, traj_batch, advantages, targets, rng)
-            update_state, loss_info = jax.lax.scan(_update_epoch, update_state, None, config.update_epochs)
-
-            train_states = update_state[0]
-            rng = update_state[-1]
+                train_states = update_state[0]
+                rng = update_state[-1]
 
             ref_agent = agent_names[0]
 
