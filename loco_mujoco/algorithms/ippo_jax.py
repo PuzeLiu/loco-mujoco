@@ -91,10 +91,24 @@ class IPPOAgentState(AgentStateBase):
         # If your TrainState.create is required, adapt accordingly.
         train_states = {}
         for agent_name, ts_dict in d["train_states"].items():
+            expected_opt_state = agent_conf.txs[agent_name].init(ts_dict["params"])
+            opt_state = ts_dict["opt_state"]
+            if jax.tree_util.tree_structure(opt_state) != jax.tree_util.tree_structure(expected_opt_state):
+                opt_state = expected_opt_state
+                if agent_conf.config.experiment.get("adaptive_lr", False):
+                    adaptive_lr_state = AdaptiveLRState(learning_rate=jnp.array(agent_conf.config.experiment.lr))
+                else:
+                    adaptive_lr_state = None
+            else:
+                adaptive_lr_state = ts_dict.get("adaptive_lr_state", None)
+            ts_kwargs = dict(ts_dict)
+            ts_kwargs["opt_state"] = opt_state
+            if "adaptive_lr_state" in ts_kwargs or adaptive_lr_state is not None:
+                ts_kwargs["adaptive_lr_state"] = adaptive_lr_state
             train_states[agent_name] = TrainState(
                 apply_fn=agent_conf.networks[agent_name].apply,
                 tx=agent_conf.txs[agent_name],
-                **ts_dict
+                **ts_kwargs
             )
         return cls(train_states=train_states)
 
