@@ -237,7 +237,12 @@ class IPPOJax(JaxRLAlgorithmBase):
 
         networks = {}
         txs = {}
-        max_len_obs_history = max(agent_cfg.get("len_obs_history", 1) for agent_cfg in config.env.agent.values())
+        len_obs_history_list = [config.experiment.get("len_obs_history", 1)]
+        for agent_cfg in config.env.agent.values():
+            len_obs_history_list.append(agent_cfg.get("len_obs_history", 1))
+            len_obs_history_list.append(agent_cfg.get("critic_len_obs_history", 1))
+            len_obs_history_list.append(agent_cfg.get("actor_len_obs_history", 1))
+        max_len_obs_history = max(len_obs_history_list)
 
         # config.agent is a DictConfig: {agent_name: {...}}
         for agent_name, agent_cfg in config.env.agent.items():
@@ -253,8 +258,8 @@ class IPPOJax(JaxRLAlgorithmBase):
 
             if max_len_obs_history > 1:
                 obs_len = env.info.observation_space.shape[0]
-                actor_len_obs_history = agent_cfg.get("actor_len_obs_history", 1)
-                critic_len_obs_history = agent_cfg.get("critic_len_obs_history", 1)
+                actor_len_obs_history = agent_cfg.actor_len_obs_history
+                critic_len_obs_history = agent_cfg.critic_len_obs_history
                 actor_history_offset = max_len_obs_history - actor_len_obs_history
                 critic_history_offset = max_len_obs_history - critic_len_obs_history
                 actor_obs_ind = jnp.concatenate([actor_obs_ind + (actor_history_offset + i) * obs_len
