@@ -253,12 +253,14 @@ class IPPOJax(JaxRLAlgorithmBase):
 
             if max_len_obs_history > 1:
                 obs_len = env.info.observation_space.shape[0]
-                len_obs_history = agent_cfg.get("len_obs_history", 1)
-                history_offset = max_len_obs_history - len_obs_history
-                actor_obs_ind = jnp.concatenate([actor_obs_ind + (history_offset + i) * obs_len
-                                                 for i in range(len_obs_history)])
-                critic_obs_ind = jnp.concatenate([critic_obs_ind + (history_offset + i) * obs_len
-                                                  for i in range(len_obs_history)])
+                actor_len_obs_history = agent_cfg.get("actor_len_obs_history", 1)
+                critic_len_obs_history = agent_cfg.get("critic_len_obs_history", 1)
+                actor_history_offset = max_len_obs_history - actor_len_obs_history
+                critic_history_offset = max_len_obs_history - critic_len_obs_history
+                actor_obs_ind = jnp.concatenate([actor_obs_ind + (actor_history_offset + i) * obs_len
+                                                 for i in range(actor_len_obs_history)])
+                critic_obs_ind = jnp.concatenate([critic_obs_ind + (critic_history_offset + i) * obs_len
+                                                  for i in range(critic_len_obs_history)])
             action_dim = len(agent_cfg.action_idx)
 
             networks[agent_name] = ActorCritic(
@@ -266,7 +268,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                 activation=agent_cfg.activation,
                 init_std=config.experiment.init_std,
                 learnable_std=config.experiment.learnable_std,
-                hidden_layer_dims=agent_cfg.hidden_layers,
+                actor_hidden_layer_dims=agent_cfg.actor_hidden_layers,
+                critic_hidden_layer_dims=agent_cfg.critic_hidden_layers,
                 actor_obs_ind=actor_obs_ind,
                 critic_obs_ind=critic_obs_ind,
                 # random=agent_cfg.get("random_action", False)

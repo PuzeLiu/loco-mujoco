@@ -103,8 +103,9 @@ class ActorCritic(nn.Module):
     activation: str = "tanh"
     init_std: float = 1.0
     learnable_std: bool = True
-    hidden_layer_dims: Sequence[int] = (1024, 512)
+    actor_hidden_layer_dims: Sequence[int] = (1024, 512)
     actor_obs_ind: jnp.ndarray = None
+    critic_hidden_layer_dims: Sequence[int] = (1024, 512)
     critic_obs_ind: jnp.ndarray = None
     # random: bool = False
 
@@ -118,7 +119,7 @@ class ActorCritic(nn.Module):
 
         # build actor
         actor_x = x if self.actor_obs_ind is None else x[..., self.actor_obs_ind]
-        actor_mean = FullyConnectedNet(self.hidden_layer_dims, self.action_dim, self.activation,
+        actor_mean = FullyConnectedNet(self.actor_hidden_layer_dims, self.action_dim, self.activation,
                                        None, False, False)(actor_x)
         actor_logtstd = self.param("log_std", nn.initializers.constant(jnp.log(self.init_std)),
                                    (self.action_dim,))
@@ -133,7 +134,7 @@ class ActorCritic(nn.Module):
 
         # build critic
         critic_x = x if self.critic_obs_ind is None else x[..., self.critic_obs_ind]
-        critic = FullyConnectedNet(self.hidden_layer_dims, 1, self.activation, None, False, False)(critic_x)
+        critic = FullyConnectedNet(self.critic_hidden_layer_dims, 1, self.activation, None, False, False)(critic_x)
 
         return pi, jnp.squeeze(critic, axis=-1)
 
