@@ -258,6 +258,140 @@ class RichLogWrapper(BaseWrapper):
 
 
 @struct.dataclass
+class EpisodicTrackState(BaseWrapperState):
+    env_state: MjxState
+    track_count: jnp.ndarray
+    episode_return_buffer: jnp.ndarray
+    episode_length_buffer: jnp.ndarray
+    absorbed_buffer: jnp.ndarray
+    juggle_absorbed_buffer: jnp.ndarray
+    loco_absorbed_buffer: jnp.ndarray
+    episode_return_components_buffer: dict[str, jnp.ndarray]
+    mean_episode_return: jnp.ndarray
+    mean_episode_length: jnp.ndarray
+    frac_absorbed: jnp.ndarray
+    juggle_absorbed: jnp.ndarray
+    loco_absorbed: jnp.ndarray
+    mean_episode_return_components: dict[str, jnp.ndarray]
+
+
+class EpisodicTrackWrapper(BaseWrapper):
+    """Track episodic stats in a fixed-size JAX buffer."""
+
+    def __init__(self, env, track_len: int):
+        super().__init__(env)
+        self.track_len = max(1, int(track_len))
+
+    def reset(self, rng_key, env_id=None):
+        obs, env_state = self.env.reset(rng_key, env_id=env_id)
+        log_env_state = env_state.find(RichLogEnvState)
+        logged_metrics = log_env_state.metrics
+
+        component_keys = logged_metrics.episode_return_components.keys()
+        comp_buffers = {
+            key: jnp.zeros((self.track_len,), dtype=jnp.float32) for key in component_keys
+        }
+        comp_means = {key: jnp.array(0.0, dtype=jnp.float32) for key in component_keys}
+
+        state = EpisodicTrackState(
+            env_state=env_state,
+            track_count=jnp.array(0, dtype=jnp.int32),
+            episode_return_buffer=jnp.zeros((self.track_len,), dtype=jnp.float32),
+            episode_length_buffer=jnp.zeros((self.track_len,), dtype=jnp.float32),
+            absorbed_buffer=jnp.zeros((self.track_len,), dtype=jnp.float32),
+            juggle_absorbed_buffer=jnp.zeros((self.track_len,), dtype=jnp.float32),
+            loco_absorbed_buffer=jnp.zeros((self.track_len,), dtype=jnp.float32),
+            episode_return_components_buffer=comp_buffers,
+            mean_episode_return=jnp.array(0.0, dtype=jnp.float32),
+            mean_episode_length=jnp.array(0.0, dtype=jnp.float32),
+            frac_absorbed=jnp.array(0.0, dtype=jnp.float32),
+            juggle_absorbed=jnp.array(0.0, dtype=jnp.float32),
+            loco_absorbed=jnp.array(0.0, dtype=jnp.float32),
+            mean_episode_return_components=comp_means,
+        )
+        return obs, state
+
+    def step(self, state: EpisodicTrackState, action: Union[int, float]):
+        next_observation, reward, absorbing, done, info, env_state = self.env.step(state.env_state, action)
+        log_env_state = env_state.find(RichLogEnvState)
+        logged_metrics = log_env_state.metrics
+
+        returns_done = logged_metrics.returned_episode_returns
+        lengths_done = logged_metrics.returned_episode_lengths
+        absorbed_done = logged_metrics.absorbed
+        juggle_absorbed_done = logged_metrics.juggle_absorbed
+        loco_absorbed_done = logged_metrics.loco_absorbed
+        comps_done = logged_metrics.returned_episode_return_components
+
+        def _update_buffers(i, carry):
+            (ret_buf, len_buf, abs_buf, juggle_buf, loco_buf, comp_bufs, count) = carry
+
+            def _apply_update(carry_inner):
+                (ret_buf, len_buf, abs_buf, juggle_buf, loco_buf, comp_bufs, count) = carry_inner
+
+                ret_buf = jnp.roll(ret_buf, shift=-1)
+                len_buf = jnp.roll(len_buf, shift=-1)
+                abs_buf = jnp.roll(abs_buf, shift=-1)
+                juggle_buf = jnp.roll(juggle_buf, shift=-1)
+                loco_buf = jnp.roll(loco_buf, shift=-1)
+
+                ret_buf = ret_buf.at[-1].set(returns_done[i])
+                len_buf = len_buf.at[-1].set(lengths_done[i])
+                abs_buf = abs_buf.at[-1].set(absorbed_done[i])
+                juggle_buf = juggle_buf.at[-1].set(juggle_absorbed_done[i])
+                loco_buf = loco_buf.at[-1].set(loco_absorbed_done[i])
+
+                new_comp_bufs = {}
+                for key, buf in comp_bufs.items():
+                    new_buf = jnp.roll(buf, shift=-1)
+                    new_comp_bufs[key] = new_buf.at[-1].set(comps_done[key][i])
+
+                count = jnp.minimum(count + 1, self.track_len)
+                return (ret_buf, len_buf, abs_buf, juggle_buf, loco_buf, new_comp_bufs,
+                        count)
+
+            return jax.lax.cond(done[i], _apply_update, lambda x: x, carry)
+
+        init_carry = (state.episode_return_buffer,
+                      state.episode_length_buffer,
+                      state.absorbed_buffer,
+                      state.juggle_absorbed_buffer,
+                      state.loco_absorbed_buffer,
+                      state.episode_return_components_buffer,
+                      state.track_count)
+
+        (ret_buf, len_buf, abs_buf, juggle_buf, loco_buf, comp_bufs,
+         count) = jax.lax.fori_loop(0, done.shape[0], _update_buffers, init_carry)
+
+        count_f = jnp.maximum(count.astype(jnp.float32), 1.0)
+        mean_return = jnp.sum(ret_buf) / count_f
+        mean_length = jnp.sum(len_buf) / count_f
+        mean_abs = jnp.sum(abs_buf) / count_f
+        mean_juggle = jnp.sum(juggle_buf) / count_f
+        mean_loco = jnp.sum(loco_buf) / count_f
+        mean_comps = {key: jnp.sum(buf) / count_f for key, buf in comp_bufs.items()}
+
+        state = EpisodicTrackState(
+            env_state=env_state,
+            track_count=count,
+            episode_return_buffer=ret_buf,
+            episode_length_buffer=len_buf,
+            absorbed_buffer=abs_buf,
+            juggle_absorbed_buffer=juggle_buf,
+            loco_absorbed_buffer=loco_buf,
+            episode_return_components_buffer=comp_bufs,
+            mean_episode_return=mean_return,
+            mean_episode_length=mean_length,
+            frac_absorbed=mean_abs,
+            juggle_absorbed=mean_juggle,
+            loco_absorbed=mean_loco,
+            mean_episode_return_components=mean_comps,
+        )
+
+        return next_observation, reward, absorbing, done, info, state
+
+
+@struct.dataclass
 class NStepWrapperState(BaseWrapperState):
     env_state: MjxState
     observation_buffer: jnp.ndarray
@@ -555,8 +689,16 @@ class VecEnv(BaseWrapper):
 
     def __init__(self, env):
         super().__init__(env)
-        self.reset = jax.vmap(self.env.reset, in_axes=(0, 0))
-        self.step = jax.vmap(self.env.step, in_axes=(0, 0))
+        self._reset_with_id = jax.vmap(self.env.reset, in_axes=(0, 0))
+        self._step = jax.vmap(self.env.step, in_axes=(0, 0))
+
+    def reset(self, key, env_id=None):
+        if env_id is None:
+            raise ValueError("VecEnv.reset requires env_id (one per env).")
+        return self._reset_with_id(key, env_id)
+
+    def step(self, state, action):
+        return self._step(state, action)
 
 
 @struct.dataclass

@@ -18,7 +18,8 @@ from loco_mujoco.algorithms import (JaxRLAlgorithmBase, AgentConfBase, AgentStat
                                     Transition, IPPOTransition, TrainState, TrainStateBuffer, MetricHandlerTransition, AdaptiveLRState)
 # from loco_mujoco.core.wrappers import LogWrapper, NStepWrapper, LogEnvState, VecEnv, NormalizeVecReward, SummaryMetrics
 from loco_mujoco.core.wrappers import (RichLogWrapper, NStepWrapper, RichLogEnvState, VecEnv,
-                                       NormalizeVecRewardDict, SummaryRichMetrics, WorldModelWrapper)
+                                       NormalizeVecRewardDict, SummaryRichMetrics, WorldModelWrapper,
+                                       EpisodicTrackWrapper, EpisodicTrackState)
 from loco_mujoco.core.wrappers.mjx import NormalizeVecRewEnvDictState, NormalizeVecRewEnvState
 from loco_mujoco.core.wrappers.mjx import BaseWrapper
 from loco_mujoco.utils import MetricsHandler, ValidationSummary
@@ -697,6 +698,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                     wm_target_norm_std=jnp.sqrt(wm_target_norm_stats["var"] + 1e-6),
                 )
 
+            train_info = {}
             if not freeze_policy:
                 # CALCULATE ADVANTAGE
                 # bootstrap values per agent
@@ -868,22 +870,26 @@ class IPPOJax(JaxRLAlgorithmBase):
                 train_states = update_state[0]
                 rng = update_state[-1]
 
+                for name in agent_names:
+                    train_info[name] = {
+                        "actor_loss": jnp.mean(loss_info[name][2]),
+                        "critic_loss": jnp.mean(loss_info[name][1]),
+                    }
+
             ref_agent = agent_names[0]
 
             logged_metrics = traj_batch.metrics
 
-            mean_episode_return_components = dict()
-            for key in logged_metrics.returned_episode_return_components.keys():
-                mean_episode_return_components[key] = jnp.sum(jnp.where(logged_metrics.done, logged_metrics.returned_episode_return_components[key], 0.0)) / jnp.sum(logged_metrics.done)
+            track_state = env_state.find(EpisodicTrackState)
 
             metric = SummaryRichMetrics(
-                mean_episode_return=jnp.sum(jnp.where(logged_metrics.done, logged_metrics.returned_episode_returns, 0.0)) / jnp.sum(logged_metrics.done),
-                mean_episode_length=jnp.sum(jnp.where(logged_metrics.done, logged_metrics.returned_episode_lengths, 0.0)) / jnp.sum(logged_metrics.done),
+                mean_episode_return=track_state.mean_episode_return,
+                mean_episode_length=track_state.mean_episode_length,
                 max_timestep=global_timesteps + jnp.max(logged_metrics.timestep * config.num_envs),
-                frac_absorbed=jnp.sum(jnp.where(logged_metrics.done, logged_metrics.absorbed, 0.0)) / (jnp.sum(logged_metrics.done) + 1e-6),
-                juggle_absorbed=jnp.sum(jnp.where(logged_metrics.done, logged_metrics.juggle_absorbed, 0.0)) / (jnp.sum(logged_metrics.done) + 1e-6),
-                loco_absorbed=jnp.sum(jnp.where(logged_metrics.done, logged_metrics.loco_absorbed, 0.0)) / (jnp.sum(logged_metrics.done) + 1e-6),
-                mean_episode_return_components=mean_episode_return_components,
+                frac_absorbed=track_state.frac_absorbed,
+                juggle_absorbed=track_state.juggle_absorbed,
+                loco_absorbed=track_state.loco_absorbed,
+                mean_episode_return_components=track_state.mean_episode_return_components,
                 curriculum_step=jnp.mean(logged_metrics.curriculum_step),
             )
 
@@ -920,6 +926,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                             wandb_log_dict[group + '/' + key] = mean_ep_return_components[key]
                         else:
                             continue
+
                     wandb_run.log(wandb_log_dict, step=timestep)                
 
             ts = train_states[ref_agent]
@@ -944,6 +951,10 @@ class IPPOJax(JaxRLAlgorithmBase):
                     "World Model/rollout_disp_distance": wm_abs_dist,
                     "World Model/rollout_vel_rmse": jnp.sqrt(jnp.mean(traj_batch.info["wm_pred_vel_mse"]) + 1e-8),
                 })
+            if len(train_info) > 0:
+                for name, losses in train_info.items():
+                    live_info[f"Train Info/{name}/Actor Loss"] = losses["actor_loss"]
+                    live_info[f"Train Info/{name}/Critic Loss"] = losses["critic_loss"]
             jax.debug.callback(callback, metric, live_info=live_info)
 
             # no train state buffering during training (validation only at end)
@@ -1121,6 +1132,7 @@ class IPPOJax(JaxRLAlgorithmBase):
             env = NStepWrapper(env, config.len_obs_history)
         env = RichLogWrapper(env)
         env = VecEnv(env)
+        env = EpisodicTrackWrapper(env, config.track_len)
         if config.normalize_env:
             env = NormalizeVecRewardDict(env, config.gamma)
         if world_conf is not None:
