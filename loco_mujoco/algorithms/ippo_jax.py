@@ -16,6 +16,8 @@ import optax
 
 from loco_mujoco.algorithms import (JaxRLAlgorithmBase, AgentConfBase, AgentStateBase, ActorCritic,
                                     Transition, IPPOTransition, TrainState, TrainStateBuffer, MetricHandlerTransition, AdaptiveLRState)
+from loco_mujoco.algorithms.common.networks import TransformerXLActorCritic
+from loco_mujoco.algorithms.common.transformer_xl import init_mems
 # from loco_mujoco.core.wrappers import LogWrapper, NStepWrapper, LogEnvState, VecEnv, NormalizeVecReward, SummaryMetrics
 from loco_mujoco.core.wrappers import (RichLogWrapper, NStepWrapper, RichLogEnvState, VecEnv,
                                        NormalizeVecRewardDict, SummaryRichMetrics, WorldModelWrapper,
@@ -269,17 +271,47 @@ class IPPOJax(JaxRLAlgorithmBase):
                                                   for i in range(critic_len_obs_history)])
             action_dim = len(agent_cfg.action_idx)
 
-            networks[agent_name] = ActorCritic(
-                action_dim,
-                activation=agent_cfg.activation,
-                init_std=config.experiment.init_std,
-                learnable_std=config.experiment.learnable_std,
-                actor_hidden_layer_dims=agent_cfg.actor_hidden_layers,
-                critic_hidden_layer_dims=agent_cfg.critic_hidden_layers,
-                actor_obs_ind=actor_obs_ind,
-                critic_obs_ind=critic_obs_ind,
-                # random=agent_cfg.get("random_action", False)
-            )
+            model_type = agent_cfg.get("model_type", "mlp")
+            if model_type == "trxl":
+                required_keys = [
+                    "trxl_model_dim",
+                    "trxl_n_layers",
+                    "trxl_n_heads",
+                    "trxl_ff_dim",
+                    "trxl_mem_len",
+                ]
+                missing = [k for k in required_keys if agent_cfg.get(k, None) is None]
+                if missing:
+                    raise ValueError(f"Missing TrXL config keys for agent '{agent_name}': {missing}")
+                networks[agent_name] = TransformerXLActorCritic(
+                    action_dim,
+                    activation=agent_cfg.activation,
+                    init_std=config.experiment.init_std,
+                    learnable_std=config.experiment.learnable_std,
+                    actor_hidden_layer_dims=agent_cfg.actor_hidden_layers,
+                    critic_hidden_layer_dims=agent_cfg.critic_hidden_layers,
+                    actor_obs_ind=actor_obs_ind,
+                    critic_obs_ind=critic_obs_ind,
+                    model_dim=int(agent_cfg.trxl_model_dim),
+                    n_layers=int(agent_cfg.trxl_n_layers),
+                    n_heads=int(agent_cfg.trxl_n_heads),
+                    ff_dim=int(agent_cfg.trxl_ff_dim),
+                    mem_len=int(agent_cfg.trxl_mem_len),
+                    dropout=float(agent_cfg.get("trxl_dropout", 0.0)),
+                    positional_encoding=str(agent_cfg.get("trxl_positional_encoding", "absolute")),
+                )
+            else:
+                networks[agent_name] = ActorCritic(
+                    action_dim,
+                    activation=agent_cfg.activation,
+                    init_std=config.experiment.init_std,
+                    learnable_std=config.experiment.learnable_std,
+                    actor_hidden_layer_dims=agent_cfg.actor_hidden_layers,
+                    critic_hidden_layer_dims=agent_cfg.critic_hidden_layers,
+                    actor_obs_ind=actor_obs_ind,
+                    critic_obs_ind=critic_obs_ind,
+                    # random=agent_cfg.get("random_action", False)
+                )
 
             txs[agent_name] = cls._get_optimizer(config)
         return cls._agent_conf(config=config, networks=networks, txs=txs)
@@ -392,6 +424,10 @@ class IPPOJax(JaxRLAlgorithmBase):
             env = cls._wrap_env(env, config, world_conf=world_conf)
 
         agent_names = tuple(agent_conf.networks.keys())
+        agent_is_trxl = {
+            name: isinstance(agent_conf.networks[name], TransformerXLActorCritic)
+            for name in agent_names
+        }
         freeze_policy = bool(config.get("freeze_policy", False))
         world_model_enabled = world_conf is not None
         wm_obs_ind = world_conf.obs_ind if world_model_enabled else None
@@ -413,6 +449,22 @@ class IPPOJax(JaxRLAlgorithmBase):
 
         full_action_dim = env.info.action_space.shape[0]
         num_envs = config.num_envs
+
+        def _reset_mems(mems, done_mask):
+            if mems is None:
+                return None
+            done_f = done_mask.astype(jnp.float32)
+            return jax.tree.map(lambda m: m * (1.0 - done_f)[None, :, None], mems)
+
+        def _mems_to_transition(mems):
+            if mems is None:
+                return None
+            return jax.tree.map(lambda m: jnp.transpose(m, (1, 0, 2)), mems)
+
+        def _mems_from_transition(mems):
+            if mems is None:
+                return None
+            return jax.tree.map(lambda m: jnp.transpose(m, (1, 0, 2)), mems)
 
         global_timesteps = timesteps if env_state is None else jnp.zeros_like(timesteps)
 
@@ -441,6 +493,20 @@ class IPPOJax(JaxRLAlgorithmBase):
                     adaptive_lr_state=adaptive_lr_state,
                     tx=agent_conf.txs[name],
                 )
+
+        agent_mems = {}
+        for name in agent_names:
+            if agent_is_trxl[name]:
+                agent_cfg = agent_conf.config.env.agent[name]
+                agent_mems[name] = init_mems(
+                    n_layers=int(agent_cfg.trxl_n_layers),
+                    mem_len=int(agent_cfg.trxl_mem_len),
+                    batch_size=num_envs,
+                    model_dim=int(agent_cfg.trxl_model_dim),
+                    dtype=jnp.float32,
+                )
+            else:
+                agent_mems[name] = None
 
         if world_model_enabled and world_model_state is None:
             rng, subkey = jax.random.split(rng)
@@ -496,16 +562,18 @@ class IPPOJax(JaxRLAlgorithmBase):
         def _update_step(runner_state, unused):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
-                train_states, world_model_state, env_state, last_obs, train_state_buffer, rng = runner_state
+                train_states, agent_mems, world_model_state, env_state, last_obs, train_state_buffer, rng = runner_state
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
                 agent_actions = {}
                 agent_values = {}
                 agent_log_probs = {}
+                agent_mem_in = {}
 
                 # update run_stats per agent during action selection
                 new_train_states = dict(train_states)
+                new_agent_mems = dict(agent_mems)
 
                 # split rng for agents deterministically
                 keys = jax.random.split(_rng, len(agent_names) + 1)
@@ -516,12 +584,27 @@ class IPPOJax(JaxRLAlgorithmBase):
                     ts = new_train_states[name]
                     net = agent_conf.networks[name]
 
-                    y, updates = net.apply(
-                        {"params": ts.params, "run_stats": ts.run_stats},
-                        last_obs,
-                        mutable=["run_stats"],
-                    )
-                    pi, value = y
+                    if agent_is_trxl[name]:
+                        mem_in = new_agent_mems[name]
+                        y, updates = net.apply(
+                            {"params": ts.params, "run_stats": ts.run_stats},
+                            last_obs,
+                            mems=mem_in,
+                            attn_mask=None,
+                            train=False,
+                            mutable=["run_stats"],
+                        )
+                        pi, value, mem_out = y
+                        agent_mem_in[name] = mem_in
+                    else:
+                        y, updates = net.apply(
+                            {"params": ts.params, "run_stats": ts.run_stats},
+                            last_obs,
+                            mutable=["run_stats"],
+                        )
+                        pi, value = y
+                        mem_out = None
+                        agent_mem_in[name] = ()
                     if not freeze_policy:
                         ts = ts.replace(run_stats=updates["run_stats"])
                     a = pi.sample(seed=k)
@@ -530,6 +613,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                     agent_actions[name] = a
                     agent_values[name] = value
                     agent_log_probs[name] = lp
+                    if agent_is_trxl[name]:
+                        new_agent_mems[name] = mem_out
                     new_train_states[name] = ts
 
                 action = _scatter_actions(num_envs, full_action_dim, agent_actions, agent_action_idx)
@@ -537,6 +622,9 @@ class IPPOJax(JaxRLAlgorithmBase):
                 # STEP ENV
                 obsv, reward, absorbing, done, info, env_state = env.step(env_state, action)
                 agent_rewards = info['agent_rewards']
+                for name in agent_names:
+                    if agent_is_trxl[name]:
+                        new_agent_mems[name] = _reset_mems(new_agent_mems[name], done)
                 # GET METRICS
                 log_env_state = env_state.find(RichLogEnvState)
                 logged_metrics = log_env_state.metrics
@@ -550,18 +638,19 @@ class IPPOJax(JaxRLAlgorithmBase):
                     reward=agent_rewards,
                     log_prob=agent_log_probs,
                     obs=last_obs,
+                    mem_in={name: _mems_to_transition(agent_mem_in[name]) for name in agent_names},
                     info=info,
                     traj_state=env_state.additional_carry.traj_state,
                     metrics=logged_metrics,
                 )
-                runner_state = (new_train_states, world_model_state, env_state, obsv, train_state_buffer, _rng_next)
+                runner_state = (new_train_states, new_agent_mems, world_model_state, env_state, obsv, train_state_buffer, _rng_next)
                 return runner_state, transition
 
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, config.num_steps
             )
 
-            train_states, world_model_state, env_state, last_obs, train_state_buffer, rng = runner_state
+            train_states, agent_mems, world_model_state, env_state, last_obs, train_state_buffer, rng = runner_state
             traj_metrics = traj_batch.metrics
             absorb_ratio = jnp.sum(
                 jnp.where(traj_metrics.done, traj_metrics.absorbed, 0.0)
@@ -580,7 +669,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                 return state
 
             env_state = _set_curriculum(env_state)
-            runner_state = (train_states, world_model_state, env_state, last_obs, train_state_buffer, rng)
+            runner_state = (train_states, agent_mems, world_model_state, env_state, last_obs, train_state_buffer, rng)
 
             world_model_metrics = None
             if world_model_enabled:
@@ -706,8 +795,24 @@ class IPPOJax(JaxRLAlgorithmBase):
                 for name in agent_names:
                     ts = train_states[name]
                     net = agent_conf.networks[name]
-                    y, _ = net.apply({"params": ts.params, "run_stats": ts.run_stats}, last_obs, mutable=["run_stats"])
-                    _, last_val = y
+                    if agent_is_trxl[name]:
+                        mems = agent_mems[name]
+                        y, _ = net.apply(
+                            {"params": ts.params, "run_stats": ts.run_stats},
+                            last_obs,
+                            mems=mems,
+                            attn_mask=None,
+                            train=False,
+                            mutable=["run_stats"],
+                        )
+                        _, last_val, _ = y
+                    else:
+                        y, _ = net.apply(
+                            {"params": ts.params, "run_stats": ts.run_stats},
+                            last_obs,
+                            mutable=["run_stats"],
+                        )
+                        _, last_val = y
                     last_vals[name] = last_val
 
                 def _calculate_gae(traj_batch: IPPOTransition, last_vals: Dict[str, jnp.ndarray]):
@@ -776,9 +881,11 @@ class IPPOJax(JaxRLAlgorithmBase):
                         # aggregate logs (optional)
                         loss_logs = {}
 
+                        rng = _rng
                         for name in agent_names:
                             ts = new_train_states[name]
                             net = agent_conf.networks[name]
+                            rng, agent_rng = jax.random.split(rng)
 
                             mask = jnp.ones(traj_mb.done.shape, dtype=jnp.float32)
                             if stand_phase_enabled and name not in stand_phase_active_agents:
@@ -788,9 +895,25 @@ class IPPOJax(JaxRLAlgorithmBase):
 
                             def _loss_fn(params):
                                 # RERUN NETWORK
-                                y, _ = net.apply({"params": params, "run_stats": ts.run_stats},
-                                                    traj_mb.obs, mutable=["run_stats"])
-                                pi, value = y
+                                if agent_is_trxl[name]:
+                                    mems = _mems_from_transition(traj_mb.mem_in[name])
+                                    y, _ = net.apply(
+                                        {"params": params, "run_stats": ts.run_stats},
+                                        traj_mb.obs,
+                                        mems=mems,
+                                        attn_mask=None,
+                                        train=True,
+                                        rngs={"dropout": agent_rng},
+                                        mutable=["run_stats"],
+                                    )
+                                    pi, value, _ = y
+                                else:
+                                    y, _ = net.apply(
+                                        {"params": params, "run_stats": ts.run_stats},
+                                        traj_mb.obs,
+                                        mutable=["run_stats"],
+                                    )
+                                    pi, value = y
                                 # recompute logprob on stored per-agent actions
                                 a = traj_mb.action_dict[name]
                                 log_prob = pi.log_prob(a)
@@ -959,18 +1082,18 @@ class IPPOJax(JaxRLAlgorithmBase):
 
             # no train state buffering during training (validation only at end)
 
-            runner_state = (train_states, world_model_state, env_state, last_obs, train_state_buffer, rng)
+            runner_state = (train_states, agent_mems, world_model_state, env_state, last_obs, train_state_buffer, rng)
             return runner_state, (metric, metric.max_timestep)
 
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_states, world_model_state, env_state, obsv, train_state_buffer, _rng)
+        runner_state = (train_states, agent_mems, world_model_state, env_state, obsv, train_state_buffer, _rng)
         runner_state, (metric, global_timesteps) = jax.lax.scan(
             _update_step, runner_state, None, config.num_updates
         )
 
         agent_state = cls._agent_state(train_states=runner_state[0])
-        world_state = runner_state[1]
-        env_state_out = runner_state[2]
+        world_state = runner_state[2]
+        env_state_out = runner_state[3]
 
         return {"agent_state": agent_state,
                 "world_state": world_state,
@@ -994,8 +1117,26 @@ class IPPOJax(JaxRLAlgorithmBase):
             assert n_envs == 1, "Only one mujoco env can be run at a time."
 
         config = agent_conf.config.experiment
+        full_config = agent_conf.config
         train_states = agent_state.train_states
         agent_names = tuple(train_states.keys())
+        agent_is_trxl = {
+            name: isinstance(agent_conf.networks[name], TransformerXLActorCritic)
+            for name in agent_names
+        }
+        agent_mems = {}
+        for name in agent_names:
+            if agent_is_trxl[name]:
+                agent_cfg = full_config.env.agent[name]
+                agent_mems[name] = init_mems(
+                    n_layers=int(agent_cfg.trxl_n_layers),
+                    mem_len=int(agent_cfg.trxl_mem_len),
+                    batch_size=n_envs,
+                    model_dim=int(agent_cfg.trxl_model_dim),
+                    dtype=jnp.float32,
+                )
+            else:
+                agent_mems[name] = None
 
         if config.get("n_seeds", 1) > 1:
             assert train_state_seed is not None, (
@@ -1073,12 +1214,25 @@ class IPPOJax(JaxRLAlgorithmBase):
                 ts = new_train_states[name]
                 net = agent_conf.networks[name]
 
-                y, updates = net.apply(
-                    {"params": ts.params, "run_stats": ts.run_stats},
-                    obs,
-                    mutable=["run_stats"]
-                )
-                pi, _ = y
+                if agent_is_trxl[name]:
+                    mem_in = agent_mems[name]
+                    y, updates = net.apply(
+                        {"params": ts.params, "run_stats": ts.run_stats},
+                        obs,
+                        mems=mem_in,
+                        attn_mask=None,
+                        train=False,
+                        mutable=["run_stats"]
+                    )
+                    pi, _, mem_out = y
+                    agent_mems[name] = mem_out
+                else:
+                    y, updates = net.apply(
+                        {"params": ts.params, "run_stats": ts.run_stats},
+                        obs,
+                        mutable=["run_stats"]
+                    )
+                    pi, _ = y
 
                 ts = ts.replace(run_stats=updates["run_stats"])
                 a = pi.sample(seed=k)
@@ -1100,6 +1254,17 @@ class IPPOJax(JaxRLAlgorithmBase):
             else:
                 state = jv_step(state, action) 
                 obs = state.observation
+            if use_mujoco and done:
+                for name in agent_names:
+                    if agent_is_trxl[name]:
+                        agent_cfg = full_config.env.agent[name]
+                        agent_mems[name] = init_mems(
+                            n_layers=int(agent_cfg.trxl_n_layers),
+                            mem_len=int(agent_cfg.trxl_mem_len),
+                            batch_size=n_envs,
+                            model_dim=int(agent_cfg.trxl_model_dim),
+                            dtype=jnp.float32,
+                        )
 
             # RENDER
             if use_mujoco:

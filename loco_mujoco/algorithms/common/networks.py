@@ -3,8 +3,10 @@ import jax.numpy as jnp
 import flax.linen as nn
 import numpy as np
 from flax.linen.initializers import constant, orthogonal
-from typing import Sequence
+from typing import Sequence, Optional, Any
 import distrax
+
+from loco_mujoco.algorithms.common.transformer_xl import TransformerXL
 
 
 class RandomActionDistribution:
@@ -137,6 +139,82 @@ class ActorCritic(nn.Module):
         critic = FullyConnectedNet(self.critic_hidden_layer_dims, 1, self.activation, None, False, False)(critic_x)
 
         return pi, jnp.squeeze(critic, axis=-1)
+
+
+class TransformerXLActorCritic(nn.Module):
+    action_dim: Sequence[int]
+    activation: str = "tanh"
+    init_std: float = 1.0
+    learnable_std: bool = True
+    actor_hidden_layer_dims: Sequence[int] = (256, 256)
+    actor_obs_ind: jnp.ndarray = None
+    critic_hidden_layer_dims: Sequence[int] = (256, 256)
+    critic_obs_ind: jnp.ndarray = None
+    model_dim: int = 128
+    n_layers: int = 2
+    n_heads: int = 2
+    ff_dim: int = 256
+    dropout: float = 0.0
+    mem_len: int = 16
+    positional_encoding: str = "absolute"
+
+    def setup(self):
+        self.activation_fn = get_activation_fn(self.activation)
+        self.actor_rms = RunningMeanStd()
+        self.actor_embed = nn.Dense(
+            self.model_dim,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )
+        self.actor_trxl = TransformerXL(
+            model_dim=self.model_dim,
+            n_layers=self.n_layers,
+            n_heads=self.n_heads,
+            ff_dim=self.ff_dim,
+            dropout=self.dropout,
+            mem_len=self.mem_len,
+            positional_encoding=self.positional_encoding,
+        )
+
+    def _select_obs(self, x: jnp.ndarray, obs_ind: Optional[jnp.ndarray]) -> jnp.ndarray:
+        return x if obs_ind is None else x[..., obs_ind]
+
+    def _normalize_and_embed(self, x: jnp.ndarray, rms: Any, embed: nn.Dense) -> jnp.ndarray:
+        if x.ndim == 1:
+            x = x[None, None, ...]
+        elif x.ndim == 2:
+            x = x[None, ...]
+        x_flat = x.reshape((-1, x.shape[-1]))
+        x_norm = rms(x_flat)
+        x_norm = x_norm.reshape(x.shape)
+        h = embed(x_norm)
+        return self.activation_fn(h)
+
+    @nn.compact
+    def __call__(self,
+                 x: jnp.ndarray,
+                 mems: Optional[Any] = None,
+                 attn_mask: Optional[jnp.ndarray] = None,
+                 train: bool = False):
+        mems_actor = mems
+        actor_x = self._select_obs(x, self.actor_obs_ind)
+        critic_x = self._select_obs(x, self.critic_obs_ind)
+        actor_h = self._normalize_and_embed(actor_x, self.actor_rms, self.actor_embed)
+        actor_h, new_mems = self.actor_trxl(actor_h, mems_actor, attn_mask, train)
+        h_last = actor_h[-1]
+        actor_mean = FullyConnectedNet(
+            self.actor_hidden_layer_dims, self.action_dim, self.activation, None, False, False
+        )(h_last)
+        critic = FullyConnectedNet(
+            self.critic_hidden_layer_dims, 1, self.activation, None, False, False
+        )(critic_x)
+
+        actor_logtstd = self.param("log_std", nn.initializers.constant(jnp.log(self.init_std)),
+                                   (self.action_dim,))
+        if not self.learnable_std:
+            actor_logtstd = jax.lax.stop_gradient(actor_logtstd)
+        pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
+        return pi, jnp.squeeze(critic, axis=-1), new_mems
 
 
 class RunningMeanStd(nn.Module):
