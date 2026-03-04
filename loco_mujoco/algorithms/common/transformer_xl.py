@@ -106,6 +106,25 @@ class MultiHeadSelfAttentionXL(nn.Module):
         return self.o_proj(out)
 
 
+class GatedResidual(nn.Module):
+    d_model: int
+    gate_bias: float = -2.0
+    dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
+
+    def setup(self):
+        self.gate_proj = nn.Dense(
+            self.d_model,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            bias_init=nn.initializers.constant(self.gate_bias),
+        )
+
+    def __call__(self, x: jnp.ndarray, f_x: jnp.ndarray) -> jnp.ndarray:
+        gate = jax.nn.sigmoid(self.gate_proj(f_x))
+        return gate * f_x + (1.0 - gate) * x
+
+
 
 class TransformerXLLayer(nn.Module):
     model_dim: int
@@ -128,6 +147,8 @@ class TransformerXLLayer(nn.Module):
         self.ffn1 = nn.Dense(self.ff_dim, dtype=self.dtype, param_dtype=self.param_dtype)
         self.ffn2 = nn.Dense(self.model_dim, dtype=self.dtype, param_dtype=self.param_dtype)
         self.dropout_layer = nn.Dropout(rate=self.dropout)
+        self.resid1 = GatedResidual(self.model_dim, dtype=self.dtype, param_dtype=self.param_dtype)
+        self.resid2 = GatedResidual(self.model_dim, dtype=self.dtype, param_dtype=self.param_dtype)
 
     def __call__(self,
                  x: jnp.ndarray,
@@ -138,7 +159,7 @@ class TransformerXLLayer(nn.Module):
         h = self.ln1(x.astype(jnp.float32)).astype(self.dtype)
         h = self.attn(h, mem, mem_pos_emb, attn_mask, train)
         h = self.dropout_layer(h, deterministic=not train)
-        x = x + h
+        x = self.resid1(x, h)
 
         h = self.ln2(x.astype(jnp.float32)).astype(self.dtype)
         h = self.ffn1(h)
@@ -146,7 +167,7 @@ class TransformerXLLayer(nn.Module):
         h = self.dropout_layer(h, deterministic=not train)
         h = self.ffn2(h)
         h = self.dropout_layer(h, deterministic=not train)
-        return x + h
+        return self.resid2(x, h)
 
 
 
