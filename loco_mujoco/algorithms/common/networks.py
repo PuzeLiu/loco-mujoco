@@ -200,8 +200,9 @@ class TransformerXLActorCritic(nn.Module):
         actor_x = self._select_obs(x, self.actor_obs_ind)
         critic_x = self._select_obs(x, self.critic_obs_ind)
         actor_h = self._normalize_and_embed(actor_x, self.actor_rms, self.actor_embed)
-        actor_h, new_mems = self.actor_trxl(actor_h, mems_actor, attn_mask, train)
+        actor_h, new_mems, layer_h = self.actor_trxl(actor_h, mems_actor, attn_mask, train)
         h_last = actor_h[-1]
+        layer_h_last = [h[-1] for h in layer_h]
         actor_mean = FullyConnectedNet(
             self.actor_hidden_layer_dims, self.action_dim, self.activation, None, False, False
         )(h_last)
@@ -214,7 +215,7 @@ class TransformerXLActorCritic(nn.Module):
         if not self.learnable_std:
             actor_logtstd = jax.lax.stop_gradient(actor_logtstd)
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
-        return pi, jnp.squeeze(critic, axis=-1), new_mems
+        return pi, jnp.squeeze(critic, axis=-1), new_mems, layer_h_last
 
 
 class RunningMeanStd(nn.Module):

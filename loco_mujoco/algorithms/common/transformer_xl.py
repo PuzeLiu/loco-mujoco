@@ -35,6 +35,7 @@ def _abs_positional_encoding(length: int, dim: int, dtype: Any, reverse: bool = 
     if pos_emb.shape[1] < dim:
         pad = jnp.zeros((length, dim - pos_emb.shape[1]), dtype=pos_emb.dtype)
         pos_emb = jnp.concatenate([pos_emb, pad], axis=-1)
+    return pos_emb.astype(dtype)
 
 
 def init_mems(n_layers: int, mem_len: int, batch_size: int, model_dim: int, dtype: Any = jnp.float32) -> List[jnp.ndarray]:
@@ -193,8 +194,9 @@ class TransformerXL(nn.Module):
                  x: jnp.ndarray,
                  mems: Optional[List[jnp.ndarray]],
                  attn_mask: Optional[jnp.ndarray],
-                 train: bool) -> Tuple[jnp.ndarray, List[jnp.ndarray]]:
+                 train: bool) -> Tuple[jnp.ndarray, List[jnp.ndarray], List[jnp.ndarray]]:
         new_mems = []
+        layer_h = []
         h = x
         for i, layer in enumerate(self.layers):
             mem = mems[i] if mems is not None else None
@@ -209,6 +211,7 @@ class TransformerXL(nn.Module):
                     indices = jnp.minimum(indices, max_len - 1)
                     mem_pos_emb = self.pos_embedding[indices]
             h = layer(h, mem, mem_pos_emb, attn_mask, train)
+            layer_h.append(h)
             if self.mem_len > 0:
                 if mem is not None and mem.shape[0] > 0:
                     cat = jnp.concatenate([mem, h], axis=0)
@@ -217,4 +220,4 @@ class TransformerXL(nn.Module):
                 new_mems.append(cat[-self.mem_len:])
             else:
                 new_mems.append(jnp.zeros((0, h.shape[1], h.shape[2]), dtype=h.dtype))
-        return h, new_mems
+        return h, new_mems, layer_h

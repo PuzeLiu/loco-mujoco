@@ -456,15 +456,19 @@ class IPPOJax(JaxRLAlgorithmBase):
             done_f = done_mask.astype(jnp.float32)
             return jax.tree.map(lambda m: m * (1.0 - done_f)[None, :, None], mems)
 
-        def _mems_to_transition(mems):
-            if mems is None:
-                return None
-            return jax.tree.map(lambda m: jnp.transpose(m, (1, 0, 2)), mems)
+        def _mems_from_hidden(hidden_states, episode_id_prev, t_idx, env_idx, mem_len):
+            def _build(layer_states):
+                window = t_idx[:, None] - jnp.arange(mem_len, 0, -1)[None, :]
+                valid = window >= 0
+                window = jnp.clip(window, 0, layer_states.shape[0] - 1)
+                gather = layer_states[window, env_idx[:, None]]
+                ep_t = episode_id_prev[t_idx, env_idx]
+                ep_w = episode_id_prev[window, env_idx[:, None]]
+                same_ep = ep_w == ep_t[:, None]
+                mask = valid & same_ep
+                return jnp.transpose(gather * mask[..., None], (1, 0, 2))
 
-        def _mems_from_transition(mems):
-            if mems is None:
-                return None
-            return jax.tree.map(lambda m: jnp.transpose(m, (1, 0, 2)), mems)
+            return [ _build(layer_states) for layer_states in hidden_states ]
 
         global_timesteps = timesteps if env_state is None else jnp.zeros_like(timesteps)
 
@@ -569,7 +573,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                 agent_actions = {}
                 agent_values = {}
                 agent_log_probs = {}
-                agent_mem_in = {}
+                agent_mem_h = {}
 
                 # update run_stats per agent during action selection
                 new_train_states = dict(train_states)
@@ -594,8 +598,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                             train=False,
                             mutable=["run_stats"],
                         )
-                        pi, value, mem_out = y
-                        agent_mem_in[name] = mem_in
+                        pi, value, mem_out, mem_h = y
                     else:
                         y, updates = net.apply(
                             {"params": ts.params, "run_stats": ts.run_stats},
@@ -604,7 +607,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                         )
                         pi, value = y
                         mem_out = None
-                        agent_mem_in[name] = ()
+                        mem_h = ()
                     if not freeze_policy:
                         ts = ts.replace(run_stats=updates["run_stats"])
                     a = pi.sample(seed=k)
@@ -615,6 +618,9 @@ class IPPOJax(JaxRLAlgorithmBase):
                     agent_log_probs[name] = lp
                     if agent_is_trxl[name]:
                         new_agent_mems[name] = mem_out
+                        agent_mem_h[name] = mem_h
+                    else:
+                        agent_mem_h[name] = ()
                     new_train_states[name] = ts
 
                 action = _scatter_actions(num_envs, full_action_dim, agent_actions, agent_action_idx)
@@ -638,7 +644,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                     reward=agent_rewards,
                     log_prob=agent_log_probs,
                     obs=last_obs,
-                    mem_in={name: _mems_to_transition(agent_mem_in[name]) for name in agent_names},
+                    mem_h={name: agent_mem_h[name] for name in agent_names},
                     info=info,
                     traj_state=env_state.additional_carry.traj_state,
                     metrics=logged_metrics,
@@ -805,7 +811,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                             train=False,
                             mutable=["run_stats"],
                         )
-                        _, last_val, _ = y
+                        _, last_val, _, _ = y
                     else:
                         y, _ = net.apply(
                             {"params": ts.params, "run_stats": ts.run_stats},
@@ -855,6 +861,10 @@ class IPPOJax(JaxRLAlgorithmBase):
                     return advantages, targets
 
                 advantages, targets = _calculate_gae(traj_batch, last_vals)
+                episode_id_prev = jnp.concatenate(
+                    [jnp.zeros((1, num_envs), dtype=jnp.int32), jnp.cumsum(traj_batch.done, axis=0)[:-1]],
+                    axis=0,
+                )
 
                 # UPDATE ACTOR & CRITIC NETWORK
                 def _update_epoch(update_state, unused):
@@ -874,8 +884,11 @@ class IPPOJax(JaxRLAlgorithmBase):
                         lambda x: jnp.reshape(x, [config.num_minibatches, -1] + list(x.shape[1:])),
                         shuffled_batch
                     )
+                    batch_indices = jnp.arange(batch_size)
+                    shuffled_indices = jnp.take(batch_indices, permutation, axis=0)
+                    minibatch_indices = jnp.reshape(shuffled_indices, [config.num_minibatches, -1])
                     def _update_minibatch(train_states, batch_info):
-                        traj_mb, adv_mb, tgt_mb = batch_info
+                        traj_mb, adv_mb, tgt_mb, mb_indices = batch_info
                         new_train_states = dict(train_states)
 
                         # aggregate logs (optional)
@@ -896,7 +909,16 @@ class IPPOJax(JaxRLAlgorithmBase):
                             def _loss_fn(params):
                                 # RERUN NETWORK
                                 if agent_is_trxl[name]:
-                                    mems = _mems_from_transition(traj_mb.mem_in[name])
+                                    mem_len = int(agent_conf.config.env.agent[name].trxl_mem_len)
+                                    t_idx = mb_indices // num_envs
+                                    env_idx = mb_indices % num_envs
+                                    mems = _mems_from_hidden(
+                                        traj_batch.mem_h[name],
+                                        episode_id_prev,
+                                        t_idx,
+                                        env_idx,
+                                        mem_len,
+                                    )
                                     y, _ = net.apply(
                                         {"params": params, "run_stats": ts.run_stats},
                                         traj_mb.obs,
@@ -906,7 +928,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                                         rngs={"dropout": agent_rng},
                                         mutable=["run_stats"],
                                     )
-                                    pi, value, _ = y
+                                    pi, value, _, _ = y
                                 else:
                                     y, _ = net.apply(
                                         {"params": params, "run_stats": ts.run_stats},
@@ -983,7 +1005,11 @@ class IPPOJax(JaxRLAlgorithmBase):
 
                         return new_train_states, loss_logs
 
-                    train_states, loss_logs = jax.lax.scan(_update_minibatch, train_states, minibatches)
+                    train_states, loss_logs = jax.lax.scan(
+                        _update_minibatch,
+                        train_states,
+                        (minibatches[0], minibatches[1], minibatches[2], minibatch_indices),
+                    )
                     update_state = (train_states, traj_batch, advantages, targets, rng)
                     return update_state, loss_logs
 
@@ -1057,6 +1083,11 @@ class IPPOJax(JaxRLAlgorithmBase):
                 "Learning Rate": ts.adaptive_lr_state.learning_rate
                 if config.get("adaptive_lr", False) else config.lr,
             }
+            for name in agent_names:
+                log_std = train_states[name].params.get("log_std", None)
+                if log_std is not None:
+                    live_info[f"Train Info/{name}/LogStd Mean"] = jnp.mean(log_std)
+                    live_info[f"Train Info/{name}/LogStd Std"] = jnp.std(log_std)
             if world_model_metrics is not None:
                 wm_abs_count = jnp.sum(
                     traj_batch.info.get(
@@ -1224,7 +1255,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                         train=False,
                         mutable=["run_stats"]
                     )
-                    pi, _, mem_out = y
+                    pi, _, mem_out, _ = y
                     agent_mems[name] = mem_out
                 else:
                     y, updates = net.apply(
