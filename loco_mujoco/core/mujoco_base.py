@@ -61,6 +61,7 @@ class AdditionalCarry:
     key: jax.Array
     cur_step_in_episode: int
     last_action: Union[np.ndarray, jax.Array]
+    last_policy_action: Union[np.ndarray, jax.Array]
     observation_states: struct.PyTreeNode
     reward_state: struct.PyTreeNode
     domain_randomizer_state: struct.PyTreeNode
@@ -895,6 +896,7 @@ class Mujoco:
             total_timestep=0,
             delta_action=backend.zeros(4),
             last_action=backend.zeros(self.info.action_space.shape),
+            last_policy_action=backend.zeros(self.info.action_space.shape),
             observation_states=self.obs_container.init_state(self, _k1, model, data, backend),
             reward_state=self._reward_function.init_state(self, _k2, model, data, backend),
             domain_randomizer_state=self._domain_randomizer.init_state(self, _k3, model, data, backend),

@@ -8,6 +8,7 @@ from flax import struct
 import mujoco
 from mujoco import MjData, MjModel
 from mujoco.mjx import Data, Model
+from omegaconf import ListConfig, OmegaConf
 
 from loco_mujoco.core.domain_randomizer import DomainRandomizer
 from loco_mujoco.core.control_functions import ControlFunction, PDControl
@@ -74,6 +75,22 @@ class CustomRandomizer(DomainRandomizer):
         self._allowed_to_be_randomized = env.obs_container.get_randomizable_obs_indices()
 
         super().__init__(env, **kwargs)
+
+    def _parse_noise_range(self, value):
+        if value is None:
+            return None
+        if isinstance(value, ListConfig):
+            value = OmegaConf.to_container(value, resolve=True)
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            return float(value[0]), float(value[1])
+        scalar = float(value)
+        return -abs(scalar), abs(scalar)
+
+    def _agent_noise_range(self, agent_name: str, key: str):
+        agent_conf = self.rand_conf.get("agent_joint_randomization", {}).get(agent_name, {})
+        if agent_conf.get("mode") != "multiplicative":
+            return None
+        return self._parse_noise_range(agent_conf.get(key))
 
     def init_state(self,
                    env: Any,
@@ -163,9 +180,9 @@ class CustomRandomizer(DomainRandomizer):
         base_mass_to_add, carry = self._sample_base_mass(model, carry, backend)
         com_displacement, carry = self._sample_com_displacement(model, carry, backend)
         link_mass_multipliers, carry = self._sample_link_mass_multipliers(model, carry, backend)
-        joint_friction_loss, carry = self._sample_joint_friction_loss(model, carry, backend)
-        joint_damping, carry = self._sample_joint_damping(model, carry, backend)
-        joint_armature, carry = self._sample_joint_armature(model, carry, backend)
+        joint_friction_loss, carry = self._sample_joint_friction_loss(env, model, carry, backend)
+        joint_damping, carry = self._sample_joint_damping(env, model, carry, backend)
+        joint_armature, carry = self._sample_joint_armature(env, model, carry, backend)
 
         if isinstance(env._control_func, ControlFunction):
             control_func_state = carry.control_func_state
@@ -259,7 +276,7 @@ class CustomRandomizer(DomainRandomizer):
             body_mass = body_mass.at[other_body_masks].set(body_mass[other_body_masks] * sampled_other_bodies_mass_multipliers)
             dof_frictionloss = model.dof_frictionloss.at[env.qvel_joint_adr].set(domrand_state.joint_friction_loss[env.qvel_joint_adr])
             dof_damping = model.dof_damping.at[env.qvel_joint_adr].set(domrand_state.joint_damping[env.qvel_joint_adr])
-            dof_armature = model.dof_armature.at[env.agent_info["agent_lower_body"]["joints_dofadr"]].set(domrand_state.joint_armature[env.agent_info["agent_lower_body"]["joints_dofadr"]])
+            dof_armature = model.dof_armature.at[env.qvel_joint_adr].set(domrand_state.joint_armature[env.qvel_joint_adr])
             if self.rand_conf["randomize_gravity"]:
                 model = self._set_attribute_in_model(model, "opt.gravity", domrand_state.gravity, backend)
         else:
@@ -737,6 +754,7 @@ class CustomRandomizer(DomainRandomizer):
         return sampled_damping, sampled_stiffness, carry
     
     def _sample_joint_friction_loss(self,
+                                    env: Any,
                                     model: Union[MjModel, Model],
                                     carry: Any,
                                     backend: ModuleType) -> Tuple[Union[np.ndarray, jnp.ndarray], Any]:
@@ -772,9 +790,25 @@ class CustomRandomizer(DomainRandomizer):
             else model.dof_frictionloss[6:]
         )
 
+        noise_range = self._agent_noise_range("agent_right_arm", "joint_friction_loss_noise_range")
+        if noise_range is not None:
+            idx = env.agent_info["agent_right_arm"]["joints_dofadr"]
+            if idx is not None:
+                if backend == jnp:
+                    key = carry.key
+                    key, _k = jax.random.split(key)
+                    noise = jax.random.uniform(_k, shape=(idx.shape[0],), minval=noise_range[0], maxval=noise_range[1])
+                    carry = carry.replace(key=key)
+                    base = model.dof_frictionloss[idx]
+                    sampled_friction_loss = sampled_friction_loss.at[idx].set(base * (1.0 + noise))
+                else:
+                    noise = np.random.uniform(low=noise_range[0], high=noise_range[1], size=(idx.shape[0],))
+                    base = model.dof_frictionloss[idx]
+                    sampled_friction_loss[idx] = base * (1.0 + noise)
+
         return sampled_friction_loss, carry
     
-    def _sample_joint_damping(self, model: Union[MjModel, Model],
+    def _sample_joint_damping(self, env: Any, model: Union[MjModel, Model],
                               carry: Any,
                               backend: ModuleType) -> Tuple[Union[np.ndarray, jnp.ndarray], Any]:
         """
@@ -809,9 +843,26 @@ class CustomRandomizer(DomainRandomizer):
             else model.dof_damping[6:]
         )
 
+        noise_range = self._agent_noise_range("agent_right_arm", "joint_damping_noise_range")
+        if noise_range is not None:
+            idx = env.agent_info["agent_right_arm"]["joints_dofadr"]
+            if idx is not None:
+                if backend == jnp:
+                    key = carry.key
+                    key, _k = jax.random.split(key)
+                    noise = jax.random.uniform(_k, shape=(idx.shape[0],), minval=noise_range[0], maxval=noise_range[1])
+                    carry = carry.replace(key=key)
+                    base = model.dof_damping[idx]
+                    sampled_damping = sampled_damping.at[idx].set(base * (1.0 + noise))
+                else:
+                    noise = np.random.uniform(low=noise_range[0], high=noise_range[1], size=(idx.shape[0],))
+                    base = model.dof_damping[idx]
+                    sampled_damping[idx] = base * (1.0 + noise)
+
         return sampled_damping, carry
     
     def _sample_joint_armature(self,
+                               env: Any,
                                model: Union[MjModel, Model],
                                carry: Any,
                                backend: ModuleType) -> Tuple[Union[np.ndarray, jnp.ndarray], Any]:
@@ -846,6 +897,22 @@ class CustomRandomizer(DomainRandomizer):
             if self.rand_conf["randomize_joint_armature"]
             else model.dof_armature[6:]
         )
+
+        noise_range = self._agent_noise_range("agent_right_arm", "joint_armature_noise_range")
+        if noise_range is not None:
+            idx = env.agent_info["agent_right_arm"]["joints_dofadr"]
+            if idx is not None:
+                if backend == jnp:
+                    key = carry.key
+                    key, _k = jax.random.split(key)
+                    noise = jax.random.uniform(_k, shape=(idx.shape[0],), minval=noise_range[0], maxval=noise_range[1])
+                    carry = carry.replace(key=key)
+                    base = model.dof_armature[idx]
+                    sampled_armature = sampled_armature.at[idx].set(base * (1.0 + noise))
+                else:
+                    noise = np.random.uniform(low=noise_range[0], high=noise_range[1], size=(idx.shape[0],))
+                    base = model.dof_armature[idx]
+                    sampled_armature[idx] = base * (1.0 + noise)
 
         return sampled_armature, carry
 
