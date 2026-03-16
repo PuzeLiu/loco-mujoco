@@ -24,6 +24,7 @@ class CustomRandomizerState:
 
     gravity: Union[np.ndarray, jax.Array]
     geom_friction: Union[np.ndarray, jax.Array]
+    ball_geom_solref: Union[np.ndarray, jax.Array]
     floor_friction: Union[np.ndarray, jax.Array]
     geom_stiffness: Union[np.ndarray, jax.Array]
     geom_damping: Union[np.ndarray, jax.Array]
@@ -66,6 +67,28 @@ class CustomRandomizer(DomainRandomizer):
         self._root_body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, root_body_name)
 
         self._floor_geom_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        ball_body_ids = []
+        for body_id in range(env.model.nbody):
+            body_name = mujoco.mj_id2name(env.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+            if body_name is not None and body_name.startswith("ball_"):
+                ball_body_ids.append(body_id)
+        self._ball_body_ids = np.array(ball_body_ids, dtype=np.int32)
+        ball_body_id_set = set(ball_body_ids)
+
+        ball_geom_ids = []
+        for geom_id in range(env.model.ngeom):
+            if env.model.geom_bodyid[geom_id] not in ball_body_id_set:
+                continue
+
+            # Restrict targeting to the actual collision sphere geoms on ball bodies.
+            if env.model.geom_type[geom_id] != mujoco.mjtGeom.mjGEOM_SPHERE:
+                continue
+            if env.model.geom_contype[geom_id] == 0 and env.model.geom_conaffinity[geom_id] == 0:
+                continue
+
+            ball_geom_ids.append(geom_id)
+
+        self._ball_geom_ids = np.array(ball_geom_ids, dtype=np.int32)
 
         self._other_body_masks = np.ones(env.model.nbody, dtype=bool)
         self._other_body_masks[0] = False # exclude worldbody
@@ -121,6 +144,7 @@ class CustomRandomizer(DomainRandomizer):
 
         return CustomRandomizerState(gravity=backend.array([0.0, 0.0, -9.81]),
                                       geom_friction=backend.array(model.geom_friction.copy()),
+                                      ball_geom_solref=backend.array(model.geom_solref[self._ball_geom_ids].copy()),
                                       floor_friction=backend.array(model.geom_friction[self._floor_geom_id].copy()),
                                       geom_stiffness=backend.zeros(model.ngeom),
                                       geom_damping=backend.zeros(model.ngeom),
@@ -175,6 +199,7 @@ class CustomRandomizer(DomainRandomizer):
         # update different randomization parameters
         gravity, carry = self._sample_gravity(model, carry, backend)
         geom_friction, carry = self._sample_geom_friction(model, carry, backend)
+        ball_geom_solref, carry = self._sample_ball_geom_solref(model, carry, backend)
         # floor_friction, carry = self._sample_floor_friction(model, carry, backend)
         geom_damping, geom_stiffness, carry = self._sample_geom_damping_and_stiffness(model, carry, backend)
         base_mass_to_add, carry = self._sample_base_mass(model, carry, backend)
@@ -198,6 +223,7 @@ class CustomRandomizer(DomainRandomizer):
 
         carry = carry.replace(domain_randomizer_state=domain_randomizer_state.replace(gravity=gravity,
                                                                                       geom_friction=geom_friction,
+                                                                                      ball_geom_solref=ball_geom_solref,
                                                                                       floor_friction=geom_friction[self._floor_geom_id],
                                                                                       geom_stiffness=geom_stiffness,
                                                                                       geom_damping=geom_damping,
@@ -268,8 +294,13 @@ class CustomRandomizer(DomainRandomizer):
 
 
         if backend == jnp:
-            geom_solref = model.geom_solref.at[:, 0].set(-domrand_state.geom_stiffness)
-            geom_solref = geom_solref.at[:, 1].set(-domrand_state.geom_damping)
+            geom_solref = model.geom_solref
+            if self.rand_conf["randomize_geom_stiffness"]:
+                geom_solref = geom_solref.at[:, 0].set(-domrand_state.geom_stiffness)
+            if self.rand_conf["randomize_geom_damping"]:
+                geom_solref = geom_solref.at[:, 1].set(-domrand_state.geom_damping)
+            if self._ball_geom_ids.size > 0 and self._ball_solref_randomization_enabled():
+                geom_solref = geom_solref.at[self._ball_geom_ids].set(domrand_state.ball_geom_solref)
             body_ipos = model.body_ipos.at[root_body_id].set(model.body_ipos[root_body_id] + domrand_state.com_displacement)
             body_mass = model.body_mass.at[root_body_id].set(model.body_mass[root_body_id] * sampled_base_mass_multiplier)
             body_mass = body_mass.at[root_body_id].set(body_mass[root_body_id] + domrand_state.base_mass_to_add)
@@ -281,8 +312,12 @@ class CustomRandomizer(DomainRandomizer):
                 model = self._set_attribute_in_model(model, "opt.gravity", domrand_state.gravity, backend)
         else:
             geom_solref = self._init_geom_solref.copy()
-            geom_solref[:, 0] = -domrand_state.geom_stiffness
-            geom_solref[:, 1] = -domrand_state.geom_damping
+            if self.rand_conf["randomize_geom_stiffness"]:
+                geom_solref[:, 0] = -domrand_state.geom_stiffness
+            if self.rand_conf["randomize_geom_damping"]:
+                geom_solref[:, 1] = -domrand_state.geom_damping
+            if self._ball_geom_ids.size > 0 and self._ball_solref_randomization_enabled():
+                geom_solref[self._ball_geom_ids] = np.asarray(domrand_state.ball_geom_solref)
             body_ipos = self._init_body_ipos.copy()
             body_ipos[root_body_id] += domrand_state.com_displacement
             body_mass = self._init_body_mass.copy()
@@ -303,9 +338,10 @@ class CustomRandomizer(DomainRandomizer):
                 or self.rand_conf["randomize_model_geom_friction_rolling"] 
                 or self.rand_conf["randomize_floor_geom_friction_tangential"] 
                 or self.rand_conf["randomize_floor_geom_friction_torsional"]
-                or self.rand_conf["randomize_floor_geom_friction_rolling"]):
+                or self.rand_conf["randomize_floor_geom_friction_rolling"]
+                or self._ball_friction_randomization_enabled()):
             model = self._set_attribute_in_model(model, "geom_friction", domrand_state.geom_friction, backend)
-        if self.rand_conf["randomize_geom_damping"] or self.rand_conf["randomize_geom_stiffness"]:
+        if self.rand_conf["randomize_geom_damping"] or self.rand_conf["randomize_geom_stiffness"] or self._ball_solref_randomization_enabled():
             model = self._set_attribute_in_model(model, "geom_solref", geom_solref, backend)
         if self.rand_conf["randomize_com_displacement"]:
             model = self._set_attribute_in_model(model, "body_ipos", body_ipos, backend)
@@ -624,6 +660,7 @@ class CustomRandomizer(DomainRandomizer):
             or self.rand_conf["randomize_floor_geom_friction_torsional"]
             or self.rand_conf["randomize_floor_geom_friction_rolling"]
         )
+        any_ball_flags = self._ball_friction_randomization_enabled() and self._ball_geom_ids.size > 0
 
         if backend == jnp:
             key = carry.key
@@ -638,10 +675,16 @@ class CustomRandomizer(DomainRandomizer):
                 interp_floor = jax.random.uniform(subkey)
             else:
                 interp_floor = backend.zeros(())
+            if any_ball_flags:
+                key, subkey = jax.random.split(key)
+                interp_ball = jax.random.uniform(subkey)
+            else:
+                interp_ball = backend.zeros(())
             carry = carry.replace(key=key)
         else:
             interp_model = np.random.uniform(size=(ngeom,)) if any_model_flags else np.zeros(ngeom)
             interp_floor = np.random.uniform() if any_floor_flags else 0.0
+            interp_ball = np.random.uniform() if any_ball_flags else 0.0
 
         # Start from original values
         geom_friction = backend.array(model.geom_friction)
@@ -703,7 +746,86 @@ class CustomRandomizer(DomainRandomizer):
             else:
                 geom_friction[floor_id] = new_floor_friction
 
+        if any_ball_flags:
+            ball_geom_ids = self._ball_geom_ids
+            ball_friction = geom_friction[ball_geom_ids]
+            tan = ball_friction[:, 0]
+            tor = ball_friction[:, 1]
+            roll = ball_friction[:, 2]
+
+            if self.rand_conf.get("randomize_ball_geom_friction_tangential", False):
+                min_, max_ = self.rand_conf["ball_geom_friction_tangential_range"]
+                sampled_tan = min_ + (max_ - min_) * interp_ball
+                tan = backend.ones_like(tan) * sampled_tan
+
+            if self.rand_conf.get("randomize_ball_geom_friction_torsional", False):
+                min_, max_ = self.rand_conf["ball_geom_friction_torsional_range"]
+                sampled_tor = min_ + (max_ - min_) * interp_ball
+                tor = backend.ones_like(tor) * sampled_tor
+
+            if self.rand_conf.get("randomize_ball_geom_friction_rolling", False):
+                min_, max_ = self.rand_conf["ball_geom_friction_rolling_range"]
+                sampled_roll = min_ + (max_ - min_) * interp_ball
+                roll = backend.ones_like(roll) * sampled_roll
+
+            new_ball_friction = backend.stack([tan, tor, roll], axis=1)
+            if backend == jnp:
+                geom_friction = geom_friction.at[ball_geom_ids].set(new_ball_friction)
+            else:
+                geom_friction[ball_geom_ids] = new_ball_friction
+
         return geom_friction, carry
+
+    def _sample_ball_geom_solref(self,
+                                 model: Union[MjModel, Model],
+                                 carry: Any,
+                                 backend: ModuleType) -> Tuple[Union[np.ndarray, jnp.ndarray], Any]:
+        """
+        Samples ball-only geom solref values directly from their configured ranges.
+        """
+        assert_backend_is_supported(backend)
+
+        if self._ball_geom_ids.size == 0:
+            return backend.array(model.geom_solref[self._ball_geom_ids].copy()), carry
+
+        sampled_ball_geom_solref = backend.array(model.geom_solref[self._ball_geom_ids].copy())
+        if not self._ball_solref_randomization_enabled():
+            return sampled_ball_geom_solref, carry
+
+        if backend == jnp:
+            key = carry.key
+            key, subkey = jax.random.split(key)
+            interp_ball = jax.random.uniform(subkey)
+            carry = carry.replace(key=key)
+        else:
+            interp_ball = np.random.uniform()
+
+        if self.rand_conf.get("randomize_ball_geom_solref_stiffness", False):
+            min_, max_ = self.rand_conf["ball_geom_solref_stiffness_range"]
+            sampled_ball_geom_solref = sampled_ball_geom_solref.at[:, 0].set(min_ + (max_ - min_) * interp_ball) if backend == jnp else sampled_ball_geom_solref
+            if backend != jnp:
+                sampled_ball_geom_solref[:, 0] = min_ + (max_ - min_) * interp_ball
+
+        if self.rand_conf.get("randomize_ball_geom_solref_damping", False):
+            min_, max_ = self.rand_conf["ball_geom_solref_damping_range"]
+            sampled_ball_geom_solref = sampled_ball_geom_solref.at[:, 1].set(min_ + (max_ - min_) * interp_ball) if backend == jnp else sampled_ball_geom_solref
+            if backend != jnp:
+                sampled_ball_geom_solref[:, 1] = min_ + (max_ - min_) * interp_ball
+
+        return sampled_ball_geom_solref, carry
+
+    def _ball_friction_randomization_enabled(self) -> bool:
+        return (
+            self.rand_conf.get("randomize_ball_geom_friction_tangential", False)
+            or self.rand_conf.get("randomize_ball_geom_friction_torsional", False)
+            or self.rand_conf.get("randomize_ball_geom_friction_rolling", False)
+        )
+
+    def _ball_solref_randomization_enabled(self) -> bool:
+        return (
+            self.rand_conf.get("randomize_ball_geom_solref_stiffness", False)
+            or self.rand_conf.get("randomize_ball_geom_solref_damping", False)
+        )
 
     def _sample_geom_damping_and_stiffness(self,
                                            model: Union[MjModel, Model],
