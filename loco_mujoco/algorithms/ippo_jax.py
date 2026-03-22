@@ -1088,6 +1088,19 @@ class IPPOJax(JaxRLAlgorithmBase):
                 if log_std is not None:
                     live_info[f"Train Info/{name}/LogStd Mean"] = jnp.mean(log_std)
                     live_info[f"Train Info/{name}/LogStd Std"] = jnp.std(log_std)
+            _bg_err = traj_batch.info.get(
+                "body_goal_vel_err",
+                jnp.zeros(traj_batch.done.shape + (3,), dtype=jnp.float32),
+            )
+            live_info["Locomotion/body_goal_vel_err_rmse_x"] = jnp.sqrt(
+                jnp.mean(jnp.square(_bg_err[..., 0])) + 1e-8
+            )
+            live_info["Locomotion/body_goal_vel_err_rmse_y"] = jnp.sqrt(
+                jnp.mean(jnp.square(_bg_err[..., 1])) + 1e-8
+            )
+            live_info["Locomotion/body_goal_vel_err_rmse_yaw"] = jnp.sqrt(
+                jnp.mean(jnp.square(_bg_err[..., 2])) + 1e-8
+            )
             if world_model_metrics is not None:
                 wm_abs_count = jnp.sum(
                     traj_batch.info.get(
