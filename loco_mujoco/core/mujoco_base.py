@@ -57,6 +57,20 @@ class CurriculumState:
     step: int
 
 @struct.dataclass
+class CatchState:
+    noise_e_t: Union[np.ndarray, jax.Array]
+    noise_e_pos: Union[np.ndarray, jax.Array]
+    noise_e_vel: Union[np.ndarray, jax.Array]
+    catch_pos: Union[np.ndarray, jax.Array]
+    catch_vel: Union[np.ndarray, jax.Array]
+    catch_idx: int
+    catch_t: float
+    catch_valid: Union[np.ndarray, jax.Array]
+    if_catch: bool
+    time_to_catch: Union[np.ndarray, jax.Array]
+    compute_t: float
+
+@struct.dataclass
 class AdditionalCarry:
     key: jax.Array
     cur_step_in_episode: int
@@ -82,7 +96,7 @@ class AdditionalCarry:
     curriculum: CurriculumState
     stand_end_step: int
     ball_com_ipos: Union[np.ndarray, jax.Array]
-
+    right_hand_catch_state: CatchState
 
 class Mujoco:
     """
@@ -933,6 +947,19 @@ class Mujoco:
             curriculum=CurriculumState(absorb_ratio=1.0, step=0),
             stand_end_step=0,
             ball_com_ipos=backend.zeros((getattr(self, 'n_balls', 0), 3)),
+            right_hand_catch_state=CatchState(
+                noise_e_t=backend.zeros(1),
+                noise_e_pos=backend.zeros(3),
+                noise_e_vel=backend.zeros(3),
+                catch_pos=backend.zeros(3),
+                catch_vel=backend.zeros(3),
+                catch_idx=-1,
+                catch_t=0.0,
+                catch_valid=backend.zeros(1, dtype=bool),
+                time_to_catch=backend.zeros((getattr(self, 'n_balls', 0), 3)),
+                if_catch=False,
+                compute_t=0.0,
+            ),
         )
 
         return carry
