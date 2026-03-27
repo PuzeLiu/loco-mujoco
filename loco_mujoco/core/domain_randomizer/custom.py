@@ -457,51 +457,93 @@ class CustomRandomizer(DomainRandomizer):
                 push_relief_duration = backend.array(self.rand_conf["push_relief_duration"] / env.dt, dtype=backend.int32)
                 push_torque_amplitude = self.rand_conf["push_torque_amplitude"]
 
-                is_push_active = (domrand_state.push_counter < push_active_duration)
-                domrand_state_local = domrand_state.replace(push_counter=domrand_state.push_counter + 1)
+                cycle_duration = push_active_duration + push_relief_duration
+
                 data_local = data
                 carry_local = carry
+                domrand_state_local = domrand_state
 
-                # if push is inactive, and a push is sampled, then randomly generate a push force (cartesian and torque), and save it in domrand state
-                # if push is active, then use the saved push force from domrand state. so just increment the push counter
+                # Current phase determined by current counter before increment
+                is_push_active = domrand_state_local.push_counter < push_active_duration
+                is_cycle_finished = domrand_state_local.push_counter >= cycle_duration
+
                 if backend == jnp:
                     key = carry_local.key
                     key, _k = jax.random.split(key)
-                    random_value = jax.random.uniform(_k, shape=(1,))
                     carry_local = carry_local.replace(key=key)
-                    
-                    def inactive_push_branch(_):
-                        # Generate random push force
+
+                    def resample_new_cycle(_):
+                        random_value = jax.random.uniform(_k, shape=(1,))
                         random_push_force = jax.random.uniform(_k, shape=(6,), minval=-1.0, maxval=1.0)
                         random_push_force = random_push_force * backend.array([push_force_amplitude, push_force_amplitude, push_force_amplitude,
                                                                                 push_torque_amplitude, push_torque_amplitude, push_torque_amplitude])
                         
                         def apply_push(_):
-                            new_state = domrand_state_local.replace(active_root_push_force=random_push_force)
-                            return new_state.replace(push_counter=0)  # reset push counter
-                        
+                            return domrand_state_local.replace(
+                                active_root_push_force=random_push_force,
+                                push_counter=1
+                            )
+
                         def no_push(_):
-                            return domrand_state_local.replace(active_root_push_force=backend.zeros_like(domrand_state_local.active_root_push_force))
-                        
+                            return domrand_state_local.replace(
+                                active_root_push_force=backend.zeros_like(domrand_state_local.active_root_push_force),
+                                push_counter=1
+                            )
+
                         return jax.lax.cond(random_value[0] < push_prob, apply_push, no_push, operand=None)
-                    
-                    def active_push_branch(_):
-                        return domrand_state_local
-                    
-                    domrand_state_local = jax.lax.cond(~is_push_active, inactive_push_branch, active_push_branch, operand=None)
+
+                    def continue_current_cycle(_):
+                        next_counter = domrand_state_local.push_counter + 1
+
+                        def active_branch(_):
+                            # keep current sampled push during active window
+                            return domrand_state_local.replace(push_counter=next_counter)
+
+                        def relief_branch(_):
+                            # zero force during relief window
+                            return domrand_state_local.replace(
+                                active_root_push_force=backend.zeros_like(domrand_state_local.active_root_push_force),
+                                push_counter=next_counter
+                            )
+
+                        return jax.lax.cond(is_push_active, active_branch, relief_branch, operand=None)
+
+                    domrand_state_local = jax.lax.cond(
+                        is_cycle_finished,
+                        resample_new_cycle,
+                        continue_current_cycle,
+                        operand=None
+                    )
 
                 else:
-                    if not is_push_active:
-                        # sample a push force with a random prob
+                    if is_cycle_finished:
                         random_value = np.random.uniform(size=(1,))
                         if random_value[0] < push_prob:
                             random_push_force = np.random.uniform(-1.0, 1.0, size=(6,))
-                            random_push_force = random_push_force * backend.array([push_force_amplitude, push_force_amplitude, push_force_amplitude,
-                                                                                push_torque_amplitude, push_torque_amplitude, push_torque_amplitude])
-                            domrand_state_local = domrand_state_local.replace(active_root_push_force=random_push_force)
-                            domrand_state_local = domrand_state_local.replace(push_counter=0)  # reset push counter
+                            random_push_force = random_push_force * backend.array([
+                                push_force_amplitude, push_force_amplitude, push_force_amplitude,
+                                push_torque_amplitude, push_torque_amplitude, push_torque_amplitude
+                            ])
+                            domrand_state_local = domrand_state_local.replace(
+                                active_root_push_force=random_push_force,
+                                push_counter=1
+                            )
+                        else:
+                            domrand_state_local = domrand_state_local.replace(
+                                active_root_push_force=backend.zeros_like(domrand_state_local.active_root_push_force),
+                                push_counter=1
+                            )
                     else:
-                        domrand_state_local = domrand_state_local.replace(active_root_push_force=backend.zeros_like(domrand_state_local.active_root_push_force))
+                        next_counter = domrand_state_local.push_counter + 1
+                        if is_push_active:
+                            # keep current sampled push during active window
+                            domrand_state_local = domrand_state_local.replace(push_counter=next_counter)
+                        else:
+                            # relief window: zero force
+                            domrand_state_local = domrand_state_local.replace(
+                                active_root_push_force=backend.zeros_like(domrand_state_local.active_root_push_force),
+                                push_counter=next_counter
+                            )
 
                 push_force = domrand_state_local.active_root_push_force[:3]
                 push_torque = domrand_state_local.active_root_push_force[3:]
