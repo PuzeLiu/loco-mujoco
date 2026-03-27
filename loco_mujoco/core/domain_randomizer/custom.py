@@ -65,6 +65,7 @@ class CustomRandomizer(DomainRandomizer):
         info_props = env._get_all_info_properties()
         root_body_name = info_props["root_body_name"]
         self._root_body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, root_body_name)
+        self._torso_body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, "torso")
 
         self._floor_geom_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
         ball_body_ids = []
@@ -439,7 +440,7 @@ class CustomRandomizer(DomainRandomizer):
 
 
         if self.rand_conf["push_robots"]:
-            push_enabled = env._is_stand_phase(carry)
+            push_enabled = True  # env._is_stand_phase(carry)
 
             def _apply_push(_):
                 # Pushing
@@ -507,12 +508,12 @@ class CustomRandomizer(DomainRandomizer):
 
                 if backend == jnp:
                     # Apply the push force to the root body (body index 0)
-                    data_local = data_local.replace(xfrc_applied=data_local.xfrc_applied.at[self._root_body_id, :3].set(push_force))
-                    data_local = data_local.replace(xfrc_applied=data_local.xfrc_applied.at[self._root_body_id, 3:].set(push_torque))                
+                    data_local = data_local.replace(xfrc_applied=data_local.xfrc_applied.at[self._torso_body_id, :3].set(push_force))
+                    data_local = data_local.replace(xfrc_applied=data_local.xfrc_applied.at[self._torso_body_id, 3:].set(push_torque))                
                 else:
                     # Apply the push force to the root body (body index 0)
-                    data_local.xfrc_applied[self._root_body_id, :3] = push_force
-                    data_local.xfrc_applied[self._root_body_id, 3:] = push_torque
+                    data_local.xfrc_applied[self._torso_body_id, :3] = push_force
+                    data_local.xfrc_applied[self._torso_body_id, 3:] = push_torque
 
                 return domrand_state_local, data_local, carry_local
 
