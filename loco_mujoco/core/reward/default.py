@@ -638,6 +638,16 @@ class HumanoidLocomotionReward(Reward):
         
         self._left_foot_sensor_adr = np.array(foot_sensor_adrs[0])
         self._right_foot_sensor_adr = np.array(foot_sensor_adrs[1])
+        torso_orientation_sensor_id = model.sensor("orientation").id
+        torso_angvel_sensor_id = model.sensor("local_angvel").id
+        self._torso_orientation_sensor_adr = np.arange(
+            model.sensor_adr[torso_orientation_sensor_id],
+            model.sensor_adr[torso_orientation_sensor_id] + model.sensor_dim[torso_orientation_sensor_id],
+        )
+        self._torso_angvel_sensor_adr = np.arange(
+            model.sensor_adr[torso_angvel_sensor_id],
+            model.sensor_adr[torso_angvel_sensor_id] + model.sensor_dim[torso_angvel_sensor_id],
+        )
 
         # Initialize foot site IDs
         self._left_foot_site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "left_foot")
@@ -663,6 +673,7 @@ class HumanoidLocomotionReward(Reward):
         self._base_height_coeff = kwargs.get("base_height_coeff", 0.0)
         # self._base_height_target = kwargs.get("base_height_target", 0.0)
         self.orientation_coeff = kwargs.get("orientation_coeff", 0.0)
+        self._torso_orientation_coeff = kwargs.get("torso_orientation_coeff", 0.0)
 
         # Torque and energy coefficients
         self._joint_torque_coeff = kwargs.get("joint_torque_coeff", 0.0)
@@ -671,6 +682,7 @@ class HumanoidLocomotionReward(Reward):
         # Velocity and acceleration penalties
         self._z_vel_coeff = kwargs.get("z_vel_coeff", 0.0)
         self._roll_pitch_vel_coeff = kwargs.get("roll_pitch_vel_coeff", 0.0)
+        self._torso_roll_pitch_vel_coeff = kwargs.get("torso_roll_pitch_vel_coeff", 0.0)
         self._joint_vel_coeff = kwargs.get("joint_vel_coeff", 0.0)
         self._joint_acc_coeff = kwargs.get("joint_acc_coeff", 0.0)
         self._root_acc_coeff = kwargs.get("root_acc_coeff", 0.0)
@@ -737,10 +749,12 @@ class HumanoidLocomotionReward(Reward):
             "joint_deviation_l1": 0.,
             "base_height": 0.,
             "orientation": 0.,
+            "torso_orientation": 0.,
             "torque": 0.,
             "energy": 0.,
             "z_vel": 0.,
             "roll_pitch_vel": 0.,
+            "torso_roll_pitch_vel": 0.,
             "joint_vel": 0.,
             "acceleration": 0.,
             "root_acceleration": 0.,
@@ -854,6 +868,9 @@ class HumanoidLocomotionReward(Reward):
         # Orientation reward
         projected_gravity = global_rot.inv().apply(backend.array([0, 0, -1]))
         orientation_reward = backend.sum(backend.square(projected_gravity[:2]))  # Penalize deviation from vertical
+        torso_rot = R.from_quat(quat_scalarfirst2scalarlast(data.sensordata[self._torso_orientation_sensor_adr]))
+        torso_projected_gravity = torso_rot.inv().apply(backend.array([0, 0, -1]))
+        torso_orientation_reward = backend.sum(backend.square(torso_projected_gravity[:2]))
 
         # Joint torque reward
         torque_reward = backend.sum(backend.square(data.qfrc_actuator[~self._free_joint_qvel_mask]))
@@ -870,6 +887,7 @@ class HumanoidLocomotionReward(Reward):
         # Velocity penalties
         z_vel_reward = backend.square(local_vel_root_lin[2])
         roll_pitch_vel_reward = backend.square(local_vel_root_ang[:2]).sum()
+        torso_roll_pitch_vel_reward = backend.square(data.sensordata[self._torso_angvel_sensor_adr][:2]).sum()
 
         # Joint motion penalties
         joint_vel = data.qvel[~self._free_joint_qvel_mask]
@@ -1088,10 +1106,12 @@ class HumanoidLocomotionReward(Reward):
         joint_deviation_l1_penalty *= (self._joint_deviation_l1_coeff * env.dt)
         base_height_reward *= (base_height_coeff * env.dt)
         orientation_reward *= (self.orientation_coeff * env.dt)
+        torso_orientation_reward *= (self._torso_orientation_coeff * env.dt)
         torque_reward *= (self._joint_torque_coeff * env.dt)
         energy_reward *= (self._energy_coeff * env.dt)
         z_vel_reward *= (self._z_vel_coeff * env.dt)
         roll_pitch_vel_reward *= (self._roll_pitch_vel_coeff * env.dt)
+        torso_roll_pitch_vel_reward *= (self._torso_roll_pitch_vel_coeff * env.dt)
         joint_vel_reward *= (self._joint_vel_coeff * env.dt)
         acceleration_reward *= (joint_acc_coeff * env.dt)
         root_acceleration_reward *= (self._root_acc_coeff * env.dt)
@@ -1115,8 +1135,8 @@ class HumanoidLocomotionReward(Reward):
         )
         
         penalty_rewards = (
-            base_height_reward + orientation_reward + torque_reward + 
-            energy_reward + z_vel_reward + roll_pitch_vel_reward + joint_vel_reward +
+            base_height_reward + orientation_reward + torso_orientation_reward + torque_reward + 
+            energy_reward + z_vel_reward + roll_pitch_vel_reward + torso_roll_pitch_vel_reward + joint_vel_reward +
             acceleration_reward + root_acceleration_reward + action_rate_reward + 
             joint_position_limit_reward + feet_slip_reward + 
             feet_yaw_diff_reward + feet_yaw_mean_reward + feet_roll_reward +
@@ -1150,10 +1170,12 @@ class HumanoidLocomotionReward(Reward):
             "base_height": base_height_reward,
             "joint_deviation_l1": joint_deviation_l1_penalty,
             "orientation": orientation_reward,
+            "torso_orientation": torso_orientation_reward,
             "torque": torque_reward,
             "energy": energy_reward,
             "z_vel": z_vel_reward,
             "roll_pitch_vel": roll_pitch_vel_reward,
+            "torso_roll_pitch_vel": torso_roll_pitch_vel_reward,
             "joint_vel": joint_vel_reward,
             "acceleration": acceleration_reward,
             "root_acceleration": root_acceleration_reward,

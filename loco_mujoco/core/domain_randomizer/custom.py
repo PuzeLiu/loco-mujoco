@@ -8,7 +8,7 @@ from flax import struct
 import mujoco
 from mujoco import MjData, MjModel
 from mujoco.mjx import Data, Model
-from omegaconf import ListConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from loco_mujoco.core.domain_randomizer import DomainRandomizer
 from loco_mujoco.core.control_functions import ControlFunction, PDControl
@@ -31,6 +31,7 @@ class CustomRandomizerState:
     base_mass_to_add: float
     com_displacement: Union[np.ndarray, jax.Array]
     link_mass_multipliers: Union[np.ndarray, jax.Array]
+    torso_inertia_scale: Union[np.ndarray, jax.Array]
     joint_friction_loss: Union[np.ndarray, jax.Array]
     joint_damping: Union[np.ndarray, jax.Array]
     joint_armature: Union[np.ndarray, jax.Array]
@@ -58,6 +59,7 @@ class CustomRandomizer(DomainRandomizer):
         self._init_geom_solref = None
         self._init_body_ipos = None
         self._init_body_mass = None
+        self._init_body_inertia = None
         self._init_dof_frictionloss = None
         self._init_dof_damping = None
         self._init_dof_armature = None
@@ -152,6 +154,7 @@ class CustomRandomizer(DomainRandomizer):
                                       base_mass_to_add=0.0,
                                       com_displacement=backend.array([0.0, 0.0, 0.0]),
                                       link_mass_multipliers=backend.array([1.0] * (model.nbody-1)), #exclude worldbody
+                                      torso_inertia_scale=backend.array([1.0, 1.0, 1.0]),
                                       joint_friction_loss=backend.array([0.0] * (model.nv-6)), #exclude freejoint 6 dofs
                                       joint_damping=backend.array([0.0] * (model.nv-6)), #exclude freejoint 6 dofs
                                     #   joint_armature=backend.array([0.0] * (model.nv-6)), #exclude freejoint 6 dofs
@@ -193,6 +196,7 @@ class CustomRandomizer(DomainRandomizer):
             self._init_geom_solref = model.geom_solref.copy()
             self._init_body_ipos = model.body_ipos.copy()
             self._init_body_mass = model.body_mass.copy()
+            self._init_body_inertia = model.body_inertia.copy()
             self._init_dof_frictionloss = model.dof_frictionloss.copy()
             self._init_dof_damping = model.dof_damping.copy()
             self._init_dof_armature = model.dof_armature.copy()
@@ -206,6 +210,7 @@ class CustomRandomizer(DomainRandomizer):
         base_mass_to_add, carry = self._sample_base_mass(model, carry, backend)
         com_displacement, carry = self._sample_com_displacement(model, carry, backend)
         link_mass_multipliers, carry = self._sample_link_mass_multipliers(model, carry, backend)
+        torso_inertia_scale, carry = self._sample_torso_inertia(model, carry, backend)
         joint_friction_loss, carry = self._sample_joint_friction_loss(env, model, carry, backend)
         joint_damping, carry = self._sample_joint_damping(env, model, carry, backend)
         joint_armature, carry = self._sample_joint_armature(env, model, carry, backend)
@@ -231,6 +236,7 @@ class CustomRandomizer(DomainRandomizer):
                                                                                       base_mass_to_add=base_mass_to_add,
                                                                                       com_displacement=com_displacement,
                                                                                       link_mass_multipliers=link_mass_multipliers,
+                                                                                      torso_inertia_scale=torso_inertia_scale,
                                                                                       joint_friction_loss=joint_friction_loss,
                                                                                       joint_damping=joint_damping,
                                                                                       joint_armature=joint_armature,
@@ -283,11 +289,8 @@ class CustomRandomizer(DomainRandomizer):
 
         domrand_state = carry.domain_randomizer_state
 
-        sampled_base_mass_multiplier = domrand_state.link_mass_multipliers[0]
-        sampled_other_bodies_mass_multipliers = domrand_state.link_mass_multipliers[1:]
-
         root_body_id = self._root_body_id
-        other_body_masks = self._other_body_masks
+        torso_body_id = self._torso_body_id
 
         # increment the curriculum coefficient
         new_curriculum_coefficient = domrand_state.curriculum_coefficient + (1 / self.rand_conf["total_timesteps"])
@@ -303,9 +306,11 @@ class CustomRandomizer(DomainRandomizer):
             if self._ball_geom_ids.size > 0 and self._ball_solref_randomization_enabled():
                 geom_solref = geom_solref.at[self._ball_geom_ids].set(domrand_state.ball_geom_solref)
             body_ipos = model.body_ipos.at[root_body_id].set(model.body_ipos[root_body_id] + domrand_state.com_displacement)
-            body_mass = model.body_mass.at[root_body_id].set(model.body_mass[root_body_id] * sampled_base_mass_multiplier)
+            body_mass = model.body_mass.at[1:].set(model.body_mass[1:] * domrand_state.link_mass_multipliers)
             body_mass = body_mass.at[root_body_id].set(body_mass[root_body_id] + domrand_state.base_mass_to_add)
-            body_mass = body_mass.at[other_body_masks].set(body_mass[other_body_masks] * sampled_other_bodies_mass_multipliers)
+            body_inertia = model.body_inertia
+            if self.rand_conf.get("randomize_torso_inertia", False) and torso_body_id > 0:
+                body_inertia = body_inertia.at[torso_body_id].set(model.body_inertia[torso_body_id] * domrand_state.torso_inertia_scale)
             dof_frictionloss = model.dof_frictionloss.at[env.qvel_joint_adr].set(domrand_state.joint_friction_loss[env.qvel_joint_adr])
             dof_damping = model.dof_damping.at[env.qvel_joint_adr].set(domrand_state.joint_damping[env.qvel_joint_adr])
             dof_armature = model.dof_armature.at[env.qvel_joint_adr].set(domrand_state.joint_armature[env.qvel_joint_adr])
@@ -322,9 +327,11 @@ class CustomRandomizer(DomainRandomizer):
             body_ipos = self._init_body_ipos.copy()
             body_ipos[root_body_id] += domrand_state.com_displacement
             body_mass = self._init_body_mass.copy()
-            body_mass[root_body_id] *= sampled_base_mass_multiplier
+            body_mass[1:] *= domrand_state.link_mass_multipliers
             body_mass[root_body_id] += domrand_state.base_mass_to_add
-            body_mass[other_body_masks] *= sampled_other_bodies_mass_multipliers
+            body_inertia = self._init_body_inertia.copy()
+            if self.rand_conf.get("randomize_torso_inertia", False) and torso_body_id > 0:
+                body_inertia[torso_body_id] *= domrand_state.torso_inertia_scale
             dof_frictionloss = self._init_dof_frictionloss.copy()
             dof_frictionloss[6:] = domrand_state.joint_friction_loss
             dof_damping = self._init_dof_damping.copy()
@@ -348,6 +355,8 @@ class CustomRandomizer(DomainRandomizer):
             model = self._set_attribute_in_model(model, "body_ipos", body_ipos, backend)
         if self.rand_conf["randomize_link_mass"] or self.rand_conf["randomize_base_mass"]:
             model = self._set_attribute_in_model(model, "body_mass", body_mass, backend)
+        if self.rand_conf.get("randomize_torso_inertia", False):
+            model = self._set_attribute_in_model(model, "body_inertia", body_inertia, backend)
         if self.rand_conf["randomize_joint_friction_loss"]:
             model = self._set_attribute_in_model(model, "dof_frictionloss", dof_frictionloss, backend)
         if self.rand_conf["randomize_joint_damping"]:
@@ -1203,7 +1212,17 @@ class CustomRandomizer(DomainRandomizer):
         """
         assert_backend_is_supported(backend)
 
-        displ_min, displ_max = self.rand_conf["com_displacement_range"]
+        displacement_range = self.rand_conf["com_displacement_range"]
+        if isinstance(displacement_range, DictConfig):
+            displacement_range = OmegaConf.to_container(displacement_range, resolve=True)
+
+        if isinstance(displacement_range, dict):
+            displ_min = backend.array([displacement_range[axis][0] for axis in ("x", "y", "z")])
+            displ_max = backend.array([displacement_range[axis][1] for axis in ("x", "y", "z")])
+        else:
+            displ_min, displ_max = displacement_range
+            displ_min = backend.array([displ_min, displ_min, displ_min])
+            displ_max = backend.array([displ_max, displ_max, displ_max])
 
         if backend == jnp:
             key = carry.key
@@ -1241,12 +1260,12 @@ class CustomRandomizer(DomainRandomizer):
         assert_backend_is_supported(backend)
 
         multiplier_dict = self.rand_conf["link_mass_multiplier_range"]
+        if isinstance(multiplier_dict, DictConfig):
+            multiplier_dict = OmegaConf.to_container(multiplier_dict, resolve=True)
 
         mult_base_min, mult_base_max = multiplier_dict["root_body"]
+        mult_torso_min, mult_torso_max = multiplier_dict.get("torso", multiplier_dict["root_body"])
         mult_other_min, mult_other_max = multiplier_dict["other_bodies"]
-
-        # print(mult_base_min.shape)
-        # print(mult_other_min.shape)
         if backend == jnp:
             key = carry.key
             key, _k = jax.random.split(key)
@@ -1255,28 +1274,58 @@ class CustomRandomizer(DomainRandomizer):
         else:
             interpolation = np.random.uniform(size=model.nbody-1)
 
-        sampled_base_mass_multiplier = (
-            mult_base_min + (mult_base_max - mult_base_min) * interpolation[0].reshape(1)
+        mass_multipliers = (
+            mult_other_min + (mult_other_max - mult_other_min) * interpolation
             if self.rand_conf["randomize_link_mass"]
-            else backend.array([1.0])
+            else backend.array([1.0] * (model.nbody - 1))
         )
 
-        # sampled_base_mass_multiplier = jnp.expand_dims(sampled_base_mass_multiplier, axis=0)
+        if self.rand_conf["randomize_link_mass"]:
+            root_idx = self._root_body_id - 1
+            torso_idx = self._torso_body_id - 1
+            root_multiplier = mult_base_min + (mult_base_max - mult_base_min) * interpolation[root_idx]
+            if backend == jnp:
+                mass_multipliers = mass_multipliers.at[root_idx].set(root_multiplier)
+            else:
+                mass_multipliers[root_idx] = root_multiplier
 
-        sampled_other_bodies_mass_multipliers = (
-            mult_other_min + (mult_other_max - mult_other_min) * interpolation[1:]
-            if self.rand_conf["randomize_link_mass"]
-            else backend.array([1.0]*(model.nbody-2))
-        )
-
-        # sampled_other_bodies_mass_multipliers = jnp.expand_dims(sampled_other_bodies_mass_multipliers, axis=0)
-
-        mass_multipliers = backend.concatenate([
-            sampled_base_mass_multiplier,
-            sampled_other_bodies_mass_multipliers,
-        ])
+            if torso_idx >= 0:
+                torso_multiplier = mult_torso_min + (mult_torso_max - mult_torso_min) * interpolation[torso_idx]
+                if backend == jnp:
+                    mass_multipliers = mass_multipliers.at[torso_idx].set(torso_multiplier)
+                else:
+                    mass_multipliers[torso_idx] = torso_multiplier
 
         return mass_multipliers, carry
+
+    def _sample_torso_inertia(self,
+                              model: Union[MjModel, Model],
+                              carry: Any,
+                              backend: ModuleType) -> Tuple[Union[np.ndarray, jnp.ndarray], Any]:
+        assert_backend_is_supported(backend)
+
+        if not self.rand_conf.get("randomize_torso_inertia", False) or self._torso_body_id < 0:
+            return backend.array([1.0, 1.0, 1.0]), carry
+
+        inertia_range = self.rand_conf["torso_inertia_range"]
+        if isinstance(inertia_range, DictConfig):
+            inertia_range = OmegaConf.to_container(inertia_range, resolve=True)
+
+        if backend == jnp:
+            key = carry.key
+            key, _k = jax.random.split(key)
+            interpolation = jax.random.uniform(_k, shape=(3,))
+            carry = carry.replace(key=key)
+        else:
+            interpolation = np.random.uniform(size=3)
+
+        torso_inertia_scale = backend.array([
+            inertia_range["Ixx_scale"][0] + (inertia_range["Ixx_scale"][1] - inertia_range["Ixx_scale"][0]) * interpolation[0],
+            inertia_range["Iyy_scale"][0] + (inertia_range["Iyy_scale"][1] - inertia_range["Iyy_scale"][0]) * interpolation[1],
+            inertia_range["Izz_scale"][0] + (inertia_range["Izz_scale"][1] - inertia_range["Izz_scale"][0]) * interpolation[2],
+        ])
+
+        return torso_inertia_scale, carry
     
     def _sample_p_gains_noise(self,
                               env, model: Union[MjModel, Model],
