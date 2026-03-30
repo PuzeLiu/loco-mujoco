@@ -942,7 +942,8 @@ class IPPOJax(JaxRLAlgorithmBase):
 
                                 # value loss (clipped)
                                 old_v = traj_mb.value[name]
-                                v_clipped = old_v + (value - old_v).clip(-config.clip_eps, config.clip_eps)
+                                clip_eps = agent_conf.config.env.agent[name].clip_eps
+                                v_clipped = old_v + (value - old_v).clip(-clip_eps, clip_eps)
                                 v_loss1 = jnp.square(value - tgt_mb[name])
                                 v_loss2 = jnp.square(v_clipped - tgt_mb[name])
                                 value_loss = 0.5 * jnp.maximum(v_loss1, v_loss2)
@@ -956,7 +957,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                                 gae = (gae - gae_mean) / (jnp.sqrt(gae_var) + 1e-8)
 
                                 loss1 = ratio * gae
-                                loss2 = jnp.clip(ratio, 1.0 - config.clip_eps, 1.0 + config.clip_eps) * gae
+                                loss2 = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * gae
                                 loss_actor = -(jnp.minimum(loss1, loss2) * mask).sum() / mask_denom
 
                                 entropy = (pi.entropy() * mask).sum() / mask_denom

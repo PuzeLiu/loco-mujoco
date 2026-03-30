@@ -1073,30 +1073,43 @@ class HumanoidLocomotionReward(Reward):
         symmetry_air_reward = 0.0
 
         # ==================== SCALE REWARDS BY COEFFICIENTS ====================
+        max_curriculum_step = 5
         if isinstance(self._action_rate_coeff, ListConfig):
             assert len(self._action_rate_coeff) == 2
-            coeff_scale = jnp.linspace(self._action_rate_coeff[0], self._action_rate_coeff[1], 5)
+            coeff_scale = jnp.linspace(self._action_rate_coeff[0], self._action_rate_coeff[1], max_curriculum_step)
             action_rate_coeff = coeff_scale[carry.curriculum.step]
         else:
             action_rate_coeff = self._action_rate_coeff
         if isinstance(self._base_height_coeff, ListConfig):
             assert len(self._base_height_coeff) == 2
-            coeff_scale = jnp.linspace(self._base_height_coeff[0], self._base_height_coeff[1], 5)
+            coeff_scale = jnp.linspace(self._base_height_coeff[0], self._base_height_coeff[1], max_curriculum_step)
             base_height_coeff = coeff_scale[carry.curriculum.step]
         else:
             base_height_coeff = self._base_height_coeff
         if isinstance(self._joint_acc_coeff, ListConfig):
             assert len(self._joint_acc_coeff) == 2
-            coeff_scale = jnp.linspace(self._joint_acc_coeff[0], self._joint_acc_coeff[1], 5)
+            coeff_scale = jnp.linspace(self._joint_acc_coeff[0], self._joint_acc_coeff[1], max_curriculum_step)
             joint_acc_coeff = coeff_scale[carry.curriculum.step]
         else:
             joint_acc_coeff = self._joint_acc_coeff
         if isinstance(self._feet_slip_coeff, ListConfig):
             assert len(self._feet_slip_coeff) == 2
-            coeff_scale = jnp.linspace(self._feet_slip_coeff[0], self._feet_slip_coeff[1], 5)
+            coeff_scale = jnp.linspace(self._feet_slip_coeff[0], self._feet_slip_coeff[1], max_curriculum_step)
             feet_slip_coeff = coeff_scale[carry.curriculum.step]
         else:
             feet_slip_coeff = self._feet_slip_coeff
+        if isinstance(self.orientation_coeff, ListConfig):
+            assert len(self.orientation_coeff) == 2
+            coeff_scale = jnp.linspace(self.orientation_coeff[0], self.orientation_coeff[1], max_curriculum_step)
+            orientation_coeff = coeff_scale[carry.curriculum.step]
+        else:
+            orientation_coeff = self.orientation_coeff
+        if isinstance(self._torso_orientation_coeff, ListConfig):
+            assert len(self._torso_orientation_coeff) == 2
+            coeff_scale = jnp.linspace(self._torso_orientation_coeff[0], self._torso_orientation_coeff[1], max_curriculum_step)
+            torso_orientation_coeff = coeff_scale[carry.curriculum.step]
+        else:
+            torso_orientation_coeff = self._torso_orientation_coeff 
         
         survival_reward *= (self._survival * env.dt)
         tracking_reward_linvel_x *= (self._tracking_w_sum_linvel_x * env.dt)
@@ -1105,8 +1118,8 @@ class HumanoidLocomotionReward(Reward):
         joint_qpos_reward *= (self._nominal_joint_pos_coeff * env.dt)
         joint_deviation_l1_penalty *= (self._joint_deviation_l1_coeff * env.dt)
         base_height_reward *= (base_height_coeff * env.dt)
-        orientation_reward *= (self.orientation_coeff * env.dt)
-        torso_orientation_reward *= (self._torso_orientation_coeff * env.dt)
+        orientation_reward *= (orientation_coeff * env.dt)
+        torso_orientation_reward *= (torso_orientation_coeff * env.dt)
         torque_reward *= (self._joint_torque_coeff * env.dt)
         energy_reward *= (self._energy_coeff * env.dt)
         z_vel_reward *= (self._z_vel_coeff * env.dt)
