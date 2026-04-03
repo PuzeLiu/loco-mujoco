@@ -96,6 +96,7 @@ class AdditionalCarry:
     curriculum: CurriculumState
     stand_end_step: int
     ball_com_ipos: Union[np.ndarray, jax.Array]
+    joint_pos_offset: Union[np.ndarray, jax.Array]
     right_hand_catch_state: CatchState
 
 class Mujoco:
@@ -947,6 +948,7 @@ class Mujoco:
             curriculum=CurriculumState(absorb_ratio=1.0, step=0),
             stand_end_step=0,
             ball_com_ipos=backend.zeros((getattr(self, 'n_balls', 0), 3)),
+            joint_pos_offset=backend.zeros(len(self._control_func._nominal_joint_positions)),
             right_hand_catch_state=CatchState(
                 noise_e_t=backend.zeros(1),
                 noise_e_pos=backend.zeros(3),

@@ -222,7 +222,7 @@ class CustomRandomizer(DomainRandomizer):
             d_noise, carry = self._sample_d_gains_noise(env, model, carry, backend)
             carry = carry.replace(control_func_state=control_func_state.replace(p_gain_noise=p_noise,
                                                                                 d_gain_noise=d_noise,
-                                                                                pos_offset=backend.zeros_like(env._control_func._nominal_joint_positions),
+                                                                                pos_offset=carry.joint_pos_offset,
                                                                                 ctrl_mult=backend.ones_like(env._control_func._nominal_joint_positions)))
 
 

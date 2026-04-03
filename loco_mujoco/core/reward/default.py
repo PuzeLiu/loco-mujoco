@@ -700,6 +700,7 @@ class HumanoidLocomotionReward(Reward):
 
         self._tracking_base_pos_coeff = kwargs.get("tracking_base_pos_coeff", 0.0)
         self._tracking_base_pos_exp = kwargs.get("tracking_base_pos_exp", 4.0)
+        self._yaw_deviation_coeff = kwargs.get("yaw_deviation_coeff", 0.0)
 
         # Initialize joint limits and nominal positions
         self._limited_joints = np.array(model.jnt_limited, dtype=bool)
@@ -758,6 +759,7 @@ class HumanoidLocomotionReward(Reward):
             "no_fly": 0.,
             "impact": 0.,
             "tracking_base_pos": 0.,
+            "yaw_deviation": 0.,
         }
 
         return HumanoidLocomotionRewardState(
@@ -987,7 +989,7 @@ class HumanoidLocomotionReward(Reward):
             backend.cos(base_yaw) * (left_foot_pos[1] - right_foot_pos[1]) -
             backend.sin(base_yaw) * (left_foot_pos[0] - right_foot_pos[0])
         )
-        feet_distance_reward = backend.clip(self._feet_distance_target - feet_distance, 0.0, 0.1)
+        feet_distance_reward = backend.linalg.norm(self._feet_distance_target - feet_distance)
 
         # Feet swing reward
         gait_frequency = goal_state.gait_frequency
@@ -1061,6 +1063,13 @@ class HumanoidLocomotionReward(Reward):
         impact_reward = left_foot_impact * 1.0 + right_foot_impact * 1.0
         impact_reward = backend.mean(impact_reward)
 
+        # Yaw deviation reward
+        cur_rot = data.site_xmat[env.base_site_id].reshape(3, 3)
+        init_rot = carry.base_site_rot0
+        rel_rot = init_rot.T @ cur_rot
+        relative_yaw = backend.arctan2(rel_rot[1, 0], rel_rot[0, 0])
+        yaw_deviation_reward = relative_yaw ** 2
+
         # Symmetry air reward (currently unused)
         symmetry_air_reward = 0.0
 
@@ -1124,6 +1133,7 @@ class HumanoidLocomotionReward(Reward):
         no_fly_reward *= (self._no_fly_coeff * env.dt)
         impact_reward *= (self._impact_coeff * env.dt)
         tracking_base_pos_reward *= (self._tracking_base_pos_coeff * env.dt)
+        yaw_deviation_reward *= (self._yaw_deviation_coeff * env.dt)
 
         # ==================== COMBINE REWARDS ====================
         
@@ -1139,7 +1149,7 @@ class HumanoidLocomotionReward(Reward):
             joint_position_limit_reward + feet_slip_reward + 
             feet_yaw_diff_reward + feet_yaw_mean_reward + feet_roll_reward +
             feet_distance_reward + air_time_reward + no_fly_reward + impact_reward + 
-            joint_deviation_l1_penalty
+            joint_deviation_l1_penalty + yaw_deviation_reward
         )
         
         total_reward = survival_reward + tracking_reward + penalty_rewards
@@ -1186,6 +1196,7 @@ class HumanoidLocomotionReward(Reward):
             "no_fly": no_fly_reward,
             "impact": impact_reward,
             "tracking_base_pos": tracking_base_pos_reward,
+            "yaw_deviation": yaw_deviation_reward,
         }
         
         reward_state = reward_state.replace(reward_components=updated_reward_components)
