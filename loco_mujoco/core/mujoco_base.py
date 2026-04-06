@@ -12,6 +12,7 @@ import numpy as np
 from flax import struct
 import jax
 import jax.numpy as jnp
+from omegaconf import ListConfig
 
 from loco_mujoco.core.utils import Box, MDPInfo, info_property
 from loco_mujoco.core.reward.base import Reward
@@ -800,15 +801,21 @@ class Mujoco:
         if backend == jnp:
             key = carry.key
 
+        max_curriculum_step = self.env_cfg.curriculum.end_step
         for obs in self.obs_container.values():
-            if not obs.allow_randomization or obs.randomization_scale == 0.0:
+            if not obs.allow_randomization:
                 continue
+            randomization_scale = obs.randomization_scale
+            if isinstance(randomization_scale, ListConfig):
+                assert len(randomization_scale) == 2
+                coeff_scale = jnp.linspace(randomization_scale[0], randomization_scale[1], max_curriculum_step)
+                randomization_scale = coeff_scale[carry.curriculum.step]
             if backend == np:
-                noise = np.random.normal(0.0, obs.randomization_scale, size=obs.obs_ind.shape)
+                noise = np.random.normal(0.0, np.asarray(randomization_scale), size=obs.obs_ind.shape)
                 merged[obs.obs_ind] = merged[obs.obs_ind] + noise
             elif backend == jnp:
                 key, subkey = jax.random.split(key)
-                noise = jax.random.normal(subkey, shape=obs.obs_ind.shape) * obs.randomization_scale
+                noise = jax.random.normal(subkey, shape=obs.obs_ind.shape) * jnp.asarray(randomization_scale)
                 merged = merged.at[obs.obs_ind].add(noise)
 
         if backend == jnp:

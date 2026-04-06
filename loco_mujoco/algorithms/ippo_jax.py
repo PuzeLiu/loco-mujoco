@@ -328,6 +328,18 @@ class IPPOJax(JaxRLAlgorithmBase):
         if obs_ind.size == 0:
             raise ValueError(f"World model obs_group '{obs_group}' produced empty indices.")
         obs_ind = jnp.array(obs_ind, dtype=jnp.int32)
+        # len_obs_history_list = [config.experiment.get("len_obs_history", 1)]
+        # for agent_cfg in config.env.agent.values():
+        #     len_obs_history_list.append(agent_cfg.get("len_obs_history", 1))
+        #     len_obs_history_list.append(agent_cfg.get("critic_len_obs_history", 1))
+        #     len_obs_history_list.append(agent_cfg.get("actor_len_obs_history", 1))
+        # max_len_obs_history = max(len_obs_history_list)
+        # if max_len_obs_history > 1:
+        #     obs_len = env.info.observation_space.shape[0]
+        #     world_model_len_obs_history = 4
+        #     history_offset = max_len_obs_history - world_model_len_obs_history
+        #     obs_ind = jnp.concatenate([obs_ind + (history_offset + i) * obs_len
+        #                                         for i in range(world_model_len_obs_history)])
         input_dim = int(obs_ind.shape[0])
         action_dim = int(env.info.action_space.shape[0])
         input_dim += action_dim
@@ -428,7 +440,10 @@ class IPPOJax(JaxRLAlgorithmBase):
             name: isinstance(agent_conf.networks[name], TransformerXLActorCritic)
             for name in agent_names
         }
-        freeze_policy = bool(config.get("freeze_policy", False))
+        freeze_policy = {
+            name: bool(agent_conf.config.env.agent[name].freeze_policy)
+            for name in agent_names
+        }
         world_model_enabled = world_conf is not None
         wm_obs_ind = world_conf.obs_ind if world_model_enabled else None
         wm_cfg = config.world_model if world_model_enabled else None
@@ -608,7 +623,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                         pi, value = y
                         mem_out = None
                         mem_h = ()
-                    if not freeze_policy:
+                    if not freeze_policy[name]:
                         ts = ts.replace(run_stats=updates["run_stats"])
                     a = pi.sample(seed=k)
                     lp = pi.log_prob(a)
@@ -794,7 +809,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                 )
 
             train_info = {}
-            if not freeze_policy:
+            if not all(freeze_policy.values()):
                 # CALCULATE ADVANTAGE
                 # bootstrap values per agent
                 last_vals = {}
@@ -899,6 +914,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                             ts = new_train_states[name]
                             net = agent_conf.networks[name]
                             rng, agent_rng = jax.random.split(rng)
+                            if freeze_policy[name]:
+                                continue
 
                             mask = jnp.ones(traj_mb.done.shape, dtype=jnp.float32)
                             if stand_phase_enabled and name not in stand_phase_active_agents:
@@ -1021,10 +1038,16 @@ class IPPOJax(JaxRLAlgorithmBase):
                 rng = update_state[-1]
 
                 for name in agent_names:
-                    train_info[name] = {
-                        "actor_loss": jnp.mean(loss_info[name][2]),
-                        "critic_loss": jnp.mean(loss_info[name][1]),
-                    }
+                    if not freeze_policy[name]:
+                        train_info[name] = {
+                            "actor_loss": jnp.mean(loss_info[name][2]),
+                            "critic_loss": jnp.mean(loss_info[name][1]),
+                        }
+                    else:
+                        train_info[name] = {
+                            "actor_loss": 0.0,
+                            "critic_loss": 0.0,
+                        }
 
             ref_agent = agent_names[0]
 

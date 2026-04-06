@@ -1074,7 +1074,7 @@ class HumanoidLocomotionReward(Reward):
         symmetry_air_reward = 0.0
 
         # ==================== SCALE REWARDS BY COEFFICIENTS ====================
-        max_curriculum_step = 5
+        max_curriculum_step = env.env_cfg.curriculum.end_step
         if isinstance(self._action_rate_coeff, ListConfig):
             assert len(self._action_rate_coeff) == 2
             coeff_scale = jnp.linspace(self._action_rate_coeff[0], self._action_rate_coeff[1], max_curriculum_step)
