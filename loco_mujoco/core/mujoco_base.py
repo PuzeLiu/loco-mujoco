@@ -789,10 +789,12 @@ class Mujoco:
         mask = backend.ones(len(merged), dtype=bool)
 
         if backend == np:
+            stateful_obs_ind = np.asarray(stateful_obs_ind, dtype=int)
             mask[stateful_obs_ind] = False
             merged[mask] = obs_not_stateful
             merged[stateful_obs_ind] = obs_stateful
         elif backend == jnp:
+            stateful_obs_ind = jnp.asarray(stateful_obs_ind, dtype=jnp.int32)
             mask = mask.at[stateful_obs_ind].set(False)
             indices = jnp.where(mask, size=len(obs_not_stateful))[0]  # Convert boolean mask to indices
             merged = merged.at[indices].set(obs_not_stateful)
@@ -805,18 +807,24 @@ class Mujoco:
         for obs in self.obs_container.values():
             if not obs.allow_randomization:
                 continue
+            if backend == np:
+                obs_ind = np.asarray(obs.obs_ind, dtype=int)
+            else:
+                obs_ind = jnp.asarray(obs.obs_ind, dtype=jnp.int32)
+            if obs_ind.size == 0:
+                continue
             randomization_scale = obs.randomization_scale
             if isinstance(randomization_scale, ListConfig):
                 assert len(randomization_scale) == 2
                 coeff_scale = jnp.linspace(randomization_scale[0], randomization_scale[1], max_curriculum_step)
                 randomization_scale = coeff_scale[carry.curriculum.step]
             if backend == np:
-                noise = np.random.normal(0.0, np.asarray(randomization_scale), size=obs.obs_ind.shape)
-                merged[obs.obs_ind] = merged[obs.obs_ind] + noise
+                noise = np.random.normal(0.0, np.asarray(randomization_scale), size=obs_ind.shape)
+                merged[obs_ind] = merged[obs_ind] + noise
             elif backend == jnp:
                 key, subkey = jax.random.split(key)
-                noise = jax.random.normal(subkey, shape=obs.obs_ind.shape) * jnp.asarray(randomization_scale)
-                merged = merged.at[obs.obs_ind].add(noise)
+                noise = jax.random.normal(subkey, shape=obs_ind.shape) * jnp.asarray(randomization_scale)
+                merged = merged.at[obs_ind].add(noise)
 
         if backend == jnp:
             carry = carry.replace(key=key)

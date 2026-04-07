@@ -441,9 +441,10 @@ class IPPOJax(JaxRLAlgorithmBase):
             for name in agent_names
         }
         freeze_policy = {
-            name: bool(agent_conf.config.env.agent[name].freeze_policy)
+            name: agent_conf.config.env.agent[name].freeze_policy
             for name in agent_names
         }
+        has_trainable_policy = any(mode != True for mode in freeze_policy.values())
         world_model_enabled = world_conf is not None
         wm_obs_ind = world_conf.obs_ind if world_model_enabled else None
         wm_cfg = config.world_model if world_model_enabled else None
@@ -484,6 +485,11 @@ class IPPOJax(JaxRLAlgorithmBase):
                 return jnp.transpose(gather * mask[..., None], (1, 0, 2))
 
             return [ _build(layer_states) for layer_states in hidden_states ]
+
+        def _policy_training_enabled(name, env_state):
+            if freeze_policy[name] == "adaptive":
+                return jnp.any(env_state.additional_carry.curriculum.step > 0)
+            return not bool(freeze_policy[name])
 
         global_timesteps = timesteps if env_state is None else jnp.zeros_like(timesteps)
 
@@ -623,8 +629,12 @@ class IPPOJax(JaxRLAlgorithmBase):
                         pi, value = y
                         mem_out = None
                         mem_h = ()
-                    if not freeze_policy[name]:
-                        ts = ts.replace(run_stats=updates["run_stats"])
+                    ts = jax.lax.cond(
+                        _policy_training_enabled(name, env_state),
+                        lambda state: state.replace(run_stats=updates["run_stats"]),
+                        lambda state: state,
+                        ts,
+                    )
                     a = pi.sample(seed=k)
                     lp = pi.log_prob(a)
 
@@ -809,7 +819,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                 )
 
             train_info = {}
-            if not all(freeze_policy.values()):
+            if has_trainable_policy:
                 # CALCULATE ADVANTAGE
                 # bootstrap values per agent
                 last_vals = {}
@@ -914,9 +924,6 @@ class IPPOJax(JaxRLAlgorithmBase):
                             ts = new_train_states[name]
                             net = agent_conf.networks[name]
                             rng, agent_rng = jax.random.split(rng)
-                            if freeze_policy[name]:
-                                continue
-
                             mask = jnp.ones(traj_mb.done.shape, dtype=jnp.float32)
                             if stand_phase_enabled and name not in stand_phase_active_agents:
                                 mask = 1.0 - traj_mb.info["no_ball"]
@@ -982,44 +989,55 @@ class IPPOJax(JaxRLAlgorithmBase):
                                 total_loss = loss_actor + config.vf_coef * value_loss - config.ent_coef * entropy
                                 return total_loss, (value_loss, loss_actor, entropy, ratio)
 
-                            grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-                            (total_loss, (value_loss, loss_actor, entropy, ratio)), grads = grad_fn(ts.params)\
-                            
-                            # apply grads
-                            ts = ts.apply_gradients(grads=grads)
+                            def _train_agent(ts):
+                                grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
+                                (total_loss, (value_loss, loss_actor, entropy, ratio)), grads = grad_fn(ts.params)
 
-                        # adaptive lr (per-agent, same logic)
-                            if config.get("adaptive_lr", False):
-                                current_lr = ts.adaptive_lr_state.learning_rate
-                                eps = 1e-7
-                                approx_kl = ((ratio - 1.0 + eps) - jnp.log(ratio + eps))
-                                approx_kl = (approx_kl * mask).sum() / mask_denom
+                                # apply grads
+                                ts = ts.apply_gradients(grads=grads)
 
-                                next_lr = jax.lax.cond(
-                                    approx_kl > config.kl_target * config.kl_margin,
-                                    lambda lr: lr / config.kl_lr_scale,
-                                    lambda lr: lr,
-                                    current_lr,
-                                )
-                                next_lr = jax.lax.cond(
-                                    approx_kl < config.kl_target / config.kl_margin,
-                                    lambda lr: lr * config.kl_lr_scale,
-                                    lambda lr: lr,
-                                    next_lr,
-                                )
-                                next_lr = jnp.clip(next_lr, config.lr_min, config.lr_max)
+                                # adaptive lr (per-agent, same logic)
+                                if config.get("adaptive_lr", False):
+                                    current_lr = ts.adaptive_lr_state.learning_rate
+                                    eps = 1e-7
+                                    approx_kl = ((ratio - 1.0 + eps) - jnp.log(ratio + eps))
+                                    approx_kl = (approx_kl * mask).sum() / mask_denom
 
-                                # update injected hyperparams (same hack, per-agent)
-                                old_h = ts.opt_state[1].hyperparams
-                                new_h = {**old_h, "learning_rate": next_lr}
-                                new_inject = ts.opt_state[1]._replace(hyperparams=new_h)
-                                new_opt_state = tuple(ts.opt_state[i] if i != 1 else new_inject
-                                                      for i in range(len(ts.opt_state)))
-                                ts = ts.replace(opt_state=new_opt_state,
-                                                adaptive_lr_state=AdaptiveLRState(learning_rate=next_lr))
+                                    next_lr = jax.lax.cond(
+                                        approx_kl > config.kl_target * config.kl_margin,
+                                        lambda lr: lr / config.kl_lr_scale,
+                                        lambda lr: lr,
+                                        current_lr,
+                                    )
+                                    next_lr = jax.lax.cond(
+                                        approx_kl < config.kl_target / config.kl_margin,
+                                        lambda lr: lr * config.kl_lr_scale,
+                                        lambda lr: lr,
+                                        next_lr,
+                                    )
+                                    next_lr = jnp.clip(next_lr, config.lr_min, config.lr_max)
 
+                                    # update injected hyperparams (same hack, per-agent)
+                                    old_h = ts.opt_state[1].hyperparams
+                                    new_h = {**old_h, "learning_rate": next_lr}
+                                    new_inject = ts.opt_state[1]._replace(hyperparams=new_h)
+                                    new_opt_state = tuple(ts.opt_state[i] if i != 1 else new_inject
+                                                          for i in range(len(ts.opt_state)))
+                                    ts = ts.replace(opt_state=new_opt_state,
+                                                    adaptive_lr_state=AdaptiveLRState(learning_rate=next_lr))
+
+                                return ts, (total_loss, value_loss, loss_actor, entropy)
+
+                            ts, loss_logs[name] = jax.lax.cond(
+                                _policy_training_enabled(name, env_state),
+                                _train_agent,
+                                lambda ts: (
+                                    ts,
+                                    (jnp.array(0.0), jnp.array(0.0), jnp.array(0.0), jnp.array(0.0)),
+                                ),
+                                ts,
+                            )
                             new_train_states[name] = ts
-                            loss_logs[name] = (total_loss, value_loss, loss_actor, entropy)
 
                         return new_train_states, loss_logs
 
@@ -1038,16 +1056,11 @@ class IPPOJax(JaxRLAlgorithmBase):
                 rng = update_state[-1]
 
                 for name in agent_names:
-                    if not freeze_policy[name]:
-                        train_info[name] = {
-                            "actor_loss": jnp.mean(loss_info[name][2]),
-                            "critic_loss": jnp.mean(loss_info[name][1]),
-                        }
-                    else:
-                        train_info[name] = {
-                            "actor_loss": 0.0,
-                            "critic_loss": 0.0,
-                        }
+                    policy_training_enabled = _policy_training_enabled(name, env_state)
+                    train_info[name] = {
+                        "actor_loss": jnp.where(policy_training_enabled, jnp.mean(loss_info[name][2]), 0.0),
+                        "critic_loss": jnp.where(policy_training_enabled, jnp.mean(loss_info[name][1]), 0.0),
+                    }
 
             ref_agent = agent_names[0]
 
