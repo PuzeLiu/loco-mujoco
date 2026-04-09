@@ -814,16 +814,24 @@ class Mujoco:
             if obs_ind.size == 0:
                 continue
             randomization_scale = obs.randomization_scale
+            obs_scale = obs.obs_scale
             if isinstance(randomization_scale, ListConfig):
                 assert len(randomization_scale) == 2
                 coeff_scale = jnp.linspace(randomization_scale[0], randomization_scale[1], max_curriculum_step)
                 randomization_scale = coeff_scale[carry.curriculum.step]
             if backend == np:
-                noise = np.random.normal(0.0, np.asarray(randomization_scale), size=obs_ind.shape)
-                merged[obs_ind] = merged[obs_ind] + noise
+                if obs.randomization_dist == "normal":
+                    noise = np.random.normal(0.0, np.asarray(randomization_scale), size=obs_ind.shape)
+                elif obs.randomization_dist == "uniform":
+                    noise = np.random.uniform(-np.asarray(randomization_scale), np.asarray(randomization_scale), size=obs_ind.shape)
+                merged[obs_ind] = merged[obs_ind] * obs_scale + noise
             elif backend == jnp:
                 key, subkey = jax.random.split(key)
-                noise = jax.random.normal(subkey, shape=obs_ind.shape) * jnp.asarray(randomization_scale)
+                if obs.randomization_dist == "normal":
+                    noise = jax.random.normal(subkey, shape=obs_ind.shape) * jnp.asarray(randomization_scale)
+                elif obs.randomization_dist == "uniform":
+                    noise = jax.random.uniform(subkey, shape=obs_ind.shape, minval=-jnp.asarray(randomization_scale), maxval=jnp.asarray(randomization_scale))
+                merged = merged.at[obs_ind].set(merged[obs_ind] * obs_scale)
                 merged = merged.at[obs_ind].add(noise)
 
         if backend == jnp:
