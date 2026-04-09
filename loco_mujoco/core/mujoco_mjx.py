@@ -22,7 +22,6 @@ class MjxAdditionalCarry(AdditionalCarry):
     """
     final_observation: jax.Array
     final_info: Dict[str, Any]
-    ball_velocity_perturbed_in_air: jax.Array
 
 
 @struct.dataclass
@@ -592,7 +591,6 @@ class Mjx(Mujoco):
         return MjxAdditionalCarry(
             final_observation=backend.zeros(self.info.observation_space.shape),
             final_info={"no_ball": backend.array(False)},
-            ball_velocity_perturbed_in_air=backend.zeros(getattr(self, "n_balls", 0), dtype=bool),
             **vars(carry),
         )
 
