@@ -30,6 +30,7 @@ class CustomRandomizerState:
     geom_damping: Union[np.ndarray, jax.Array]
     base_mass_to_add: float
     com_displacement: Union[np.ndarray, jax.Array]
+    tool_right_com_displacement: Union[np.ndarray, jax.Array]
     link_mass_multipliers: Union[np.ndarray, jax.Array]
     torso_inertia_scale: Union[np.ndarray, jax.Array]
     joint_friction_loss: Union[np.ndarray, jax.Array]
@@ -68,6 +69,7 @@ class CustomRandomizer(DomainRandomizer):
         root_body_name = info_props["root_body_name"]
         self._root_body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, root_body_name)
         self._torso_body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, "torso")
+        self._tool_right_body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, "tool_right")
 
         self._floor_geom_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
         ball_body_ids = []
@@ -153,6 +155,7 @@ class CustomRandomizer(DomainRandomizer):
                                       geom_damping=backend.zeros(model.ngeom),
                                       base_mass_to_add=0.0,
                                       com_displacement=backend.array([0.0, 0.0, 0.0]),
+                                      tool_right_com_displacement=backend.array([0.0, 0.0, 0.0]),
                                       link_mass_multipliers=backend.array([1.0] * (model.nbody-1)), #exclude worldbody
                                       torso_inertia_scale=backend.array([1.0, 1.0, 1.0]),
                                       joint_friction_loss=backend.array([0.0] * (model.nv-6)), #exclude freejoint 6 dofs
@@ -209,6 +212,7 @@ class CustomRandomizer(DomainRandomizer):
         geom_damping, geom_stiffness, carry = self._sample_geom_damping_and_stiffness(model, carry, backend)
         base_mass_to_add, carry = self._sample_base_mass(model, carry, backend)
         com_displacement, carry = self._sample_com_displacement(model, carry, backend)
+        tool_right_com_displacement, carry = self._sample_body_com_displacement("tool_right", carry, backend)
         link_mass_multipliers, carry = self._sample_link_mass_multipliers(model, carry, backend)
         torso_inertia_scale, carry = self._sample_torso_inertia(model, carry, backend)
         joint_friction_loss, carry = self._sample_joint_friction_loss(env, model, carry, backend)
@@ -235,6 +239,7 @@ class CustomRandomizer(DomainRandomizer):
                                                                                       geom_damping=geom_damping,
                                                                                       base_mass_to_add=base_mass_to_add,
                                                                                       com_displacement=com_displacement,
+                                                                                      tool_right_com_displacement=tool_right_com_displacement,
                                                                                       link_mass_multipliers=link_mass_multipliers,
                                                                                       torso_inertia_scale=torso_inertia_scale,
                                                                                       joint_friction_loss=joint_friction_loss,
@@ -291,6 +296,7 @@ class CustomRandomizer(DomainRandomizer):
 
         root_body_id = self._root_body_id
         torso_body_id = self._torso_body_id
+        tool_right_body_id = self._tool_right_body_id
 
         # increment the curriculum coefficient
         new_curriculum_coefficient = domrand_state.curriculum_coefficient + (1 / self.rand_conf["total_timesteps"])
@@ -306,6 +312,10 @@ class CustomRandomizer(DomainRandomizer):
             if self._ball_geom_ids.size > 0 and self._ball_solref_randomization_enabled():
                 geom_solref = geom_solref.at[self._ball_geom_ids].set(domrand_state.ball_geom_solref)
             body_ipos = model.body_ipos.at[root_body_id].set(model.body_ipos[root_body_id] + domrand_state.com_displacement)
+            if self.rand_conf.get("randomize_tool_right_com_displacement", False) and tool_right_body_id > 0:
+                body_ipos = body_ipos.at[tool_right_body_id].set(
+                    model.body_ipos[tool_right_body_id] + domrand_state.tool_right_com_displacement
+                )
             body_mass = model.body_mass.at[1:].set(model.body_mass[1:] * domrand_state.link_mass_multipliers)
             body_mass = body_mass.at[root_body_id].set(body_mass[root_body_id] + domrand_state.base_mass_to_add)
             body_inertia = model.body_inertia
@@ -326,6 +336,8 @@ class CustomRandomizer(DomainRandomizer):
                 geom_solref[self._ball_geom_ids] = np.asarray(domrand_state.ball_geom_solref)
             body_ipos = self._init_body_ipos.copy()
             body_ipos[root_body_id] += domrand_state.com_displacement
+            if self.rand_conf.get("randomize_tool_right_com_displacement", False) and tool_right_body_id > 0:
+                body_ipos[tool_right_body_id] += np.asarray(domrand_state.tool_right_com_displacement)
             body_mass = self._init_body_mass.copy()
             body_mass[1:] *= domrand_state.link_mass_multipliers
             body_mass[root_body_id] += domrand_state.base_mass_to_add
@@ -352,6 +364,8 @@ class CustomRandomizer(DomainRandomizer):
         if self.rand_conf["randomize_geom_damping"] or self.rand_conf["randomize_geom_stiffness"] or self._ball_solref_randomization_enabled():
             model = self._set_attribute_in_model(model, "geom_solref", geom_solref, backend)
         if self.rand_conf["randomize_com_displacement"]:
+            model = self._set_attribute_in_model(model, "body_ipos", body_ipos, backend)
+        elif self.rand_conf.get("randomize_tool_right_com_displacement", False):
             model = self._set_attribute_in_model(model, "body_ipos", body_ipos, backend)
         if self.rand_conf["randomize_link_mass"] or self.rand_conf["randomize_base_mass"]:
             model = self._set_attribute_in_model(model, "body_mass", body_mass, backend)
@@ -1239,6 +1253,31 @@ class CustomRandomizer(DomainRandomizer):
         )
 
         return sampled_com_displacement, carry
+
+    def _sample_body_com_displacement(self,
+                                      body_name: str,
+                                      carry: Any,
+                                      backend: ModuleType) -> Tuple[Union[np.ndarray, jnp.ndarray], Any]:
+        enabled = self.rand_conf.get(f"randomize_{body_name}_com_displacement", False)
+        if not enabled:
+            return backend.array([0.0, 0.0, 0.0]), carry
+
+        displacement_range = self.rand_conf[f"{body_name}_com_displacement_range"]
+        if isinstance(displacement_range, DictConfig):
+            displacement_range = OmegaConf.to_container(displacement_range, resolve=True)
+
+        displ_min = backend.array([displacement_range[axis][0] for axis in ("x", "y", "z")])
+        displ_max = backend.array([displacement_range[axis][1] for axis in ("x", "y", "z")])
+
+        if backend == jnp:
+            key = carry.key
+            key, _k = jax.random.split(key)
+            interpolation = jax.random.uniform(_k, shape=(3,))
+            carry = carry.replace(key=key)
+        else:
+            interpolation = np.random.uniform(size=3)
+
+        return displ_min + (displ_max - displ_min) * interpolation, carry
     
     def _sample_link_mass_multipliers(self,
                                       model: Union[MjModel, Model],
