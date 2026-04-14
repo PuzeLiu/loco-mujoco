@@ -120,6 +120,41 @@ class CustomRandomizer(DomainRandomizer):
             return None
         return self._parse_noise_range(agent_conf.get(key))
 
+    def _sample_range(self, carry: Any, shape: tuple, value_range, backend: ModuleType):
+        if backend == jnp:
+            key = carry.key
+            key, _k = jax.random.split(key)
+            values = jax.random.uniform(_k, shape=shape, minval=value_range[0], maxval=value_range[1])
+            carry = carry.replace(key=key)
+        else:
+            values = np.random.uniform(low=value_range[0], high=value_range[1], size=shape)
+        return values, carry
+
+    def _sample_agent_joint_values(self,
+                                   agent_name: str,
+                                   noise_key: str,
+                                   range_key: str,
+                                   base_values,
+                                   carry: Any,
+                                   backend: ModuleType):
+        agent_conf = self.rand_conf.get("agent_joint_randomization", {}).get(agent_name, {})
+        mode = agent_conf.get("mode")
+
+        if mode == "multiplicative":
+            noise_range = self._parse_noise_range(agent_conf.get(noise_key))
+            if noise_range is None:
+                return None, carry
+            noise, carry = self._sample_range(carry, base_values.shape, noise_range, backend)
+            return base_values * (1.0 + noise), carry
+
+        if mode == "direct":
+            value_range = self._parse_noise_range(agent_conf.get(range_key))
+            if value_range is None:
+                return None, carry
+            return self._sample_range(carry, base_values.shape, value_range, backend)
+
+        return None, carry
+
     def init_state(self,
                    env: Any,
                    key: Any,
@@ -978,21 +1013,22 @@ class CustomRandomizer(DomainRandomizer):
             else model.dof_frictionloss[6:]
         )
 
-        noise_range = self._agent_noise_range("agent_right_arm", "joint_friction_loss_noise_range")
-        if noise_range is not None:
-            idx = env.agent_info["agent_right_arm"]["joints_dofadr"]
-            if idx is not None:
+        idx = env.agent_info["agent_right_arm"]["joints_dofadr"]
+        if idx is not None:
+            base = model.dof_frictionloss[idx]
+            right_arm_values, carry = self._sample_agent_joint_values(
+                "agent_right_arm",
+                "joint_friction_loss_noise_range",
+                "joint_friction_loss_range",
+                base,
+                carry,
+                backend,
+            )
+            if right_arm_values is not None:
                 if backend == jnp:
-                    key = carry.key
-                    key, _k = jax.random.split(key)
-                    noise = jax.random.uniform(_k, shape=(idx.shape[0],), minval=noise_range[0], maxval=noise_range[1])
-                    carry = carry.replace(key=key)
-                    base = model.dof_frictionloss[idx]
-                    sampled_friction_loss = sampled_friction_loss.at[idx].set(base * (1.0 + noise))
+                    sampled_friction_loss = sampled_friction_loss.at[idx].set(right_arm_values)
                 else:
-                    noise = np.random.uniform(low=noise_range[0], high=noise_range[1], size=(idx.shape[0],))
-                    base = model.dof_frictionloss[idx]
-                    sampled_friction_loss[idx] = base * (1.0 + noise)
+                    sampled_friction_loss[idx] = right_arm_values
 
         return sampled_friction_loss, carry
     
@@ -1031,21 +1067,22 @@ class CustomRandomizer(DomainRandomizer):
             else model.dof_damping[6:]
         )
 
-        noise_range = self._agent_noise_range("agent_right_arm", "joint_damping_noise_range")
-        if noise_range is not None:
-            idx = env.agent_info["agent_right_arm"]["joints_dofadr"]
-            if idx is not None:
+        idx = env.agent_info["agent_right_arm"]["joints_dofadr"]
+        if idx is not None:
+            base = model.dof_damping[idx]
+            right_arm_values, carry = self._sample_agent_joint_values(
+                "agent_right_arm",
+                "joint_damping_noise_range",
+                "joint_damping_range",
+                base,
+                carry,
+                backend,
+            )
+            if right_arm_values is not None:
                 if backend == jnp:
-                    key = carry.key
-                    key, _k = jax.random.split(key)
-                    noise = jax.random.uniform(_k, shape=(idx.shape[0],), minval=noise_range[0], maxval=noise_range[1])
-                    carry = carry.replace(key=key)
-                    base = model.dof_damping[idx]
-                    sampled_damping = sampled_damping.at[idx].set(base * (1.0 + noise))
+                    sampled_damping = sampled_damping.at[idx].set(right_arm_values)
                 else:
-                    noise = np.random.uniform(low=noise_range[0], high=noise_range[1], size=(idx.shape[0],))
-                    base = model.dof_damping[idx]
-                    sampled_damping[idx] = base * (1.0 + noise)
+                    sampled_damping[idx] = right_arm_values
 
         return sampled_damping, carry
     
@@ -1086,21 +1123,22 @@ class CustomRandomizer(DomainRandomizer):
             else model.dof_armature[6:]
         )
 
-        noise_range = self._agent_noise_range("agent_right_arm", "joint_armature_noise_range")
-        if noise_range is not None:
-            idx = env.agent_info["agent_right_arm"]["joints_dofadr"]
-            if idx is not None:
+        idx = env.agent_info["agent_right_arm"]["joints_dofadr"]
+        if idx is not None:
+            base = model.dof_armature[idx]
+            right_arm_values, carry = self._sample_agent_joint_values(
+                "agent_right_arm",
+                "joint_armature_noise_range",
+                "joint_armature_range",
+                base,
+                carry,
+                backend,
+            )
+            if right_arm_values is not None:
                 if backend == jnp:
-                    key = carry.key
-                    key, _k = jax.random.split(key)
-                    noise = jax.random.uniform(_k, shape=(idx.shape[0],), minval=noise_range[0], maxval=noise_range[1])
-                    carry = carry.replace(key=key)
-                    base = model.dof_armature[idx]
-                    sampled_armature = sampled_armature.at[idx].set(base * (1.0 + noise))
+                    sampled_armature = sampled_armature.at[idx].set(right_arm_values)
                 else:
-                    noise = np.random.uniform(low=noise_range[0], high=noise_range[1], size=(idx.shape[0],))
-                    base = model.dof_armature[idx]
-                    sampled_armature[idx] = base * (1.0 + noise)
+                    sampled_armature[idx] = right_arm_values
 
         return sampled_armature, carry
 
@@ -1403,6 +1441,23 @@ class CustomRandomizer(DomainRandomizer):
             else backend.array([0.0]*len(init_p_gain))
             )
 
+        idx = env.agent_info["agent_right_arm"]["joints_id"]
+        if idx is not None:
+            base = init_p_gain[idx]
+            right_arm_values, carry = self._sample_agent_joint_values(
+                "agent_right_arm",
+                "p_gain_noise_range",
+                "p_gain_range",
+                base,
+                carry,
+                backend,
+            )
+            if right_arm_values is not None:
+                if backend == jnp:
+                    p_noise = p_noise.at[idx].set(right_arm_values - base)
+                else:
+                    p_noise[idx] = right_arm_values - base
+
         return p_noise, carry
     
     def _sample_d_gains_noise(self,
@@ -1443,5 +1498,22 @@ class CustomRandomizer(DomainRandomizer):
             if self.rand_conf["add_d_gains_noise"]
             else backend.array([0.0]*len(init_d_gain))
             )
+
+        idx = env.agent_info["agent_right_arm"]["joints_id"]
+        if idx is not None:
+            base = init_d_gain[idx]
+            right_arm_values, carry = self._sample_agent_joint_values(
+                "agent_right_arm",
+                "d_gain_noise_range",
+                "d_gain_range",
+                base,
+                carry,
+                backend,
+            )
+            if right_arm_values is not None:
+                if backend == jnp:
+                    d_noise = d_noise.at[idx].set(right_arm_values - base)
+                else:
+                    d_noise[idx] = right_arm_values - base
 
         return d_noise, carry
