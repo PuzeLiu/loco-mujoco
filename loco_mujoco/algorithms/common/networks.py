@@ -113,14 +113,14 @@ class ActorCritic(nn.Module):
 
     def setup(self):
         self.activation_fn = get_activation_fn(self.activation)
+        self.actor_rms = RunningMeanStd()
+        self.critic_rms = RunningMeanStd()
 
     @nn.compact
     def __call__(self, x):
-
-        x = RunningMeanStd()(x)
-
         # build actor
         actor_x = x if self.actor_obs_ind is None else x[..., self.actor_obs_ind]
+        actor_x = self.actor_rms(actor_x)
         actor_mean = FullyConnectedNet(self.actor_hidden_layer_dims, self.action_dim, self.activation,
                                        None, False, False)(actor_x)
         actor_logtstd = self.param("log_std", nn.initializers.constant(jnp.log(self.init_std)),
@@ -136,6 +136,7 @@ class ActorCritic(nn.Module):
 
         # build critic
         critic_x = x if self.critic_obs_ind is None else x[..., self.critic_obs_ind]
+        critic_x = self.critic_rms(critic_x)
         critic = FullyConnectedNet(self.critic_hidden_layer_dims, 1, self.activation, None, False, False)(critic_x)
 
         return pi, jnp.squeeze(critic, axis=-1)
