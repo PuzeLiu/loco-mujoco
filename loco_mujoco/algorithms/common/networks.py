@@ -237,25 +237,29 @@ class RunningMeanStd(nn.Module):
         batch_var = jnp.var(x, axis=0) + 1e-6  # Add epsilon for numerical stability
         batch_count = x.shape[0]
 
-        # Update counts
-        updated_count = count.value + batch_count
+        if self.is_mutable_collection("run_stats"):
+            # Update counts
+            updated_count = count.value + batch_count
 
-        # Numerically stable mean and variance update
-        delta = batch_mean - mean.value
-        new_mean = mean.value + delta * batch_count / updated_count
+            # Numerically stable mean and variance update
+            delta = batch_mean - mean.value
+            new_mean = mean.value + delta * batch_count / updated_count
 
-        # Compute the new variance using Welford's method
-        m_a = var.value * count.value
-        m_b = batch_var * batch_count
-        M2 = m_a + m_b + jnp.square(delta) * count.value * batch_count / updated_count
-        new_var = M2 / updated_count
+            # Compute the new variance using Welford's method
+            m_a = var.value * count.value
+            m_b = batch_var * batch_count
+            M2 = m_a + m_b + jnp.square(delta) * count.value * batch_count / updated_count
+            new_var = M2 / updated_count
+
+            # Update state variables
+            mean.value = new_mean
+            var.value = new_var
+            count.value = updated_count
+        else:
+            new_mean = mean.value
+            new_var = var.value
 
         # Normalize input
         normalized_x = (x - new_mean) / jnp.sqrt(new_var + 1e-8)
-
-        # Update state variables
-        mean.value = new_mean
-        var.value = new_var
-        count.value = updated_count
 
         return jnp.squeeze(normalized_x)

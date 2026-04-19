@@ -995,19 +995,34 @@ class HumanoidLocomotionReward(Reward):
         gait_frequency = goal_state.gait_frequency
         gait_process = backend.fmod(reward_state.gait_process + env.dt * gait_frequency, 1.0)
         
-        left_swing = (
-            (backend.abs(gait_process - 0.25) < 0.5 * self._feet_swing_period) & 
-            (gait_frequency > 1.0e-8)
-        )
-        right_swing = (
-            (backend.abs(gait_process - 0.75) < 0.5 * self._feet_swing_period) & 
-            (gait_frequency > 1.0e-8)
+        phase_left = gait_process
+        phase_right = backend.fmod(gait_process + 0.5, 1.0)
+        is_stance_left = phase_left < 0.5
+        is_stance_right = phase_right < 0.5
+        # When goal xy velocity is ~0, force stance for both feet so the reward
+        # encourages keeping both feet planted instead of swinging in place.
+        standing_still = (backend.abs(goal_state.goal_vel_x) < 1.0e-6) & \
+                         (backend.abs(goal_state.goal_vel_y) < 1.0e-6)
+        is_stance_left = is_stance_left | standing_still
+        is_stance_right = is_stance_right | standing_still
+        feet_swing_reward = (
+            (~(feet_on_ground[0] ^ is_stance_left)).astype(backend.float32)
+            + (~(feet_on_ground[1] ^ is_stance_right)).astype(backend.float32)
         )
         
-        feet_swing_reward = (
-            (left_swing & ~feet_on_ground[0]).astype(backend.float32) +
-            (right_swing & ~feet_on_ground[1]).astype(backend.float32)
-        )
+        # left_swing = (
+        #     (backend.abs(gait_process - 0.25) < 0.5 * self._feet_swing_period) & 
+        #     (gait_frequency > 1.0e-8)
+        # )
+        # right_swing = (
+        #     (backend.abs(gait_process - 0.75) < 0.5 * self._feet_swing_period) & 
+        #     (gait_frequency > 1.0e-8)
+        # )
+        
+        # feet_swing_reward = (
+        #     (left_swing & ~feet_on_ground[0]).astype(backend.float32) +
+        #     (right_swing & ~feet_on_ground[1]).astype(backend.float32)
+        # )
 
         # Nominal joint position rewards
         joint_qpos_reward = backend.exp(
