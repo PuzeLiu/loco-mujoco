@@ -716,6 +716,12 @@ class HumanoidLocomotionReward(Reward):
                 mj_jntname2qposid(name, model) for name in self._nominal_joint_pos_names
             ])
 
+        # Initialize COM position and stand still
+        self._stand_no_step_coeff = kwargs.get("stand_no_step_coeff", 0.0)
+        self._root_centering_coeff = kwargs.get("root_centering_coeff", 0.0)
+        self._root_centering_target_x = kwargs.get("root_centering_target_x", 0.0)
+        self._root_centering_target_y = kwargs.get("root_centering_target_y", 0.0)
+
     def init_state(self, env: Any, key: Any, model: Union[MjModel, Model], 
                    data: Union[MjData, Data], backend: ModuleType):
         """
@@ -760,6 +766,8 @@ class HumanoidLocomotionReward(Reward):
             "impact": 0.,
             "tracking_base_pos": 0.,
             "yaw_deviation": 0.,
+            "stand_no_step": 0.,
+            "root_centering": 0.,
         }
 
         return HumanoidLocomotionRewardState(
@@ -1024,6 +1032,12 @@ class HumanoidLocomotionReward(Reward):
         #     (right_swing & ~feet_on_ground[1]).astype(backend.float32)
         # )
 
+        # Standing no-step penalty
+        stand_no_step_reward = standing_still.astype(backend.float32) * (
+            (1.0 - feet_on_ground[0].astype(backend.float32)) +
+            (1.0 - feet_on_ground[1].astype(backend.float32))
+        )
+
         # Nominal joint position rewards
         joint_qpos_reward = backend.exp(
             -1 * self._nominal_joint_pos_exp *
@@ -1085,6 +1099,16 @@ class HumanoidLocomotionReward(Reward):
         relative_yaw = backend.arctan2(rel_rot[1, 0], rel_rot[0, 0])
         yaw_deviation_reward = relative_yaw ** 2
 
+        # Com root centering
+        support_center_xy = 0.5 * (left_foot_pos[:2] + right_foot_pos[:2])
+        root_center_target_xy = backend.array([
+            self._root_centering_target_x,
+            self._root_centering_target_y
+        ])
+        root_offset_xy = (global_pos_root[:2] - support_center_xy) - root_center_target_xy
+        root_centering_reward = backend.sum(backend.square(root_offset_xy))
+        root_centering_reward = root_centering_reward * standing_still.astype(backend.float32)
+
         # Symmetry air reward (currently unused)
         symmetry_air_reward = 0.0
 
@@ -1120,6 +1144,12 @@ class HumanoidLocomotionReward(Reward):
             orientation_coeff = coeff_scale[carry.curriculum.step]
         else:
             orientation_coeff = self.orientation_coeff
+        if isinstance(self._root_centering_coeff, ListConfig):
+            assert len(self._root_centering_coeff) == 2
+            coeff_scale = jnp.linspace(self._root_centering_coeff[0], self._root_centering_coeff[1], max_curriculum_step)
+            root_centering_coeff = coeff_scale[carry.curriculum.step]
+        else:
+            root_centering_coeff = self._root_centering_coeff
         
         survival_reward *= (self._survival * env.dt)
         tracking_reward_linvel_x *= (self._tracking_w_sum_linvel_x * env.dt)
@@ -1149,6 +1179,8 @@ class HumanoidLocomotionReward(Reward):
         impact_reward *= (self._impact_coeff * env.dt)
         tracking_base_pos_reward *= (self._tracking_base_pos_coeff * env.dt)
         yaw_deviation_reward *= (self._yaw_deviation_coeff * env.dt)
+        stand_no_step_reward *= (self._stand_no_step_coeff * env.dt)
+        root_centering_reward *= (root_centering_coeff * env.dt)
 
         # ==================== COMBINE REWARDS ====================
         
@@ -1164,7 +1196,7 @@ class HumanoidLocomotionReward(Reward):
             joint_position_limit_reward + feet_slip_reward + 
             feet_yaw_diff_reward + feet_yaw_mean_reward + feet_roll_reward +
             feet_distance_reward + air_time_reward + no_fly_reward + impact_reward + 
-            joint_deviation_l1_penalty + yaw_deviation_reward
+            joint_deviation_l1_penalty + yaw_deviation_reward + stand_no_step_reward + root_centering_reward
         )
         
         total_reward = survival_reward + tracking_reward + penalty_rewards
@@ -1212,6 +1244,8 @@ class HumanoidLocomotionReward(Reward):
             "impact": impact_reward,
             "tracking_base_pos": tracking_base_pos_reward,
             "yaw_deviation": yaw_deviation_reward,
+            "stand_no_step": stand_no_step_reward,
+            "root_centering": root_centering_reward,
         }
         
         reward_state = reward_state.replace(reward_components=updated_reward_components)

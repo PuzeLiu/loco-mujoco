@@ -31,6 +31,7 @@ class CustomRandomizerState:
     base_mass_to_add: float
     com_displacement: Union[np.ndarray, jax.Array]
     tool_right_com_displacement: Union[np.ndarray, jax.Array]
+    tool_left_com_displacement: Union[np.ndarray, jax.Array]
     link_mass_multipliers: Union[np.ndarray, jax.Array]
     torso_inertia_scale: Union[np.ndarray, jax.Array]
     joint_friction_loss: Union[np.ndarray, jax.Array]
@@ -70,6 +71,7 @@ class CustomRandomizer(DomainRandomizer):
         self._root_body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, root_body_name)
         self._torso_body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, "torso")
         self._tool_right_body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, "tool_right")
+        self._tool_left_body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, "tool_left")
 
         self._floor_geom_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
         ball_body_ids = []
@@ -191,6 +193,7 @@ class CustomRandomizer(DomainRandomizer):
                                       base_mass_to_add=0.0,
                                       com_displacement=backend.array([0.0, 0.0, 0.0]),
                                       tool_right_com_displacement=backend.array([0.0, 0.0, 0.0]),
+                                      tool_left_com_displacement=backend.array([0.0, 0.0, 0.0]),
                                       link_mass_multipliers=backend.array([1.0] * (model.nbody-1)), #exclude worldbody
                                       torso_inertia_scale=backend.array([1.0, 1.0, 1.0]),
                                       joint_friction_loss=backend.array([0.0] * (model.nv-6)), #exclude freejoint 6 dofs
@@ -248,6 +251,7 @@ class CustomRandomizer(DomainRandomizer):
         base_mass_to_add, carry = self._sample_base_mass(model, carry, backend)
         com_displacement, carry = self._sample_com_displacement(model, carry, backend)
         tool_right_com_displacement, carry = self._sample_body_com_displacement("tool_right", carry, backend)
+        tool_left_com_displacement, carry = self._sample_body_com_displacement("tool_left", carry, backend)
         link_mass_multipliers, carry = self._sample_link_mass_multipliers(model, carry, backend)
         torso_inertia_scale, carry = self._sample_torso_inertia(model, carry, backend)
         joint_friction_loss, carry = self._sample_joint_friction_loss(env, model, carry, backend)
@@ -275,6 +279,7 @@ class CustomRandomizer(DomainRandomizer):
                                                                                       base_mass_to_add=base_mass_to_add,
                                                                                       com_displacement=com_displacement,
                                                                                       tool_right_com_displacement=tool_right_com_displacement,
+                                                                                      tool_left_com_displacement=tool_left_com_displacement,
                                                                                       link_mass_multipliers=link_mass_multipliers,
                                                                                       torso_inertia_scale=torso_inertia_scale,
                                                                                       joint_friction_loss=joint_friction_loss,
@@ -332,6 +337,7 @@ class CustomRandomizer(DomainRandomizer):
         root_body_id = self._root_body_id
         torso_body_id = self._torso_body_id
         tool_right_body_id = self._tool_right_body_id
+        tool_left_body_id = self._tool_left_body_id
 
         # increment the curriculum coefficient
         new_curriculum_coefficient = domrand_state.curriculum_coefficient + (1 / self.rand_conf["total_timesteps"])
@@ -350,6 +356,10 @@ class CustomRandomizer(DomainRandomizer):
             if self.rand_conf.get("randomize_tool_right_com_displacement", False) and tool_right_body_id > 0:
                 body_ipos = body_ipos.at[tool_right_body_id].set(
                     model.body_ipos[tool_right_body_id] + domrand_state.tool_right_com_displacement
+                )
+            if self.rand_conf.get("randomize_tool_left_com_displacement", False) and tool_left_body_id > 0:
+                body_ipos = body_ipos.at[tool_left_body_id].set(
+                    model.body_ipos[tool_left_body_id] + domrand_state.tool_left_com_displacement
                 )
             body_mass = model.body_mass.at[1:].set(model.body_mass[1:] * domrand_state.link_mass_multipliers)
             body_mass = body_mass.at[root_body_id].set(body_mass[root_body_id] + domrand_state.base_mass_to_add)
@@ -373,6 +383,8 @@ class CustomRandomizer(DomainRandomizer):
             body_ipos[root_body_id] += domrand_state.com_displacement
             if self.rand_conf.get("randomize_tool_right_com_displacement", False) and tool_right_body_id > 0:
                 body_ipos[tool_right_body_id] += np.asarray(domrand_state.tool_right_com_displacement)
+            if self.rand_conf.get("randomize_tool_left_com_displacement", False) and tool_left_body_id > 0:
+                body_ipos[tool_left_body_id] += np.asarray(domrand_state.tool_left_com_displacement)
             body_mass = self._init_body_mass.copy()
             body_mass[1:] *= domrand_state.link_mass_multipliers
             body_mass[root_body_id] += domrand_state.base_mass_to_add
@@ -400,7 +412,7 @@ class CustomRandomizer(DomainRandomizer):
             model = self._set_attribute_in_model(model, "geom_solref", geom_solref, backend)
         if self.rand_conf["randomize_com_displacement"]:
             model = self._set_attribute_in_model(model, "body_ipos", body_ipos, backend)
-        elif self.rand_conf.get("randomize_tool_right_com_displacement", False):
+        elif self.rand_conf.get("randomize_tool_right_com_displacement", False) or self.rand_conf.get("randomize_tool_left_com_displacement", False):
             model = self._set_attribute_in_model(model, "body_ipos", body_ipos, backend)
         if self.rand_conf["randomize_link_mass"] or self.rand_conf["randomize_base_mass"]:
             model = self._set_attribute_in_model(model, "body_mass", body_mass, backend)
