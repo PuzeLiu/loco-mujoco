@@ -33,6 +33,9 @@ class IPPOTransition:
     value: Dict[str, jnp.ndarray]
     reward: Dict[str, jnp.ndarray]
     log_prob: Dict[str, jnp.ndarray]
+    phase_pred: Dict[str, jnp.ndarray]
+    phase_target: Dict[str, jnp.ndarray]
+    phase_valid: Dict[str, jnp.ndarray]
     obs: jnp.ndarray
     mem_h: Dict[str, Any]
     info: Any

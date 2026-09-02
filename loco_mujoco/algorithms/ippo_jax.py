@@ -16,8 +16,17 @@ import optax
 
 from loco_mujoco.algorithms import (JaxRLAlgorithmBase, AgentConfBase, AgentStateBase, ActorCritic,
                                     Transition, IPPOTransition, TrainState, TrainStateBuffer, MetricHandlerTransition, AdaptiveLRState)
-from loco_mujoco.algorithms.common.networks import TransformerXLActorCritic
+from loco_mujoco.algorithms.common.networks import (
+    PHASE_HEAD_MODULE_NAME,
+    TransformerXLActorCritic,
+)
 from loco_mujoco.algorithms.common.transformer_xl import init_mems
+from loco_mujoco.algorithms.common.phase import (
+    advance_phase_history,
+    ball_position_visible,
+    encode_supercycle_phase,
+    normalize_visibility_history_mode,
+)
 # from loco_mujoco.core.wrappers import LogWrapper, NStepWrapper, LogEnvState, VecEnv, NormalizeVecReward, SummaryMetrics
 from loco_mujoco.core.wrappers import (RichLogWrapper, NStepWrapper, RichLogEnvState, VecEnv,
                                        NormalizeVecRewardDict, SummaryRichMetrics, WorldModelWrapper,
@@ -70,12 +79,18 @@ class IPPOAgentConf(AgentConfBase):
     @classmethod
     def from_dict(cls, d):
         config = OmegaConf.create(d["config"])
-        # Rebuild networks from state dict; requires ActorCritic class + same ctor signature.
-        # In practice you may already have a model registry; adjust accordingly.
-        # Here we assume ActorCritic is a flax Module and can be restored with from_state_dict.
-        networks = {k: flax.serialization.from_state_dict(ActorCritic, sd)
-                    for k, sd in d["networks"].items()}
-        txs = {k: IPPOJax._get_optimizer(config) for k in networks.keys()}
+        networks = {}
+        for agent_name, state_dict in d["networks"].items():
+            model_type = config.env.agent[agent_name].get("model_type", "mlp")
+            model_cls = TransformerXLActorCritic if model_type == "trxl" else ActorCritic
+            networks[agent_name] = flax.serialization.from_state_dict(model_cls, state_dict)
+        txs = {
+            agent_name: IPPOJax._get_optimizer(
+                config,
+                phase_cfg=config.env.agent[agent_name].get("phase_prediction", None),
+            )
+            for agent_name in networks.keys()
+        }
         return cls(config=config, networks=networks, txs=txs)
 
 
@@ -249,6 +264,46 @@ class IPPOJax(JaxRLAlgorithmBase):
 
         # config.agent is a DictConfig: {agent_name: {...}}
         for agent_name, agent_cfg in config.env.agent.items():
+            phase_cfg = agent_cfg.get("phase_prediction", None)
+            phase_enabled = bool(phase_cfg is not None and phase_cfg.get("enabled", False))
+            phase_output_dim = 1 if phase_enabled else 0
+            phase_hidden_layers = (
+                phase_cfg.get("hidden_layers", [256, 128])
+                if phase_enabled else (256, 128)
+            )
+            if phase_enabled:
+                visibility_history_mode = normalize_visibility_history_mode(
+                    phase_cfg.get("visibility_history_mode", "latest")
+                )
+                phase_obs_name = str(phase_cfg.observation_name)
+                visibility_obs_name = str(phase_cfg.visibility_observation_name)
+                if phase_obs_name not in env.obs_container:
+                    raise KeyError(f"Phase observation '{phase_obs_name}' not found for agent '{agent_name}'")
+                if visibility_obs_name not in env.obs_container:
+                    raise KeyError(
+                        f"Phase visibility observation '{visibility_obs_name}' not found for agent '{agent_name}'"
+                    )
+                phase_obs_ind = np.asarray(env.obs_container[phase_obs_name].obs_ind, dtype=np.int32)
+                visibility_obs_ind = np.asarray(
+                    env.obs_container[visibility_obs_name].obs_ind, dtype=np.int32
+                )
+                position_ind = np.asarray(
+                    phase_cfg.get("visibility_position_indices", [0, 1, 2]), dtype=np.int32
+                )
+                visibility_obs_ind = visibility_obs_ind[position_ind]
+                if phase_obs_ind.size != 8:
+                    raise ValueError(
+                        f"Phase observation '{phase_obs_name}' must have 8 values, got {phase_obs_ind.size}"
+                    )
+                with open_dict(phase_cfg):
+                    phase_cfg.visibility_history_mode = visibility_history_mode
+                    phase_cfg.observation_indices = phase_obs_ind.tolist()
+                    phase_cfg.visibility_observation_indices = visibility_obs_ind.tolist()
+                    phase_cfg.num_hands = int(config.env.pattern.n_hands)
+                    phase_cfg.num_balls = int(config.env.pattern.n_balls)
+                    phase_cfg.history_len = int(max_len_obs_history)
+                    phase_cfg.frame_observation_dim = int(env.info.observation_space.shape[0])
+
             if agent_cfg.get("obs_actor_group", None) is not None:
                 actor_obs_ind = env.obs_container.get_obs_ind_by_group(agent_cfg.obs_actor_group)
             else:
@@ -299,6 +354,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                     mem_len=int(agent_cfg.trxl_mem_len),
                     dropout=float(agent_cfg.get("trxl_dropout", 0.0)),
                     positional_encoding=str(agent_cfg.get("trxl_positional_encoding", "absolute")),
+                    phase_output_dim=phase_output_dim,
+                    phase_hidden_layer_dims=phase_hidden_layers,
                 )
             else:
                 networks[agent_name] = ActorCritic(
@@ -310,10 +367,12 @@ class IPPOJax(JaxRLAlgorithmBase):
                     critic_hidden_layer_dims=agent_cfg.critic_hidden_layers,
                     actor_obs_ind=actor_obs_ind,
                     critic_obs_ind=critic_obs_ind,
+                    phase_output_dim=phase_output_dim,
+                    phase_hidden_layer_dims=phase_hidden_layers,
                     # random=agent_cfg.get("random_action", False)
                 )
 
-            txs[agent_name] = cls._get_optimizer(config)
+            txs[agent_name] = cls._get_optimizer(config, phase_cfg=phase_cfg)
         return cls._agent_conf(config=config, networks=networks, txs=txs)
 
     @classmethod
@@ -372,7 +431,54 @@ class IPPOJax(JaxRLAlgorithmBase):
         )
     
     @classmethod
-    def _get_optimizer(cls, config):
+    def _get_optimizer(cls, config, phase_cfg=None):
+        phase_enabled = bool(phase_cfg is not None and phase_cfg.get("enabled", False))
+        if phase_enabled and (
+            config.experiment.get("adaptive_lr", False)
+            or config.experiment.get("anneal_lr", False)
+        ):
+            raise ValueError(
+                "Phase prediction uses an isolated optimizer and currently requires "
+                "adaptive_lr=false and anneal_lr=false"
+            )
+
+        if phase_enabled:
+            phase_lr = float(phase_cfg.get("learning_rate", config.experiment.lr))
+
+            def label_params(params):
+                flat_params = flax.traverse_util.flatten_dict(params)
+                flat_labels = {
+                    path: "phase" if PHASE_HEAD_MODULE_NAME in path else "ppo"
+                    for path in flat_params
+                }
+                return flax.traverse_util.unflatten_dict(flat_labels)
+
+            return optax.multi_transform(
+                {
+                    "ppo": optax.chain(
+                        optax.clip_by_global_norm(config.experiment.max_grad_norm),
+                        optax.adamw(
+                            config.experiment.lr,
+                            weight_decay=config.experiment.weight_decay,
+                            eps=1e-5,
+                        ),
+                    ),
+                    "phase": optax.chain(
+                        optax.clip_by_global_norm(
+                            float(phase_cfg.get("max_grad_norm", config.experiment.max_grad_norm))
+                        ),
+                        optax.adamw(
+                            phase_lr,
+                            weight_decay=float(
+                                phase_cfg.get("weight_decay", config.experiment.weight_decay)
+                            ),
+                            eps=1e-5,
+                        ),
+                    ),
+                },
+                label_params,
+            )
+
         if config.experiment.get("adaptive_lr", False) or config.experiment.get("anneal_lr", False):
             tx = optax.chain(
                 optax.clip_by_global_norm(config.experiment.max_grad_norm),
@@ -440,6 +546,64 @@ class IPPOJax(JaxRLAlgorithmBase):
             name: isinstance(agent_conf.networks[name], TransformerXLActorCritic)
             for name in agent_names
         }
+        phase_enabled = {
+            name: bool(
+                agent_conf.config.env.agent[name].get("phase_prediction", {}).get("enabled", False)
+            )
+            for name in agent_names
+        }
+        phase_agent_names = tuple(name for name in agent_names if phase_enabled[name])
+        if len(phase_agent_names) > 1:
+            raise ValueError("Autoregressive phase currently supports one predicting agent")
+        phase_agent_name = phase_agent_names[0] if phase_agent_names else None
+        phase_history_len = int(config.get("len_obs_history", 1))
+        phase_frame_dim = int(env.info.observation_space.shape[0] // phase_history_len)
+        if phase_agent_name is not None:
+            phase_cfg = agent_conf.config.env.agent[phase_agent_name].phase_prediction
+            phase_obs_ind = jnp.asarray(phase_cfg.observation_indices, dtype=jnp.int32)
+            phase_visibility_obs_ind = jnp.asarray(
+                phase_cfg.visibility_observation_indices, dtype=jnp.int32
+            )
+            phase_num_hands = int(phase_cfg.num_hands)
+            phase_num_balls = int(phase_cfg.num_balls)
+            phase_visibility_history_mode = normalize_visibility_history_mode(
+                phase_cfg.get("visibility_history_mode", "latest")
+            )
+            phase_loss_coef = float(phase_cfg.get("loss_coef", 1.0))
+            if int(phase_cfg.history_len) != phase_history_len:
+                raise ValueError("Phase history length does not match the wrapped observation history")
+            if int(phase_cfg.frame_observation_dim) != phase_frame_dim:
+                raise ValueError("Phase frame dimension does not match the wrapped observation")
+        else:
+            phase_obs_ind = jnp.zeros((0,), dtype=jnp.int32)
+            phase_visibility_obs_ind = jnp.zeros((0,), dtype=jnp.int32)
+            phase_num_hands = 1
+            phase_num_balls = 1
+            phase_visibility_history_mode = "latest"
+            phase_loss_coef = 0.0
+
+        def _inject_phase_history(obs, phase_history, phase_history_valid):
+            if phase_agent_name is None:
+                return obs
+            obs_frames = obs.reshape(obs.shape[:-1] + (phase_history_len, phase_frame_dim))
+            phase_obs = encode_supercycle_phase(
+                phase_history,
+                phase_num_hands,
+                phase_num_balls,
+            )
+            phase_obs = jnp.where(phase_history_valid[..., None], phase_obs, 0.0)
+            obs_frames = obs_frames.at[..., phase_obs_ind].set(phase_obs.astype(obs.dtype))
+            return obs_frames.reshape(obs.shape)
+
+        def _current_ball_position_visible(obs):
+            if phase_agent_name is None:
+                return jnp.zeros(obs.shape[:-1], dtype=bool)
+            obs_frames = obs.reshape(obs.shape[:-1] + (phase_history_len, phase_frame_dim))
+            return ball_position_visible(
+                obs_frames,
+                phase_visibility_obs_ind,
+                phase_visibility_history_mode,
+            )
         freeze_policy = {
             name: agent_conf.config.env.agent[name].freeze_policy
             for name in agent_names
@@ -587,13 +751,17 @@ class IPPOJax(JaxRLAlgorithmBase):
         def _update_step(runner_state, unused):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
-                train_states, agent_mems, world_model_state, env_state, last_obs, train_state_buffer, rng = runner_state
+                (train_states, agent_mems, world_model_state, env_state, last_obs,
+                 train_state_buffer, phase_history, phase_history_valid, rng) = runner_state
 
                 # SELECT ACTION
+                phase_input_visible = _current_ball_position_visible(last_obs)
+                policy_obs = _inject_phase_history(last_obs, phase_history, phase_history_valid)
                 rng, _rng = jax.random.split(rng)
                 agent_actions = {}
                 agent_values = {}
                 agent_log_probs = {}
+                agent_phase_preds = {}
                 agent_mem_h = {}
 
                 # update run_stats per agent during action selection
@@ -613,20 +781,28 @@ class IPPOJax(JaxRLAlgorithmBase):
                         mem_in = new_agent_mems[name]
                         y, updates = net.apply(
                             {"params": ts.params, "run_stats": ts.run_stats},
-                            last_obs,
+                            policy_obs,
                             mems=mem_in,
                             attn_mask=None,
                             train=False,
                             mutable=["run_stats"],
                         )
-                        pi, value, mem_out, mem_h = y
+                        if phase_enabled[name]:
+                            pi, value, phase_pred, mem_out, mem_h = y
+                        else:
+                            pi, value, mem_out, mem_h = y
+                            phase_pred = jnp.zeros_like(value)
                     else:
                         y, updates = net.apply(
                             {"params": ts.params, "run_stats": ts.run_stats},
-                            last_obs,
+                            policy_obs,
                             mutable=["run_stats"],
                         )
-                        pi, value = y
+                        if phase_enabled[name]:
+                            pi, value, phase_pred = y
+                        else:
+                            pi, value = y
+                            phase_pred = jnp.zeros_like(value)
                         mem_out = None
                         mem_h = ()
                     ts = jax.lax.cond(
@@ -641,6 +817,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                     agent_actions[name] = a
                     agent_values[name] = value
                     agent_log_probs[name] = lp
+                    agent_phase_preds[name] = phase_pred
                     if agent_is_trxl[name]:
                         new_agent_mems[name] = mem_out
                         agent_mem_h[name] = mem_h
@@ -653,6 +830,25 @@ class IPPOJax(JaxRLAlgorithmBase):
                 # STEP ENV
                 obsv, reward, absorbing, done, info, env_state = env.step(env_state, action)
                 agent_rewards = info['agent_rewards']
+                agent_phase_targets = {
+                    name: info["phase_gt"] if phase_enabled[name] else jnp.zeros_like(agent_values[name])
+                    for name in agent_names
+                }
+                agent_phase_valid = {
+                    name: phase_input_visible
+                    if phase_enabled[name]
+                    else jnp.zeros_like(agent_values[name], dtype=bool)
+                    for name in agent_names
+                }
+                if phase_agent_name is not None:
+                    phase_history, phase_history_valid = advance_phase_history(
+                        phase_history,
+                        phase_history_valid,
+                        agent_phase_preds[phase_agent_name],
+                        phase_input_visible,
+                    )
+                    phase_history = jnp.where(done[..., None], 0.0, phase_history)
+                    phase_history_valid = jnp.where(done[..., None], False, phase_history_valid)
                 for name in agent_names:
                     if agent_is_trxl[name]:
                         new_agent_mems[name] = _reset_mems(new_agent_mems[name], done)
@@ -668,20 +864,27 @@ class IPPOJax(JaxRLAlgorithmBase):
                     value=agent_values,
                     reward=agent_rewards,
                     log_prob=agent_log_probs,
-                    obs=last_obs,
+                    phase_pred=agent_phase_preds,
+                    phase_target=agent_phase_targets,
+                    phase_valid=agent_phase_valid,
+                    obs=policy_obs,
                     mem_h={name: agent_mem_h[name] for name in agent_names},
                     info=info,
                     traj_state=env_state.additional_carry.traj_state,
                     metrics=logged_metrics,
                 )
-                runner_state = (new_train_states, new_agent_mems, world_model_state, env_state, obsv, train_state_buffer, _rng_next)
+                runner_state = (
+                    new_train_states, new_agent_mems, world_model_state, env_state, obsv,
+                    train_state_buffer, phase_history, phase_history_valid, _rng_next,
+                )
                 return runner_state, transition
 
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, config.num_steps
             )
 
-            train_states, agent_mems, world_model_state, env_state, last_obs, train_state_buffer, rng = runner_state
+            (train_states, agent_mems, world_model_state, env_state, last_obs,
+             train_state_buffer, phase_history, phase_history_valid, rng) = runner_state
             traj_metrics = traj_batch.metrics
             absorb_ratio = jnp.sum(
                 jnp.where(traj_metrics.done, traj_metrics.absorbed, 0.0)
@@ -700,7 +903,10 @@ class IPPOJax(JaxRLAlgorithmBase):
                 return state
 
             env_state = _set_curriculum(env_state)
-            runner_state = (train_states, agent_mems, world_model_state, env_state, last_obs, train_state_buffer, rng)
+            runner_state = (
+                train_states, agent_mems, world_model_state, env_state, last_obs,
+                train_state_buffer, phase_history, phase_history_valid, rng,
+            )
 
             world_model_metrics = None
             if world_model_enabled:
@@ -822,6 +1028,9 @@ class IPPOJax(JaxRLAlgorithmBase):
             if has_trainable_policy:
                 # CALCULATE ADVANTAGE
                 # bootstrap values per agent
+                bootstrap_obs = _inject_phase_history(
+                    last_obs, phase_history, phase_history_valid
+                )
                 last_vals = {}
                 for name in agent_names:
                     ts = train_states[name]
@@ -830,20 +1039,26 @@ class IPPOJax(JaxRLAlgorithmBase):
                         mems = agent_mems[name]
                         y, _ = net.apply(
                             {"params": ts.params, "run_stats": ts.run_stats},
-                            last_obs,
+                            bootstrap_obs,
                             mems=mems,
                             attn_mask=None,
                             train=False,
                             mutable=["run_stats"],
                         )
-                        _, last_val, _, _ = y
+                        if phase_enabled[name]:
+                            _, last_val, _, _, _ = y
+                        else:
+                            _, last_val, _, _ = y
                     else:
                         y, _ = net.apply(
                             {"params": ts.params, "run_stats": ts.run_stats},
-                            last_obs,
+                            bootstrap_obs,
                             mutable=["run_stats"],
                         )
-                        _, last_val = y
+                        if phase_enabled[name]:
+                            _, last_val, _ = y
+                        else:
+                            _, last_val = y
                     last_vals[name] = last_val
 
                 def _calculate_gae(traj_batch: IPPOTransition, last_vals: Dict[str, jnp.ndarray]):
@@ -952,14 +1167,22 @@ class IPPOJax(JaxRLAlgorithmBase):
                                         rngs={"dropout": agent_rng},
                                         mutable=["run_stats"],
                                     )
-                                    pi, value, _, _ = y
+                                    if phase_enabled[name]:
+                                        pi, value, phase_pred, _, _ = y
+                                    else:
+                                        pi, value, _, _ = y
+                                        phase_pred = jnp.zeros_like(value)
                                 else:
                                     y, _ = net.apply(
                                         {"params": params, "run_stats": ts.run_stats},
                                         traj_mb.obs,
                                         mutable=["run_stats"],
                                     )
-                                    pi, value = y
+                                    if phase_enabled[name]:
+                                        pi, value, phase_pred = y
+                                    else:
+                                        pi, value = y
+                                        phase_pred = jnp.zeros_like(value)
                                 # recompute logprob on stored per-agent actions
                                 a = traj_mb.action_dict[name]
                                 log_prob = pi.log_prob(a)
@@ -986,12 +1209,30 @@ class IPPOJax(JaxRLAlgorithmBase):
 
                                 entropy = (pi.entropy() * mask).sum() / mask_denom
 
-                                total_loss = loss_actor + config.vf_coef * value_loss - config.ent_coef * entropy
-                                return total_loss, (value_loss, loss_actor, entropy, ratio)
+                                phase_error = 1.0 - jnp.cos(
+                                    2.0 * jnp.pi * (phase_pred - traj_mb.phase_target[name])
+                                )
+                                phase_mask = mask * traj_mb.phase_valid[name].astype(mask.dtype)
+                                phase_mask_count = phase_mask.sum()
+                                phase_mask_denom = jnp.maximum(phase_mask_count, 1.0)
+                                phase_loss = (phase_error * phase_mask).sum() / phase_mask_denom
+                                phase_loss = jnp.where(
+                                    phase_enabled[name] & (phase_mask_count > 0.0),
+                                    phase_loss,
+                                    jnp.array(0.0),
+                                )
+
+                                total_loss = (
+                                    loss_actor
+                                    + config.vf_coef * value_loss
+                                    - config.ent_coef * entropy
+                                    + phase_loss_coef * phase_loss
+                                )
+                                return total_loss, (value_loss, loss_actor, entropy, ratio, phase_loss)
 
                             def _train_agent(ts):
                                 grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-                                (total_loss, (value_loss, loss_actor, entropy, ratio)), grads = grad_fn(ts.params)
+                                (total_loss, (value_loss, loss_actor, entropy, ratio, phase_loss)), grads = grad_fn(ts.params)
 
                                 # apply grads
                                 ts = ts.apply_gradients(grads=grads)
@@ -1026,14 +1267,17 @@ class IPPOJax(JaxRLAlgorithmBase):
                                     ts = ts.replace(opt_state=new_opt_state,
                                                     adaptive_lr_state=AdaptiveLRState(learning_rate=next_lr))
 
-                                return ts, (total_loss, value_loss, loss_actor, entropy)
+                                return ts, (total_loss, value_loss, loss_actor, entropy, phase_loss)
 
                             ts, loss_logs[name] = jax.lax.cond(
                                 _policy_training_enabled(name, env_state),
                                 _train_agent,
                                 lambda ts: (
                                     ts,
-                                    (jnp.array(0.0), jnp.array(0.0), jnp.array(0.0), jnp.array(0.0)),
+                                    (
+                                        jnp.array(0.0), jnp.array(0.0), jnp.array(0.0),
+                                        jnp.array(0.0), jnp.array(0.0),
+                                    ),
                                 ),
                                 ts,
                             )
@@ -1060,6 +1304,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                     train_info[name] = {
                         "actor_loss": jnp.where(policy_training_enabled, jnp.mean(loss_info[name][2]), 0.0),
                         "critic_loss": jnp.where(policy_training_enabled, jnp.mean(loss_info[name][1]), 0.0),
+                        "phase_loss": jnp.where(policy_training_enabled, jnp.mean(loss_info[name][4]), 0.0),
                     }
 
             ref_agent = agent_names[0]
@@ -1159,15 +1404,29 @@ class IPPOJax(JaxRLAlgorithmBase):
                 for name, losses in train_info.items():
                     live_info[f"Train Info/{name}/Actor Loss"] = losses["actor_loss"]
                     live_info[f"Train Info/{name}/Critic Loss"] = losses["critic_loss"]
+                    if phase_enabled[name]:
+                        live_info[f"Train Info/{name}/Phase Loss"] = losses["phase_loss"]
             jax.debug.callback(callback, metric, live_info=live_info)
 
             # no train state buffering during training (validation only at end)
 
-            runner_state = (train_states, agent_mems, world_model_state, env_state, last_obs, train_state_buffer, rng)
+            runner_state = (
+                train_states, agent_mems, world_model_state, env_state, last_obs,
+                train_state_buffer, phase_history, phase_history_valid, rng,
+            )
             return runner_state, (metric, metric.max_timestep)
 
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_states, agent_mems, world_model_state, env_state, obsv, train_state_buffer, _rng)
+        phase_history = jnp.zeros(
+            (num_envs, phase_history_len), dtype=jnp.float32
+        )
+        phase_history_valid = jnp.zeros(
+            (num_envs, phase_history_len), dtype=bool
+        )
+        runner_state = (
+            train_states, agent_mems, world_model_state, env_state, obsv,
+            train_state_buffer, phase_history, phase_history_valid, _rng,
+        )
         runner_state, (metric, global_timesteps) = jax.lax.scan(
             _update_step, runner_state, None, config.num_updates
         )

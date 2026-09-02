@@ -9,6 +9,9 @@ import distrax
 from loco_mujoco.algorithms.common.transformer_xl import TransformerXL
 
 
+PHASE_HEAD_MODULE_NAME = "FullyConnectedNet_2"
+
+
 class RandomActionDistribution:
     """Wrapper distribution that samples random actions from uniform [-1, 1] instead of the policy."""
     
@@ -109,6 +112,8 @@ class ActorCritic(nn.Module):
     actor_obs_ind: jnp.ndarray = None
     critic_hidden_layer_dims: Sequence[int] = (1024, 512)
     critic_obs_ind: jnp.ndarray = None
+    phase_output_dim: int = 0
+    phase_hidden_layer_dims: Sequence[int] = (256, 128)
     # random: bool = False
 
     def setup(self):
@@ -142,7 +147,21 @@ class ActorCritic(nn.Module):
         # critic_x = self.critic_rms(critic_x)
         critic = FullyConnectedNet(self.critic_hidden_layer_dims, 1, self.activation, None, False, False)(critic_x)
 
-        return pi, jnp.squeeze(critic, axis=-1)
+        value = jnp.squeeze(critic, axis=-1)
+        if self.phase_output_dim <= 0:
+            return pi, value
+
+        phase = FullyConnectedNet(
+            self.phase_hidden_layer_dims,
+            self.phase_output_dim,
+            self.activation,
+            "sigmoid",
+            False,
+            False,
+            name=PHASE_HEAD_MODULE_NAME,
+        )(jax.lax.stop_gradient(actor_x))
+        phase = jnp.squeeze(phase, axis=-1)
+        return pi, value, phase
 
 
 class TransformerXLActorCritic(nn.Module):
@@ -161,6 +180,8 @@ class TransformerXLActorCritic(nn.Module):
     dropout: float = 0.0
     mem_len: int = 16
     positional_encoding: str = "absolute"
+    phase_output_dim: int = 0
+    phase_hidden_layer_dims: Sequence[int] = (256, 128)
 
     def setup(self):
         self.activation_fn = get_activation_fn(self.activation)
@@ -219,7 +240,21 @@ class TransformerXLActorCritic(nn.Module):
         if not self.learnable_std:
             actor_logtstd = jax.lax.stop_gradient(actor_logtstd)
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
-        return pi, jnp.squeeze(critic, axis=-1), new_mems, layer_h_last
+        value = jnp.squeeze(critic, axis=-1)
+        if self.phase_output_dim <= 0:
+            return pi, value, new_mems, layer_h_last
+
+        phase = FullyConnectedNet(
+            self.phase_hidden_layer_dims,
+            self.phase_output_dim,
+            self.activation,
+            "sigmoid",
+            False,
+            False,
+            name=PHASE_HEAD_MODULE_NAME,
+        )(jax.lax.stop_gradient(h_last))
+        phase = jnp.squeeze(phase, axis=-1)
+        return pi, value, phase, new_mems, layer_h_last
 
 
 class RunningMeanStd(nn.Module):
