@@ -79,6 +79,7 @@ class FullyConnectedNet(nn.Module):
     output_activation: str = None    # none means linear activation
     use_running_mean_stand: bool = True
     squeeze_output: bool = True
+    return_features: bool = False
 
     def setup(self):
         self.activation_fn = get_activation_fn(self.activation)
@@ -96,11 +97,17 @@ class FullyConnectedNet(nn.Module):
             x = nn.Dense(dim_layer, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
             x = self.activation_fn(x)
 
-        # add last layer
-        x = nn.Dense(self.output_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(x)
-        x = self.output_activation_fn(x)
+        features = x
 
-        return jnp.squeeze(x) if self.squeeze_output else x
+        # add last layer
+        output = nn.Dense(self.output_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(features)
+        output = self.output_activation_fn(output)
+
+        output = jnp.squeeze(output) if self.squeeze_output else output
+        if self.return_features:
+            return output, features
+
+        return output
 
 
 class ActorCritic(nn.Module):
@@ -114,6 +121,8 @@ class ActorCritic(nn.Module):
     critic_obs_ind: jnp.ndarray = None
     phase_output_dim: int = 0
     phase_hidden_layer_dims: Sequence[int] = (256, 128)
+    phase_joint_training: bool = False
+    phase_input_mask_indices: Sequence[int] = ()
     # random: bool = False
 
     def setup(self):
@@ -129,8 +138,20 @@ class ActorCritic(nn.Module):
         # build actor
         actor_x = x if self.actor_obs_ind is None else x[..., self.actor_obs_ind]
         # actor_x = self.actor_rms(actor_x)
-        actor_mean = FullyConnectedNet(self.actor_hidden_layer_dims, self.action_dim, self.activation,
-                                       None, False, False)(actor_x)
+        actor_output = FullyConnectedNet(
+            self.actor_hidden_layer_dims,
+            self.action_dim,
+            self.activation,
+            None,
+            False,
+            False,
+            return_features=self.phase_output_dim > 0 and self.phase_joint_training,
+        )(actor_x)
+        if self.phase_output_dim > 0 and self.phase_joint_training:
+            actor_mean, actor_features = actor_output
+        else:
+            actor_mean = actor_output
+            actor_features = None
         actor_logtstd = self.param("log_std", nn.initializers.constant(jnp.log(self.init_std)),
                                    (self.action_dim,))
         if not self.learnable_std:
@@ -151,6 +172,11 @@ class ActorCritic(nn.Module):
         if self.phase_output_dim <= 0:
             return pi, value
 
+        phase_input = actor_features if self.phase_joint_training else jax.lax.stop_gradient(actor_x)
+        if not self.phase_joint_training and len(self.phase_input_mask_indices) > 0:
+            phase_input = phase_input.at[
+                ..., jnp.asarray(self.phase_input_mask_indices, dtype=jnp.int32)
+            ].set(0.0)
         phase = FullyConnectedNet(
             self.phase_hidden_layer_dims,
             self.phase_output_dim,
@@ -159,7 +185,7 @@ class ActorCritic(nn.Module):
             False,
             False,
             name=PHASE_HEAD_MODULE_NAME,
-        )(jax.lax.stop_gradient(actor_x))
+        )(phase_input)
         phase = jnp.squeeze(phase, axis=-1)
         return pi, value, phase
 
@@ -182,6 +208,7 @@ class TransformerXLActorCritic(nn.Module):
     positional_encoding: str = "absolute"
     phase_output_dim: int = 0
     phase_hidden_layer_dims: Sequence[int] = (256, 128)
+    phase_joint_training: bool = False
 
     def setup(self):
         self.activation_fn = get_activation_fn(self.activation)
@@ -244,6 +271,7 @@ class TransformerXLActorCritic(nn.Module):
         if self.phase_output_dim <= 0:
             return pi, value, new_mems, layer_h_last
 
+        phase_input = h_last if self.phase_joint_training else jax.lax.stop_gradient(h_last)
         phase = FullyConnectedNet(
             self.phase_hidden_layer_dims,
             self.phase_output_dim,
@@ -252,7 +280,7 @@ class TransformerXLActorCritic(nn.Module):
             False,
             False,
             name=PHASE_HEAD_MODULE_NAME,
-        )(jax.lax.stop_gradient(h_last))
+        )(phase_input)
         phase = jnp.squeeze(phase, axis=-1)
         return pi, value, phase, new_mems, layer_h_last
 

@@ -3,7 +3,7 @@ import math
 import jax.numpy as jnp
 
 
-PHASE_VISIBILITY_HISTORY_MODES = ("latest", "any_history")
+PHASE_VISIBILITY_HISTORY_MODES = ("latest", "any_history", "always")
 
 
 def normalize_visibility_history_mode(mode: str) -> str:
@@ -22,8 +22,10 @@ def ball_position_visible(
     visibility_history_mode: str,
     epsilon: float = 1.0e-8,
 ):
-    """Return whether the selected ball position is visible in the chosen history scope."""
+    """Return whether phase prediction is valid in the chosen visibility mode."""
     mode = normalize_visibility_history_mode(visibility_history_mode)
+    if mode == "always":
+        return jnp.ones(obs_frames.shape[:-2], dtype=bool)
     if mode == "latest":
         ball_position = obs_frames[..., -1, position_indices]
         return jnp.any(jnp.abs(ball_position) > epsilon, axis=-1)
