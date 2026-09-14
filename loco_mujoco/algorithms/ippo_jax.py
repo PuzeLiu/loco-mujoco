@@ -1022,8 +1022,64 @@ class IPPOJax(JaxRLAlgorithmBase):
                 jnp.where(traj_metrics.done, traj_metrics.absorbed, 0.0)
             ) / (jnp.sum(traj_metrics.done) + 1e-6)
             absorb_ratio = absorb_ratio * jnp.ones_like(env_state.additional_carry.curriculum.absorb_ratio)
+            body_goal_vel_err = traj_batch.info.get(
+                "body_goal_vel_err",
+                jnp.zeros(traj_batch.done.shape + (3,), dtype=jnp.float32),
+            )
+            locomotion_command_active = traj_batch.info.get(
+                "locomotion_command_active",
+                jnp.ones_like(traj_batch.done, dtype=bool),
+            ).astype(jnp.float32)
+            locomotion_command_count = jnp.sum(locomotion_command_active)
+
+            def moving_command_rmse(error):
+                return jnp.where(
+                    locomotion_command_count > 0.0,
+                    jnp.sqrt(
+                        jnp.sum(
+                            jnp.square(error) * locomotion_command_active
+                        ) / jnp.maximum(locomotion_command_count, 1.0)
+                    ),
+                    jnp.array(jnp.inf, dtype=jnp.float32),
+                )
+
+            velocity_rmse_x = moving_command_rmse(body_goal_vel_err[..., 0])
+            velocity_rmse_y = moving_command_rmse(body_goal_vel_err[..., 1])
+            step_length_symmetry_error = traj_batch.info.get(
+                "feet_step_length_symmetry_error",
+                jnp.zeros_like(traj_batch.done, dtype=jnp.float32),
+            )
+            step_length_symmetry_valid = traj_batch.info.get(
+                "feet_step_length_symmetry_valid",
+                jnp.zeros_like(traj_batch.done, dtype=bool),
+            ).astype(jnp.float32)
+            step_length_symmetry_count = jnp.sum(step_length_symmetry_valid)
+            step_length_symmetry_rmse = jnp.where(
+                step_length_symmetry_count > 0.0,
+                jnp.sqrt(
+                    jnp.sum(
+                        jnp.square(step_length_symmetry_error)
+                        * step_length_symmetry_valid
+                    ) / jnp.maximum(step_length_symmetry_count, 1.0)
+                ),
+                jnp.array(jnp.inf, dtype=jnp.float32),
+            )
             curriculum = env_state.additional_carry.curriculum
-            curriculum = curriculum.replace(absorb_ratio=absorb_ratio)
+            curriculum = curriculum.replace(
+                absorb_ratio=absorb_ratio,
+                velocity_rmse_x=(
+                    velocity_rmse_x
+                    * jnp.ones_like(curriculum.velocity_rmse_x)
+                ),
+                velocity_rmse_y=(
+                    velocity_rmse_y
+                    * jnp.ones_like(curriculum.velocity_rmse_y)
+                ),
+                step_length_symmetry_rmse=(
+                    step_length_symmetry_rmse
+                    * jnp.ones_like(curriculum.step_length_symmetry_rmse)
+                ),
+            )
             def _set_curriculum(state):
                 fields = getattr(state, "__dataclass_fields__", {})
                 if "additional_carry" in fields:
@@ -1678,14 +1734,73 @@ class IPPOJax(JaxRLAlgorithmBase):
                 "body_goal_vel_err",
                 jnp.zeros(traj_batch.done.shape + (3,), dtype=jnp.float32),
             )
-            live_info["Locomotion/body_goal_vel_err_rmse_x"] = jnp.sqrt(
-                jnp.mean(jnp.square(_bg_err[..., 0])) + 1e-8
+            _moving_command = traj_batch.info.get(
+                "locomotion_command_active",
+                jnp.ones_like(traj_batch.done, dtype=bool),
+            ).astype(jnp.float32)
+            _moving_command_count = jnp.sum(_moving_command)
+
+            def _moving_rmse(error):
+                return jnp.where(
+                    _moving_command_count > 0.0,
+                    jnp.sqrt(
+                        jnp.sum(jnp.square(error) * _moving_command)
+                        / jnp.maximum(_moving_command_count, 1.0)
+                    ),
+                    jnp.array(jnp.nan, dtype=jnp.float32),
+                )
+
+            live_info["Locomotion/body_goal_vel_err_rmse_x"] = _moving_rmse(
+                _bg_err[..., 0]
             )
-            live_info["Locomotion/body_goal_vel_err_rmse_y"] = jnp.sqrt(
-                jnp.mean(jnp.square(_bg_err[..., 1])) + 1e-8
+            live_info["Locomotion/body_goal_vel_err_rmse_y"] = _moving_rmse(
+                _bg_err[..., 1]
             )
-            live_info["Locomotion/body_goal_vel_err_rmse_yaw"] = jnp.sqrt(
-                jnp.mean(jnp.square(_bg_err[..., 2])) + 1e-8
+            live_info["Locomotion/body_goal_vel_err_rmse_yaw"] = _moving_rmse(
+                _bg_err[..., 2]
+            )
+            live_info["Locomotion/moving_command_fraction"] = jnp.mean(
+                _moving_command
+            )
+            _step_symmetry_error = traj_batch.info.get(
+                "feet_step_length_symmetry_error",
+                jnp.zeros_like(traj_batch.done, dtype=jnp.float32),
+            )
+            _step_symmetry_valid = traj_batch.info.get(
+                "feet_step_length_symmetry_valid",
+                jnp.zeros_like(traj_batch.done, dtype=bool),
+            ).astype(jnp.float32)
+            _step_symmetry_count = jnp.sum(_step_symmetry_valid)
+            live_info["Locomotion/feet_step_length_symmetry_rmse"] = jnp.where(
+                _step_symmetry_count > 0.0,
+                jnp.sqrt(
+                    jnp.sum(
+                        jnp.square(_step_symmetry_error)
+                        * _step_symmetry_valid
+                    ) / jnp.maximum(_step_symmetry_count, 1.0)
+                ),
+                jnp.array(jnp.nan, dtype=jnp.float32),
+            )
+            _joint_cycle_symmetry_error = traj_batch.info.get(
+                "leg_joint_cycle_symmetry_error",
+                jnp.zeros_like(traj_batch.done, dtype=jnp.float32),
+            )
+            _joint_cycle_symmetry_valid = traj_batch.info.get(
+                "leg_joint_cycle_symmetry_valid",
+                jnp.zeros_like(traj_batch.done, dtype=bool),
+            ).astype(jnp.float32)
+            _joint_cycle_symmetry_count = jnp.sum(
+                _joint_cycle_symmetry_valid
+            )
+            live_info["Locomotion/leg_joint_cycle_symmetry_rmse"] = jnp.where(
+                _joint_cycle_symmetry_count > 0.0,
+                jnp.sqrt(
+                    jnp.sum(
+                        jnp.square(_joint_cycle_symmetry_error)
+                        * _joint_cycle_symmetry_valid
+                    ) / jnp.maximum(_joint_cycle_symmetry_count, 1.0)
+                ),
+                jnp.array(jnp.nan, dtype=jnp.float32),
             )
             if world_model_metrics is not None:
                 wm_abs_count = jnp.sum(

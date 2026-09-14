@@ -55,6 +55,9 @@ class PatternState:
 @struct.dataclass
 class CurriculumState:
     absorb_ratio: float
+    velocity_rmse_x: float
+    velocity_rmse_y: float
+    step_length_symmetry_rmse: float
     step: int
 
 @struct.dataclass
@@ -960,7 +963,13 @@ class Mujoco:
                 takeoff_velocity_multi=backend.zeros((2, 3)),
             ),
             reach_goal_state=False,
-            curriculum=CurriculumState(absorb_ratio=1.0, step=0),
+            curriculum=CurriculumState(
+                absorb_ratio=1.0,
+                velocity_rmse_x=backend.array(backend.inf),
+                velocity_rmse_y=backend.array(backend.inf),
+                step_length_symmetry_rmse=backend.array(backend.inf),
+                step=0,
+            ),
             stand_end_step=0,
             ball_com_ipos=backend.zeros((getattr(self, 'n_balls', 0), 3)),
             joint_pos_offset=backend.zeros(len(self._control_func._nominal_joint_positions)),
