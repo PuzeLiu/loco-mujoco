@@ -576,6 +576,7 @@ class HumanoidLocomotionRewardState:
     leg_joint_symmetry_history_count: Union[int, np.ndarray, jax.Array]
     leg_joint_cycle_symmetry_error: Union[float, np.ndarray, jax.Array]
     leg_joint_cycle_symmetry_valid: Union[bool, np.ndarray, jax.Array]
+    moving_double_support_steps: Union[int, np.ndarray, jax.Array]
     reward_components: Dict[str, Union[np.ndarray, jax.Array]]
 
 
@@ -706,6 +707,15 @@ class HumanoidLocomotionReward(Reward):
         # Velocity tracking weights and coefficients
         self._tracking_w_exp_linvel_x = kwargs.get("tracking_w_exp_linvel_x", 0.0)
         self._tracking_w_sum_linvel_x = kwargs.get("tracking_w_sum_linvel_x", 0.0)
+        self._tracking_low_speed_linvel_x_coeff = kwargs.get(
+            "tracking_low_speed_linvel_x_coeff", 0.0
+        )
+        self._tracking_low_speed_linvel_x_max_command = float(
+            kwargs.get("tracking_low_speed_linvel_x_max_command", 0.15)
+        )
+        self._tracking_low_speed_linvel_x_exp = float(
+            kwargs.get("tracking_low_speed_linvel_x_exp", 1.0)
+        )
         self._tracking_w_exp_linvel_y = kwargs.get("tracking_w_exp_linvel_y", 0.0)
         self._tracking_w_sum_linvel_y = kwargs.get("tracking_w_sum_linvel_y", 0.0)
         self._tracking_w_exp_angvel = kwargs.get("tracking_w_exp_angvel", 0.0)
@@ -789,6 +799,12 @@ class HumanoidLocomotionReward(Reward):
         self._feet_roll_coeff = kwargs.get("feet_roll_coeff", 0.0)
         self._feet_distance_coeff = kwargs.get("feet_distance_coeff", 0.0)
         self._feet_distance_target = kwargs.get("feet_distance_target", 0.0)
+        self._moving_double_support_coeff = kwargs.get(
+            "moving_double_support_coeff", 0.0
+        )
+        self._moving_double_support_grace_steps = int(
+            kwargs.get("moving_double_support_grace_steps", 5)
+        )
         self._feet_distance_mode = kwargs.get("feet_distance_mode", "target")
         if self._feet_distance_mode not in {"target", "minimum_lateral"}:
             raise ValueError(
@@ -951,6 +967,7 @@ class HumanoidLocomotionReward(Reward):
         reward_components = {
             "survival": 0.,
             "tracking_linvel_x": 0.,
+            "tracking_low_speed_linvel_x": 0.,
             "tracking_linvel_y": 0.,
             "tracking_angvel": 0.,
             "tracking_world_direction": 0.,
@@ -984,6 +1001,7 @@ class HumanoidLocomotionReward(Reward):
             "feet_yaw_mean": 0.,
             "feet_roll": 0.,
             "feet_distance": 0.,
+            "moving_double_support": 0.,
             "air_time": 0.,
             "no_fly": 0.,
             "impact": 0.,
@@ -1036,6 +1054,7 @@ class HumanoidLocomotionReward(Reward):
             leg_joint_symmetry_history_count=backend.array(0, dtype=backend.int32),
             leg_joint_cycle_symmetry_error=backend.array(0.0, dtype=backend.float32),
             leg_joint_cycle_symmetry_valid=backend.array(False, dtype=bool),
+            moving_double_support_steps=backend.array(0, dtype=backend.int32),
             reward_components=reward_components
         )
 
@@ -1294,12 +1313,20 @@ class HumanoidLocomotionReward(Reward):
             goal_state.goal_vel_yaw,
         ])
         goal_vel = sampled_goal_vel
-        locomotion_timed_stand = (
-            bool(env.env_cfg.get("locomotion_only", False))
-            and (
-                bool(getattr(env, "stand_phase_enabled", False))
-                or bool(getattr(env, "walk_to_stand_enabled", False))
+        joint_locomotion_enabled = bool(
+            env.env_cfg.get("joint_catch_juggle_locomotion", {}).get(
+                "enabled", False
             )
+        )
+        locomotion_timed_stand = (
+            (
+                bool(env.env_cfg.get("locomotion_only", False))
+                and (
+                    bool(getattr(env, "stand_phase_enabled", False))
+                    or bool(getattr(env, "walk_to_stand_enabled", False))
+                )
+            )
+            or joint_locomotion_enabled
         )
         if locomotion_timed_stand:
             # A transition observation is consumed by the next action, so the
@@ -1320,6 +1347,26 @@ class HumanoidLocomotionReward(Reward):
         tracking_reward_angvel = backend.exp(
             -backend.square(local_vel_root_ang[2] - goal_vel[2]) * self._tracking_w_exp_angvel
         )
+
+        low_speed_command = (
+            (backend.abs(goal_vel[0]) >= self._stand_command_threshold)
+            & (
+                backend.abs(goal_vel[0])
+                <= self._tracking_low_speed_linvel_x_max_command
+            )
+            & (backend.abs(goal_vel[1]) < self._stand_command_threshold)
+            & (backend.abs(goal_vel[2]) < self._stand_command_threshold)
+        )
+        low_speed_scale = backend.maximum(
+            backend.abs(goal_vel[0]), self._stand_command_threshold
+        )
+        low_speed_relative_error = (
+            local_vel_root_lin[0] - goal_vel[0]
+        ) / low_speed_scale
+        tracking_low_speed_linvel_x_reward = backend.exp(
+            -self._tracking_low_speed_linvel_x_exp
+            * backend.square(low_speed_relative_error)
+        ) * low_speed_command.astype(backend.float32)
 
         # Convert the reset-time body-frame command into a fixed world-frame
         # direction. The path starts at reset for direct walking and at the
@@ -1382,24 +1429,32 @@ class HumanoidLocomotionReward(Reward):
         transition_active = backend.array(False)
         if (
             self._transition_direction_constraints_enabled
-            and bool(env.env_cfg.get("locomotion_only", False))
+            and (
+                bool(env.env_cfg.get("locomotion_only", False))
+                or joint_locomotion_enabled
+            )
         ):
-            stand_end_step = getattr(carry, "stand_end_step", backend.array(0))
+            stand_end_step = (
+                carry.joint_locomotion_start_step
+                if joint_locomotion_enabled
+                else getattr(carry, "stand_end_step", backend.array(0))
+            )
             sampled_command_still = (
                 sampled_command_speed_xy < self._stand_command_threshold
             ) & (
                 backend.abs(sampled_goal_vel[2])
                 < self._stand_command_threshold
             )
+            if joint_locomotion_enabled:
+                initial_stand_active = stand_end_step == 0
+            else:
+                initial_stand_active = (
+                    (stand_end_step > 0)
+                    & (carry.cur_step_in_episode <= stand_end_step)
+                )
             reset_to_stand_active = backend.logical_and(
                 self._reset_to_stand_constraints_enabled,
-                backend.logical_or(
-                    (
-                        (stand_end_step > 0)
-                        & (carry.cur_step_in_episode <= stand_end_step)
-                    ),
-                    sampled_command_still,
-                ),
+                backend.logical_or(initial_stand_active, sampled_command_still),
             )
             stand_to_walk_elapsed = carry.cur_step_in_episode - stand_end_step
             stand_to_walk_active = (
@@ -1550,6 +1605,23 @@ class HumanoidLocomotionReward(Reward):
         left_foot_vel = data.sensordata[self._left_foot_sensor_adr]
         right_foot_vel = data.sensordata[self._right_foot_sensor_adr]
         feet_on_ground = get_feet_contact_states()
+
+        forward_motion_command = goal_vel[0] >= self._stand_command_threshold
+        both_feet_on_ground = backend.logical_and(
+            feet_on_ground[0], feet_on_ground[1]
+        )
+        moving_double_support_active = backend.logical_and(
+            forward_motion_command, both_feet_on_ground
+        )
+        moving_double_support_steps = backend.where(
+            moving_double_support_active,
+            reward_state.moving_double_support_steps + 1,
+            backend.array(0, dtype=backend.int32),
+        )
+        moving_double_support_reward = (
+            moving_double_support_steps
+            > self._moving_double_support_grace_steps
+        ).astype(backend.float32)
         
         feet_slip_reward = (
             backend.square(left_foot_vel[:3] * feet_on_ground[0]) + 
@@ -1886,6 +1958,9 @@ class HumanoidLocomotionReward(Reward):
 
         survival_reward *= (self._survival * env.dt)
         tracking_reward_linvel_x *= (self._tracking_w_sum_linvel_x * env.dt)
+        tracking_low_speed_linvel_x_reward *= (
+            self._tracking_low_speed_linvel_x_coeff * env.dt
+        )
         tracking_reward_linvel_y *= (self._tracking_w_sum_linvel_y * env.dt)
         tracking_reward_angvel *= (self._tracking_w_sum_angvel * env.dt)
         tracking_world_direction_reward *= (tracking_world_direction_coeff * env.dt)
@@ -1915,6 +1990,9 @@ class HumanoidLocomotionReward(Reward):
         feet_yaw_mean_reward *= (self._feet_yaw_mean_coeff * env.dt)
         feet_roll_reward *= (self._feet_roll_coeff * env.dt)
         feet_distance_reward *= (feet_distance_coeff * env.dt)
+        moving_double_support_reward *= (
+            self._moving_double_support_coeff * env.dt
+        )
         feet_swing_reward *= (self._feet_swing_coeff * env.dt)
         feet_swing_height_reward *= (feet_swing_height_coeff * env.dt)
         feet_stride_symmetry_reward *= (feet_stride_symmetry_coeff * env.dt)
@@ -1940,7 +2018,8 @@ class HumanoidLocomotionReward(Reward):
         # ==================== COMBINE REWARDS ====================
         
         tracking_reward = (
-            tracking_reward_linvel_x + tracking_reward_linvel_y + tracking_reward_angvel +
+            tracking_reward_linvel_x + tracking_low_speed_linvel_x_reward
+            + tracking_reward_linvel_y + tracking_reward_angvel +
             tracking_world_direction_reward +
             joint_qpos_reward + feet_swing_reward + tracking_base_pos_reward
         )
@@ -1953,7 +2032,8 @@ class HumanoidLocomotionReward(Reward):
             joint_position_limit_reward + feet_slip_reward + 
             feet_friction_utilization_reward +
             feet_yaw_diff_reward + feet_yaw_mean_reward + feet_roll_reward +
-            feet_distance_reward + feet_swing_height_reward +
+            feet_distance_reward + moving_double_support_reward +
+            feet_swing_height_reward +
             feet_stride_symmetry_reward + feet_step_length_symmetry_reward +
             leg_joint_cycle_symmetry_reward +
             standing_leg_joint_symmetry_reward + torso_joint_zero_reward +
@@ -1991,12 +2071,14 @@ class HumanoidLocomotionReward(Reward):
             leg_joint_symmetry_history_count=leg_joint_symmetry_history_count,
             leg_joint_cycle_symmetry_error=leg_joint_cycle_symmetry_error,
             leg_joint_cycle_symmetry_valid=leg_joint_cycle_symmetry_valid,
+            moving_double_support_steps=moving_double_support_steps,
         )
         
         # Update reward components dictionary
         updated_reward_components = {
             "survival": survival_reward,
             "tracking_linvel_x": tracking_reward_linvel_x,
+            "tracking_low_speed_linvel_x": tracking_low_speed_linvel_x_reward,
             "tracking_linvel_y": tracking_reward_linvel_y,
             "tracking_angvel": tracking_reward_angvel,
             "tracking_world_direction": tracking_world_direction_reward,
@@ -2030,6 +2112,7 @@ class HumanoidLocomotionReward(Reward):
             "feet_yaw_mean": feet_yaw_mean_reward,
             "feet_roll": feet_roll_reward,
             "feet_distance": feet_distance_reward,
+            "moving_double_support": moving_double_support_reward,
             "air_time": air_time_reward,
             "no_fly": no_fly_reward,
             "impact": impact_reward,

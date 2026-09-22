@@ -615,6 +615,28 @@ class IPPOJax(JaxRLAlgorithmBase):
             env = cls._wrap_env(env, config, world_conf=world_conf)
 
         agent_names = tuple(agent_conf.networks.keys())
+        juggle_reward_terms = tuple(dict.fromkeys(
+            str(term)
+            for name in agent_names
+            if name != "agent_lower_body"
+            for term in agent_conf.config.env.agent[name].get("reward_terms", [])
+        ))
+        rehearsal_cfg = agent_conf.config.env.get("locomotion_rehearsal", {})
+        locomotion_rehearsal_enabled = bool(
+            rehearsal_cfg.get("enabled", False)
+        )
+        locomotion_rehearsal_base_num_envs = int(
+            rehearsal_cfg.get("base_num_envs", config.num_envs)
+            if rehearsal_cfg.get("base_num_envs", None) is not None
+            else config.num_envs
+        )
+        if locomotion_rehearsal_enabled and not (
+            0 < locomotion_rehearsal_base_num_envs < int(config.num_envs)
+        ):
+            raise ValueError(
+                "locomotion_rehearsal.base_num_envs must be between 0 and "
+                "experiment.num_envs"
+            )
         agent_is_trxl = {
             name: isinstance(agent_conf.networks[name], TransformerXLActorCritic)
             for name in agent_names
@@ -677,6 +699,9 @@ class IPPOJax(JaxRLAlgorithmBase):
             obs_frames = obs.reshape(obs.shape[:-1] + (phase_history_len, phase_frame_dim))
             if phase_teacher_forcing:
                 phase_obs = obs_frames[..., phase_gt_obs_ind]
+                phase_obs = jnp.where(
+                    phase_history_valid[..., None], phase_obs, 0.0
+                )
             else:
                 phase_obs = encode_supercycle_phase(
                     phase_history,
@@ -702,6 +727,18 @@ class IPPOJax(JaxRLAlgorithmBase):
             name: agent_conf.config.env.agent[name].freeze_policy
             for name in agent_names
         }
+        freeze_policy_from_curriculum_stage = {
+            name: agent_conf.config.env.agent[name].get(
+                "freeze_policy_from_curriculum_stage", None
+            )
+            for name in agent_names
+        }
+        for name, freeze_stage in freeze_policy_from_curriculum_stage.items():
+            if freeze_stage is not None and int(freeze_stage) < 0:
+                raise ValueError(
+                    "freeze_policy_from_curriculum_stage must be non-negative "
+                    f"for agent '{name}'"
+                )
         has_trainable_policy = any(mode != True for mode in freeze_policy.values())
         world_model_enabled = world_conf is not None
         wm_obs_ind = world_conf.obs_ind if world_model_enabled else None
@@ -720,6 +757,35 @@ class IPPOJax(JaxRLAlgorithmBase):
         catch_and_juggle_enabled = bool(
             catch_and_juggle_cfg is not None
             and catch_and_juggle_cfg.get("enabled", False)
+        )
+        curriculum_absorb_source = str(
+            agent_conf.config.env.curriculum.get("absorb_source", "combined")
+        )
+        if curriculum_absorb_source not in {"combined", "juggle", "loco"}:
+            raise ValueError(
+                "env.curriculum.absorb_source must be one of: "
+                "combined, juggle, loco"
+            )
+        curriculum_absorb_episode_mode = str(
+            agent_conf.config.env.curriculum.get("absorb_episode_mode", "all")
+        )
+        if curriculum_absorb_episode_mode not in {
+            "all",
+            "incoming",
+            "bowl",
+            "both",
+        }:
+            raise ValueError(
+                "env.curriculum.absorb_episode_mode must be one of: "
+                "all, incoming, bowl, both"
+            )
+        curriculum_absorb_episode_mode_from_stage = int(
+            agent_conf.config.env.curriculum.get(
+                "absorb_episode_mode_from_stage",
+                agent_conf.config.env.get("catch_and_juggle", {}).get(
+                    "start_stage", 0
+                ),
+            )
         )
 
         # === CHANGE: action indices per agent for scattering ===
@@ -753,8 +819,19 @@ class IPPOJax(JaxRLAlgorithmBase):
 
         def _policy_training_enabled(name, env_state):
             if freeze_policy[name] == "adaptive":
-                return jnp.any(env_state.additional_carry.curriculum.step > 0)
-            return not bool(freeze_policy[name])
+                training_enabled = jnp.any(
+                    env_state.additional_carry.curriculum.step > 0
+                )
+            else:
+                training_enabled = not bool(freeze_policy[name])
+
+            freeze_stage = freeze_policy_from_curriculum_stage[name]
+            if freeze_stage is None:
+                return training_enabled
+            before_freeze_stage = jnp.all(
+                env_state.additional_carry.curriculum.step < int(freeze_stage)
+            )
+            return jnp.logical_and(training_enabled, before_freeze_stage)
 
         global_timesteps = timesteps if env_state is None else jnp.zeros_like(timesteps)
 
@@ -880,7 +957,17 @@ class IPPOJax(JaxRLAlgorithmBase):
                     ts = new_train_states[name]
                     net = agent_conf.networks[name]
 
+                    update_run_stats_from_main_tasks_only = (
+                        locomotion_rehearsal_enabled
+                        and name != "agent_lower_body"
+                    )
+
                     if agent_is_trxl[name]:
+                        if update_run_stats_from_main_tasks_only:
+                            raise ValueError(
+                                "locomotion rehearsal does not yet support a "
+                                "Transformer upper-body policy"
+                            )
                         mem_in = new_agent_mems[name]
                         y, updates = net.apply(
                             {"params": ts.params, "run_stats": ts.run_stats},
@@ -896,11 +983,45 @@ class IPPOJax(JaxRLAlgorithmBase):
                             pi, value, mem_out, mem_h = y
                             phase_pred = jnp.zeros_like(value)
                     else:
-                        y, updates = net.apply(
-                            {"params": ts.params, "run_stats": ts.run_stats},
-                            policy_obs,
-                            mutable=["run_stats"],
-                        )
+                        if update_run_stats_from_main_tasks_only:
+                            all_slots_are_main_tasks = jnp.all(
+                                jnp.logical_not(
+                                    env_state.additional_carry.locomotion_rehearsal
+                                )
+                            )
+
+                            def _update_run_stats(obs):
+                                _, branch_updates = net.apply(
+                                    {
+                                        "params": ts.params,
+                                        "run_stats": ts.run_stats,
+                                    },
+                                    obs,
+                                    mutable=["run_stats"],
+                                )
+                                return branch_updates
+
+                            updates = jax.lax.cond(
+                                all_slots_are_main_tasks,
+                                _update_run_stats,
+                                lambda obs: _update_run_stats(
+                                    obs[:locomotion_rehearsal_base_num_envs]
+                                ),
+                                policy_obs,
+                            )
+                            y = net.apply(
+                                {
+                                    "params": ts.params,
+                                    "run_stats": updates["run_stats"],
+                                },
+                                policy_obs,
+                            )
+                        else:
+                            y, updates = net.apply(
+                                {"params": ts.params, "run_stats": ts.run_stats},
+                                policy_obs,
+                                mutable=["run_stats"],
+                            )
                         if phase_enabled[name]:
                             pi, value, phase_pred = y
                         else:
@@ -957,7 +1078,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                     else jnp.zeros_like(agent_values[name], dtype=bool)
                     for name in agent_names
                 }
-                if phase_agent_name is not None and not phase_teacher_forcing:
+                if phase_agent_name is not None:
                     next_phase_history, next_phase_history_valid = advance_phase_history(
                         phase_history,
                         phase_history_valid,
@@ -1018,9 +1139,76 @@ class IPPOJax(JaxRLAlgorithmBase):
             (train_states, agent_mems, world_model_state, env_state, last_obs,
              train_state_buffer, phase_history, phase_history_valid, rng) = runner_state
             traj_metrics = traj_batch.metrics
-            absorb_ratio = jnp.sum(
-                jnp.where(traj_metrics.done, traj_metrics.absorbed, 0.0)
-            ) / (jnp.sum(traj_metrics.done) + 1e-6)
+            if curriculum_absorb_source == "juggle":
+                curriculum_absorbed = traj_metrics.juggle_absorbed
+            elif curriculum_absorb_source == "loco":
+                curriculum_absorbed = traj_metrics.loco_absorbed
+            else:
+                curriculum_absorbed = traj_metrics.absorbed
+            curriculum_eligible = traj_batch.info.get(
+                "curriculum_eligible",
+                jnp.ones_like(traj_metrics.done, dtype=bool),
+            )
+            curriculum_done = jnp.logical_and(
+                traj_metrics.done, curriculum_eligible
+            )
+            completed_episode_count = jnp.sum(curriculum_done)
+            combined_absorb_ratio = jnp.where(
+                completed_episode_count > 0,
+                jnp.sum(
+                    jnp.where(curriculum_done, curriculum_absorbed, 0.0)
+                ) / jnp.maximum(completed_episode_count, 1),
+                jnp.array(jnp.nan, dtype=jnp.float32),
+            )
+            incoming_episode = traj_batch.info.get(
+                "incoming_episode",
+                jnp.zeros_like(traj_metrics.done, dtype=bool),
+            )
+            incoming_done = jnp.logical_and(curriculum_done, incoming_episode)
+            bowl_done = jnp.logical_and(
+                curriculum_done, jnp.logical_not(incoming_episode)
+            )
+
+            def _episode_mode_absorb_ratio(done_mask):
+                done_count = jnp.sum(done_mask)
+                ratio = jnp.where(
+                    done_count > 0,
+                    jnp.sum(jnp.where(done_mask, curriculum_absorbed, 0.0))
+                    / jnp.maximum(done_count, 1),
+                    jnp.array(jnp.nan, dtype=jnp.float32),
+                )
+                return ratio, done_count
+
+            incoming_absorb_ratio, incoming_done_count = (
+                _episode_mode_absorb_ratio(incoming_done)
+            )
+            bowl_absorb_ratio, bowl_done_count = _episode_mode_absorb_ratio(
+                bowl_done
+            )
+            if curriculum_absorb_episode_mode == "incoming":
+                mode_absorb_ratio = incoming_absorb_ratio
+            elif curriculum_absorb_episode_mode == "bowl":
+                mode_absorb_ratio = bowl_absorb_ratio
+            elif curriculum_absorb_episode_mode == "both":
+                mode_absorb_ratio = jnp.where(
+                    jnp.logical_and(
+                        incoming_done_count > 0,
+                        bowl_done_count > 0,
+                    ),
+                    jnp.maximum(incoming_absorb_ratio, bowl_absorb_ratio),
+                    jnp.array(jnp.nan, dtype=jnp.float32),
+                )
+            else:
+                mode_absorb_ratio = combined_absorb_ratio
+            mode_filter_active = (
+                env_state.additional_carry.curriculum.step
+                >= curriculum_absorb_episode_mode_from_stage
+            )
+            absorb_ratio = jnp.where(
+                mode_filter_active,
+                mode_absorb_ratio,
+                combined_absorb_ratio,
+            )
             absorb_ratio = absorb_ratio * jnp.ones_like(env_state.additional_carry.curriculum.absorb_ratio)
             body_goal_vel_err = traj_batch.info.get(
                 "body_goal_vel_err",
@@ -1691,7 +1879,11 @@ class IPPOJax(JaxRLAlgorithmBase):
                 frac_absorbed = metric.frac_absorbed
                 juggle_absorbed = metric.juggle_absorbed
                 loco_absorbed = metric.loco_absorbed
-                mean_ep_return_components = metric.mean_episode_return_components                
+                mean_ep_return_components = metric.mean_episode_return_components
+                mean_ep_juggle_return = sum(
+                    mean_ep_return_components.get(term, 0.0)
+                    for term in juggle_reward_terms
+                )
                 curriculum_step = metric.curriculum_step
 
                 if config.debug:
@@ -1699,6 +1891,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                 else:
                     wandb_log_dict = dict()
                     wandb_log_dict["Live Info/Mean Episode Return"] = mean_ep_return
+                    wandb_log_dict["Live Info/Mean Episode Juggle Return"] = mean_ep_juggle_return
                     wandb_log_dict["Live Info/Mean Episode Length"] = mean_ep_length
                     wandb_log_dict["Live Info/Absorbed Envs"] = frac_absorbed
                     wandb_log_dict["Live Info/Curriculum Step"] = curriculum_step
@@ -1721,10 +1914,103 @@ class IPPOJax(JaxRLAlgorithmBase):
                     wandb_run.log(wandb_log_dict, step=timestep)                
 
             ts = train_states[ref_agent]
+            _curriculum_eligible = traj_batch.info.get(
+                "curriculum_eligible",
+                jnp.ones_like(traj_batch.metrics.done, dtype=bool),
+            )
+            _main_done = jnp.logical_and(
+                traj_batch.metrics.done, _curriculum_eligible
+            )
+            _main_done_count = jnp.sum(_main_done)
+            _incoming_episode = traj_batch.info.get(
+                "incoming_episode",
+                jnp.zeros_like(traj_batch.metrics.done, dtype=bool),
+            )
+            _main_juggle_absorbed = jnp.where(
+                _main_done_count > 0,
+                jnp.sum(
+                    jnp.where(
+                        _main_done,
+                        traj_batch.metrics.juggle_absorbed,
+                        0.0,
+                    )
+                ) / jnp.maximum(_main_done_count, 1),
+                jnp.array(jnp.nan, dtype=jnp.float32),
+            )
+            _incoming_done = jnp.logical_and(
+                traj_batch.metrics.done,
+                jnp.logical_and(_curriculum_eligible, _incoming_episode),
+            )
+            _bowl_done = jnp.logical_and(
+                traj_batch.metrics.done,
+                jnp.logical_and(
+                    jnp.logical_not(
+                        traj_batch.info.get(
+                            "locomotion_rehearsal",
+                            jnp.zeros_like(traj_batch.metrics.done, dtype=bool),
+                        )
+                    ),
+                    jnp.logical_not(_incoming_episode),
+                ),
+            )
+
+            def _mode_juggle_absorbed(done_mask):
+                done_count = jnp.sum(done_mask)
+                return jnp.where(
+                    done_count > 0,
+                    jnp.sum(
+                        jnp.where(
+                            done_mask,
+                            traj_batch.metrics.juggle_absorbed,
+                            0.0,
+                        )
+                    ) / jnp.maximum(done_count, 1),
+                    jnp.array(jnp.nan, dtype=jnp.float32),
+                )
+
+            _main_juggle_return = sum(
+                jnp.sum(
+                    jnp.where(
+                        _main_done,
+                        traj_batch.metrics.returned_episode_return_components.get(
+                            term,
+                            jnp.zeros_like(
+                                traj_batch.metrics.returned_episode_returns
+                            ),
+                        ),
+                        0.0,
+                    )
+                )
+                for term in juggle_reward_terms
+            ) / jnp.maximum(_main_done_count, 1)
             live_info = {
                 "Learning Rate": ts.adaptive_lr_state.learning_rate
                 if config.get("adaptive_lr", False) else config.lr,
+                "Live Info/Juggle Absorbed": _main_juggle_absorbed,
+                "Live Info/Curriculum Juggle Absorbed": jnp.mean(absorb_ratio),
+                "Live Info/Mean Episode Juggle Return": _main_juggle_return,
+                "Live Info/Incoming Juggle Absorbed": _mode_juggle_absorbed(
+                    _incoming_done
+                ),
+                "Live Info/Bowl Juggle Absorbed": _mode_juggle_absorbed(
+                    _bowl_done
+                ),
             }
+            if locomotion_rehearsal_enabled:
+                main_fraction = (
+                    float(locomotion_rehearsal_base_num_envs)
+                    / float(config.num_envs)
+                )
+                live_info["Environment/Main Task Fraction"] = main_fraction
+                live_info["Environment/Locomotion Rehearsal Fraction"] = (
+                    1.0 - main_fraction
+                )
+                live_info["Environment/Main Task Steps"] = (
+                    metric.max_timestep * main_fraction
+                )
+                live_info["Environment/Locomotion Rehearsal Steps"] = (
+                    metric.max_timestep * (1.0 - main_fraction)
+                )
             for name in agent_names:
                 log_std = train_states[name].params.get("log_std", None)
                 if log_std is not None:
