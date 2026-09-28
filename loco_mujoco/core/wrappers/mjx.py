@@ -425,10 +425,17 @@ class NStepWrapper(BaseWrapper):
         # make a step
         next_observation, reward, absorbing, done, info, env_state = self.env.step(state.env_state, action)
 
-        # add observation to the buffer
-        observation_buffer = state.observation_buffer
-        observation_buffer = jnp.roll(observation_buffer, shift=-1, axis=0)
-        observation_buffer = observation_buffer.at[-1].set(next_observation)
+        # Add the observation to the current episode's buffer. The wrapped MJX
+        # environment auto-resets on done: next_observation is terminal, while
+        # env_state.observation is the new episode's initial observation.
+        stepped_buffer = jnp.roll(
+            state.observation_buffer, shift=-1, axis=0
+        )
+        stepped_buffer = stepped_buffer.at[-1].set(next_observation)
+
+        reset_buffer = jnp.zeros_like(stepped_buffer)
+        reset_buffer = reset_buffer.at[-1].set(env_state.observation)
+        observation_buffer = jnp.where(done, reset_buffer, stepped_buffer)
         state = NStepWrapperState(env_state, observation_buffer)
         next_observation = jnp.reshape(observation_buffer, (-1,))
 
@@ -475,7 +482,10 @@ class WorldModelWrapper(BaseWrapper):
 
     def _build_inputs(self, obs, action):
         wm_obs = obs[..., self.wm_obs_ind]
-        wm_inputs = jnp.concatenate([wm_obs, action], axis=-1)
+        action_dim = self.model.input_dim - wm_obs.shape[-1]
+        wm_inputs = jnp.concatenate(
+            [wm_obs, action[..., :action_dim]], axis=-1
+        )
         return wm_inputs
 
     def _reset_cache(self, cache, done):

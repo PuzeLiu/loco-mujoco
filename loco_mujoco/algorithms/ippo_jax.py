@@ -349,6 +349,43 @@ class IPPOJax(JaxRLAlgorithmBase):
             else:
                 critic_obs_ind = jnp.arange(env.mdp_info.observation_space.shape[0])
 
+            goal_obs_name = agent_cfg.get("goal_observation_name", None)
+            if goal_obs_name is not None:
+                goal_obs_name = str(goal_obs_name)
+                if goal_obs_name not in env.obs_container:
+                    raise KeyError(
+                        f"Goal observation '{goal_obs_name}' not found for "
+                        f"agent '{agent_name}'"
+                    )
+                goal_obs_ind = np.asarray(
+                    env.obs_container[goal_obs_name].obs_ind,
+                    dtype=np.int32,
+                )
+                selected_goal_ind = np.asarray(
+                    agent_cfg.get(
+                        "goal_observation_indices",
+                        np.arange(goal_obs_ind.size),
+                    ),
+                    dtype=np.int32,
+                )
+                if np.any(selected_goal_ind < 0) or np.any(
+                    selected_goal_ind >= goal_obs_ind.size
+                ):
+                    raise ValueError(
+                        f"Goal observation indices for agent '{agent_name}' "
+                        f"must be in [0, {goal_obs_ind.size - 1}], got "
+                        f"{selected_goal_ind.tolist()}"
+                    )
+                selected_goal_obs_ind = jnp.asarray(
+                    goal_obs_ind[selected_goal_ind], dtype=jnp.int32
+                )
+                actor_obs_ind = jnp.unique(
+                    jnp.concatenate([actor_obs_ind, selected_goal_obs_ind])
+                )
+                critic_obs_ind = jnp.unique(
+                    jnp.concatenate([critic_obs_ind, selected_goal_obs_ind])
+                )
+
             if max_len_obs_history > 1:
                 obs_len = env.info.observation_space.shape[0]
                 actor_len_obs_history = agent_cfg.actor_len_obs_history
@@ -359,6 +396,29 @@ class IPPOJax(JaxRLAlgorithmBase):
                                                  for i in range(actor_len_obs_history)])
                 critic_obs_ind = jnp.concatenate([critic_obs_ind + (critic_history_offset + i) * obs_len
                                                   for i in range(critic_len_obs_history)])
+            if bool(agent_cfg.get("residual_policy", False)):
+                base_action_obs_name = str(agent_cfg.base_action_observation_name)
+                if base_action_obs_name not in env.obs_container:
+                    raise KeyError(
+                        f"Residual base-action observation '{base_action_obs_name}' "
+                        f"not found for agent '{agent_name}'"
+                    )
+                base_action_obs_ind = np.asarray(
+                    env.obs_container[base_action_obs_name].obs_ind,
+                    dtype=np.int32,
+                )
+                base_action_dim = len(
+                    config.env.agent[str(agent_cfg.base_agent)].action_idx
+                )
+                if base_action_obs_ind.size != base_action_dim:
+                    raise ValueError(
+                        f"Residual agent '{agent_name}' expects {base_action_dim} "
+                        f"base-action inputs, got {base_action_obs_ind.size}"
+                    )
+                with open_dict(agent_cfg):
+                    agent_cfg.base_action_observation_indices = (
+                        base_action_obs_ind.tolist()
+                    )
             phase_input_mask_indices = ()
             if phase_exclude_history_from_input:
                 actor_obs_ind_np = np.asarray(actor_obs_ind, dtype=np.int32)
@@ -579,7 +639,8 @@ class IPPOJax(JaxRLAlgorithmBase):
         wrapped_env = env if isinstance(env, BaseWrapper) else cls._wrap_env(env, config, world_conf=world_conf)
         return (
             lambda rng_key, agent_state=None, world_state=None, env_state=None,
-                   timesteps=0, phase_history=None, phase_history_valid=None: cls._train_fn(
+                   timesteps=0, phase_history=None, phase_history_valid=None,
+                   residual_base_action_history=None: cls._train_fn(
                 rng_key,
                 wrapped_env,
                 agent_conf,
@@ -592,6 +653,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                 timesteps=timesteps,
                 phase_history=phase_history,
                 phase_history_valid=phase_history_valid,
+                residual_base_action_history=residual_base_action_history,
             )
         )
     
@@ -607,6 +669,7 @@ class IPPOJax(JaxRLAlgorithmBase):
                   timesteps: int = 0,
                   phase_history=None,
                   phase_history_valid=None,
+                  residual_base_action_history=None,
                   ):
         # extract static agent info
         config = agent_conf.config.experiment
@@ -733,10 +796,22 @@ class IPPOJax(JaxRLAlgorithmBase):
             )
             for name in agent_names
         }
+        train_policy_from_curriculum_stage = {
+            name: agent_conf.config.env.agent[name].get(
+                "train_policy_from_curriculum_stage", None
+            )
+            for name in agent_names
+        }
         for name, freeze_stage in freeze_policy_from_curriculum_stage.items():
             if freeze_stage is not None and int(freeze_stage) < 0:
                 raise ValueError(
                     "freeze_policy_from_curriculum_stage must be non-negative "
+                    f"for agent '{name}'"
+                )
+        for name, train_stage in train_policy_from_curriculum_stage.items():
+            if train_stage is not None and int(train_stage) < 0:
+                raise ValueError(
+                    "train_policy_from_curriculum_stage must be non-negative "
                     f"for agent '{name}'"
                 )
         has_trainable_policy = any(mode != True for mode in freeze_policy.values())
@@ -789,13 +864,69 @@ class IPPOJax(JaxRLAlgorithmBase):
         )
 
         # === CHANGE: action indices per agent for scattering ===
-        agent_action_idx = {
-            name: jnp.array(agent_conf.config.env.agent[name].action_idx, dtype=jnp.int32)
+        agent_action_idx_values = {
+            name: tuple(
+                int(idx)
+                for idx in agent_conf.config.env.agent[name].action_idx
+            )
             for name in agent_names
         }
-
-        full_action_dim = env.info.action_space.shape[0]
+        agent_action_idx = {
+            name: jnp.asarray(indices, dtype=jnp.int32)
+            for name, indices in agent_action_idx_values.items()
+        }
+        physical_action_dim = int(env.info.action_space.shape[0])
+        full_action_dim = max(
+            physical_action_dim,
+            max(max(indices) + 1 for indices in agent_action_idx_values.values()),
+        )
+        residual_agent_base = {
+            name: str(agent_conf.config.env.agent[name].base_agent)
+            for name in agent_names
+            if bool(agent_conf.config.env.agent[name].get("residual_policy", False))
+        }
+        residual_base_obs_ind = {
+            name: jnp.asarray(
+                agent_conf.config.env.agent[name].base_action_observation_indices,
+                dtype=jnp.int32,
+            )
+            for name in residual_agent_base
+        }
+        residual_history_len = {
+            name: int(
+                agent_conf.config.env.agent[name].get(
+                    "actor_len_obs_history", 1
+                )
+            )
+            for name in residual_agent_base
+        }
+        residual_base_action_dim = {
+            name: int(agent_action_idx[base_name].size)
+            for name, base_name in residual_agent_base.items()
+        }
+        base_agent_names = tuple(
+            name for name in agent_names if name not in residual_agent_base
+        )
+        residual_agent_names = tuple(
+            name for name in agent_names if name in residual_agent_base
+        )
+        residual_base_agent_names = tuple(
+            dict.fromkeys(residual_agent_base.values())
+        )
         num_envs = config.num_envs
+
+        def _inject_residual_action_history(
+            policy_obs, name, base_action, history
+        ):
+            history = jnp.roll(history, shift=-1, axis=1)
+            history = history.at[:, -1].set(base_action)
+            first_frame = phase_history_len - residual_history_len[name]
+            for i in range(residual_history_len[name]):
+                obs_ind = residual_base_obs_ind[name] + (
+                    first_frame + i
+                ) * phase_frame_dim
+                policy_obs = policy_obs.at[..., obs_ind].set(history[:, i])
+            return policy_obs, history
 
         def _reset_mems(mems, done_mask):
             if mems is None:
@@ -826,12 +957,22 @@ class IPPOJax(JaxRLAlgorithmBase):
                 training_enabled = not bool(freeze_policy[name])
 
             freeze_stage = freeze_policy_from_curriculum_stage[name]
-            if freeze_stage is None:
-                return training_enabled
-            before_freeze_stage = jnp.all(
-                env_state.additional_carry.curriculum.step < int(freeze_stage)
-            )
-            return jnp.logical_and(training_enabled, before_freeze_stage)
+            if freeze_stage is not None:
+                before_freeze_stage = jnp.all(
+                    env_state.additional_carry.curriculum.step < int(freeze_stage)
+                )
+                training_enabled = jnp.logical_and(
+                    training_enabled, before_freeze_stage
+                )
+            train_stage = train_policy_from_curriculum_stage[name]
+            if train_stage is not None:
+                after_train_stage = jnp.all(
+                    env_state.additional_carry.curriculum.step >= int(train_stage)
+                )
+                training_enabled = jnp.logical_and(
+                    training_enabled, after_train_stage
+                )
+            return training_enabled
 
         global_timesteps = timesteps if env_state is None else jnp.zeros_like(timesteps)
 
@@ -930,7 +1071,8 @@ class IPPOJax(JaxRLAlgorithmBase):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
                 (train_states, agent_mems, world_model_state, env_state, last_obs,
-                 train_state_buffer, phase_history, phase_history_valid, rng) = runner_state
+                 train_state_buffer, phase_history, phase_history_valid,
+                 residual_base_action_history, rng) = runner_state
 
                 # SELECT ACTION
                 phase_input_visible = _current_ball_position_visible(last_obs)
@@ -949,11 +1091,40 @@ class IPPOJax(JaxRLAlgorithmBase):
                 new_agent_mems = dict(agent_mems)
 
                 # split rng for agents deterministically
-                keys = jax.random.split(_rng, len(agent_names) + 1)
-                _rng_next = keys[0]
-                agent_keys = keys[1:]
+                base_keys = jax.random.split(_rng, len(base_agent_names) + 1)
+                _rng_next = base_keys[0]
+                agent_key_by_name = {
+                    name: key
+                    for name, key in zip(base_agent_names, base_keys[1:])
+                }
+                if residual_agent_names:
+                    residual_keys = jax.random.split(
+                        jax.random.fold_in(_rng, 0x52455349),
+                        len(residual_agent_names),
+                    )
+                    agent_key_by_name.update(
+                        {
+                            name: key
+                            for name, key in zip(
+                                residual_agent_names, residual_keys
+                            )
+                        }
+                    )
+                agent_keys = tuple(
+                    agent_key_by_name[name] for name in agent_names
+                )
 
                 for name, k in zip(agent_names, agent_keys):
+                    if name in residual_agent_base:
+                        base_name = residual_agent_base[name]
+                        policy_obs, residual_base_action_history[name] = (
+                            _inject_residual_action_history(
+                                policy_obs,
+                                name,
+                                agent_actions[base_name],
+                                residual_base_action_history[name],
+                            )
+                        )
                     ts = new_train_states[name]
                     net = agent_conf.networks[name]
 
@@ -1105,6 +1276,12 @@ class IPPOJax(JaxRLAlgorithmBase):
                 for name in agent_names:
                     if agent_is_trxl[name]:
                         new_agent_mems[name] = _reset_mems(new_agent_mems[name], done)
+                for name in residual_agent_names:
+                    residual_base_action_history[name] = jnp.where(
+                        done[:, None, None],
+                        0.0,
+                        residual_base_action_history[name],
+                    )
                 # GET METRICS
                 log_env_state = env_state.find(RichLogEnvState)
                 logged_metrics = log_env_state.metrics
@@ -1128,7 +1305,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                 )
                 runner_state = (
                     new_train_states, new_agent_mems, world_model_state, env_state, obsv,
-                    train_state_buffer, phase_history, phase_history_valid, _rng_next,
+                    train_state_buffer, phase_history, phase_history_valid,
+                    residual_base_action_history, _rng_next,
                 )
                 return runner_state, transition
 
@@ -1137,7 +1315,8 @@ class IPPOJax(JaxRLAlgorithmBase):
             )
 
             (train_states, agent_mems, world_model_state, env_state, last_obs,
-             train_state_buffer, phase_history, phase_history_valid, rng) = runner_state
+             train_state_buffer, phase_history, phase_history_valid,
+             residual_base_action_history, rng) = runner_state
             traj_metrics = traj_batch.metrics
             if curriculum_absorb_source == "juggle":
                 curriculum_absorbed = traj_metrics.juggle_absorbed
@@ -1281,7 +1460,8 @@ class IPPOJax(JaxRLAlgorithmBase):
             env_state = _set_curriculum(env_state)
             runner_state = (
                 train_states, agent_mems, world_model_state, env_state, last_obs,
-                train_state_buffer, phase_history, phase_history_valid, rng,
+                train_state_buffer, phase_history, phase_history_valid,
+                residual_base_action_history, rng,
             )
 
             world_model_metrics = None
@@ -1407,8 +1587,35 @@ class IPPOJax(JaxRLAlgorithmBase):
                 bootstrap_obs = _inject_phase_history(
                     last_obs, phase_history, phase_history_valid
                 )
+                bootstrap_residual_history = dict(
+                    residual_base_action_history
+                )
+                bootstrap_action_keys = {}
+                if residual_agent_names:
+                    rng, bootstrap_rng = jax.random.split(rng)
+                    bootstrap_action_keys = {
+                        name: key
+                        for name, key in zip(
+                            residual_base_agent_names,
+                            jax.random.split(
+                                bootstrap_rng,
+                                len(residual_base_agent_names),
+                            ),
+                        )
+                    }
+                bootstrap_base_actions = {}
                 last_vals = {}
                 for name in agent_names:
+                    if name in residual_agent_base:
+                        base_name = residual_agent_base[name]
+                        bootstrap_obs, bootstrap_residual_history[name] = (
+                            _inject_residual_action_history(
+                                bootstrap_obs,
+                                name,
+                                bootstrap_base_actions[base_name],
+                                bootstrap_residual_history[name],
+                            )
+                        )
                     ts = train_states[name]
                     net = agent_conf.networks[name]
                     if agent_is_trxl[name]:
@@ -1422,9 +1629,9 @@ class IPPOJax(JaxRLAlgorithmBase):
                             mutable=["run_stats"],
                         )
                         if phase_enabled[name]:
-                            _, last_val, _, _, _ = y
+                            pi, last_val, _, _, _ = y
                         else:
-                            _, last_val, _, _ = y
+                            pi, last_val, _, _ = y
                     else:
                         y, _ = net.apply(
                             {"params": ts.params, "run_stats": ts.run_stats},
@@ -1432,9 +1639,13 @@ class IPPOJax(JaxRLAlgorithmBase):
                             mutable=["run_stats"],
                         )
                         if phase_enabled[name]:
-                            _, last_val, _ = y
+                            pi, last_val, _ = y
                         else:
-                            _, last_val = y
+                            pi, last_val = y
+                    if name in residual_base_agent_names:
+                        bootstrap_base_actions[name] = pi.sample(
+                            seed=bootstrap_action_keys[name]
+                        )
                     last_vals[name] = last_val
 
                 def _calculate_gae(traj_batch: IPPOTransition, last_vals: Dict[str, jnp.ndarray]):
@@ -2123,7 +2334,8 @@ class IPPOJax(JaxRLAlgorithmBase):
 
             runner_state = (
                 train_states, agent_mems, world_model_state, env_state, last_obs,
-                train_state_buffer, phase_history, phase_history_valid, rng,
+                train_state_buffer, phase_history, phase_history_valid,
+                residual_base_action_history, rng,
             )
             return runner_state, (metric, metric.max_timestep)
 
@@ -2147,9 +2359,34 @@ class IPPOJax(JaxRLAlgorithmBase):
                 f"phase_history_valid must have shape {expected_phase_shape}, "
                 f"got {phase_history_valid.shape}"
             )
+        if residual_base_action_history is None:
+            residual_base_action_history = {
+                name: jnp.zeros(
+                    (
+                        num_envs,
+                        residual_history_len[name],
+                        residual_base_action_dim[name],
+                    ),
+                    dtype=jnp.float32,
+                )
+                for name in residual_agent_names
+            }
+        for name in residual_agent_names:
+            expected_shape = (
+                num_envs,
+                residual_history_len[name],
+                residual_base_action_dim[name],
+            )
+            if residual_base_action_history[name].shape != expected_shape:
+                raise ValueError(
+                    f"Residual base-action history for '{name}' must have "
+                    f"shape {expected_shape}, got "
+                    f"{residual_base_action_history[name].shape}"
+                )
         runner_state = (
             train_states, agent_mems, world_model_state, env_state, obsv,
-            train_state_buffer, phase_history, phase_history_valid, _rng,
+            train_state_buffer, phase_history, phase_history_valid,
+            residual_base_action_history, _rng,
         )
         runner_state, (metric, global_timesteps) = jax.lax.scan(
             _update_step, runner_state, None, config.num_updates
@@ -2164,7 +2401,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                 "env_state": env_state_out,
                 "phase_history": runner_state[6],
                 "phase_history_valid": runner_state[7],
-                "rng": runner_state[8],
+                "residual_base_action_history": runner_state[8],
+                "rng": runner_state[9],
                 "training_metrics": metric,
                 "global_timesteps": global_timesteps}
 
