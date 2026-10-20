@@ -23,6 +23,9 @@ from loco_mujoco.algorithms.common.networks import (
 from loco_mujoco.algorithms.common.transformer_xl import init_mems
 from loco_mujoco.algorithms.common.phase import (
     advance_phase_history,
+    apply_gradients_with_phase_gate,
+    phase_training_enabled,
+    phase_training_start_stage,
     ball_position_visible,
     encode_supercycle_phase,
     normalize_visibility_history_mode,
@@ -739,6 +742,7 @@ class IPPOJax(JaxRLAlgorithmBase):
             phase_visibility_history_mode = normalize_visibility_history_mode(
                 phase_cfg.get("visibility_history_mode", "latest")
             )
+            phase_train_from_stage = phase_training_start_stage(phase_cfg)
             phase_loss_coef = float(phase_cfg.get("loss_coef", 1.0))
             phase_rate_loss_coef = float(phase_cfg.get("rate_loss_coef", 0.0))
             if int(phase_cfg.history_len) != phase_history_len:
@@ -753,6 +757,7 @@ class IPPOJax(JaxRLAlgorithmBase):
             phase_num_hands = 1
             phase_num_balls = 1
             phase_visibility_history_mode = "latest"
+            phase_train_from_stage = 0
             phase_loss_coef = 0.0
             phase_rate_loss_coef = 0.0
 
@@ -1222,8 +1227,18 @@ class IPPOJax(JaxRLAlgorithmBase):
 
                 action = _scatter_actions(num_envs, full_action_dim, agent_actions, agent_action_idx)
 
+                # Label the transition with its source stage, before env.step
+                # can promote the curriculum or reset the episode.
+                if phase_agent_name is not None and phase_train_from_stage > 0:
+                    rollout_phase_training_enabled = phase_training_enabled(
+                        env_state.additional_carry.curriculum.step, phase_train_from_stage
+                    )
                 # STEP ENV
                 obsv, reward, absorbing, done, info, env_state = env.step(env_state, action)
+                if phase_agent_name is not None and phase_train_from_stage > 0:
+                    info = {**info, "phase_training_enabled": jnp.broadcast_to(
+                        rollout_phase_training_enabled, done.shape
+                    )}
                 agent_rewards = info['agent_rewards']
                 phase_reset = info.get(
                     "phase_reset", jnp.zeros_like(done, dtype=bool)
@@ -1763,6 +1778,11 @@ class IPPOJax(JaxRLAlgorithmBase):
                                     phase_sample_mask * task_training_mask
                                 )
 
+                            if phase_enabled[name] and phase_train_from_stage > 0:
+                                phase_sample_mask = phase_sample_mask * traj_mb.info[
+                                    "phase_training_enabled"
+                                ].astype(mask.dtype)
+
                             if phase_enabled[name] and phase_rate_loss_coef > 0.0:
                                 prev_obs = traj_batch.obs[prev_t_idx, env_idx]
                                 prev_phase_target = traj_batch.phase_target[name][prev_t_idx, env_idx]
@@ -1792,6 +1812,10 @@ class IPPOJax(JaxRLAlgorithmBase):
                                         ),
                                     ).astype(mask.dtype)
                                     prev_mask = prev_mask * prev_task_training_mask
+                                if phase_train_from_stage > 0:
+                                    prev_mask = prev_mask * traj_batch.info[
+                                        "phase_training_enabled"
+                                    ][prev_t_idx, env_idx].astype(mask.dtype)
                                 phase_rate_mask = (
                                     phase_sample_mask
                                     * prev_mask
@@ -1966,8 +1990,16 @@ class IPPOJax(JaxRLAlgorithmBase):
                                     ),
                                 ), grads = grad_fn(ts.params)
 
-                                # apply grads
-                                ts = ts.apply_gradients(grads=grads)
+                                # Freeze phase weights, moments and Adam count
+                                # independently of the still-trainable PPO branches.
+                                if phase_enabled[name] and phase_train_from_stage > 0:
+                                    phase_update_enabled = jnp.any(
+                                        (phase_sample_mask > 0)
+                                        & traj_mb.phase_valid[name]
+                                    )
+                                    ts = apply_gradients_with_phase_gate(ts, grads, phase_update_enabled)
+                                else:
+                                    ts = ts.apply_gradients(grads=grads)
 
                                 # adaptive lr (per-agent, same logic)
                                 if config.get("adaptive_lr", False):

@@ -1,6 +1,10 @@
 import math
 
+import jax
 import jax.numpy as jnp
+from flax.core import FrozenDict
+
+from loco_mujoco.algorithms.common.networks import PHASE_HEAD_MODULE_NAME
 
 
 PHASE_VISIBILITY_HISTORY_MODES = ("latest", "any_history", "always")
@@ -68,3 +72,45 @@ def encode_supercycle_phase(phase, num_hands: int, num_balls: int):
         ],
         axis=-1,
     )
+
+
+def phase_training_enabled(curriculum_stage, train_from_curriculum_stage):
+    """Select rollout samples whose predicting head is allowed to learn."""
+    return jnp.asarray(curriculum_stage) >= train_from_curriculum_stage
+
+
+def phase_training_start_stage(phase_cfg):
+    """Delay predictor training only in teacher-forcing mode."""
+    if not phase_cfg.get('teacher_forcing', False):
+        return 0
+    stage = int(phase_cfg.get('train_from_curriculum_stage', 0))
+    if stage < 0:
+        raise ValueError('phase_prediction.train_from_curriculum_stage must be non-negative')
+    if stage > 0 and phase_cfg.get('joint_training', False):
+        raise ValueError('Phase stage gating requires phase_prediction.joint_training=false')
+    return stage
+
+
+def apply_gradients_with_phase_gate(train_state, grads, training_enabled):
+    """Update PPO while freezing the isolated phase params and optimizer state.
+
+    Zero phase gradients alone still advance Adam counters and can move weights
+    through resumed momentum or AdamW decay. Restore the entire phase partition
+    when the minibatch contains no eligible phase samples.
+    """
+    updated = train_state.apply_gradients(grads=grads)
+
+    def freeze_phase(state):
+        phase_params = train_state.params[PHASE_HEAD_MODULE_NAME]
+        if isinstance(state.params, FrozenDict):
+            params = state.params.copy({PHASE_HEAD_MODULE_NAME: phase_params})
+        else:
+            params = {**state.params, PHASE_HEAD_MODULE_NAME: phase_params}
+        inner_states = {
+            **state.opt_state.inner_states,
+            'phase': train_state.opt_state.inner_states['phase'],
+        }
+        return state.replace(params=params,
+                             opt_state=state.opt_state._replace(inner_states=inner_states))
+
+    return jax.lax.cond(training_enabled, lambda state: state, freeze_phase, updated)
